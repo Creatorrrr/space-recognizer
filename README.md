@@ -9,6 +9,9 @@
 
 Apple Silicon Mac(M1 Max, 32GB)에서 CUDA 없이 MPS만으로 동작하도록 설계되었습니다.
 
+> 📖 **상세 사용법은 [docs/MANUAL.md](docs/MANUAL.md)** — 설치, 뷰어 조작,
+> 촬영 요령, 설정 튜닝, 문제 해결(FAQ)을 다룹니다.
+
 ## 실행
 
 ```bash
