@@ -1,0 +1,40 @@
+# spacerec 기본 설정
+source: sources/sample_720p.mp4  # 파일 경로 또는 웹캠 인덱스(정수)
+realtime: true        # true면 파일도 벽시계 기준으로 프레임 드롭 (웹캠 에뮬레이션)
+proc_width: 1280      # 처리 해상도 (가로)
+
+depth:
+  model: da3-small
+  process_res: 504
+
+detect:
+  model: models/yolo26n-seg.pt
+  conf: 0.35
+  # 정적 지도에서 항상 제외할 클래스 (움직일 가능성 높음)
+  dynamic_classes: [person, cat, dog, bird, bicycle, car, motorcycle, bus, truck]
+
+vo:
+  max_corners: 600
+  keyframe_interval_s: 0.5
+  keyframe_min_flow_px: 40.0
+  min_inlier_ratio: 0.5
+
+backend:
+  period_s: 5.0
+  window_size: 12      # 멀티뷰 윈도 키프레임 수
+  overlap: 6           # 직전 윈도와 중첩 키프레임 수
+  voxel_size: 0.03     # 전역 지도 voxel (장면 스케일 단위)
+  max_points: 800000
+
+objects:
+  ema_alpha: 0.3
+  merge_radius: 0.5    # 동일 class 재등장 병합 반경 (장면 스케일 단위)
+  dynamic_var_thresh: 0.15
+
+graph:
+  near_dist: 1.2       # 근접 엣지 거리 임계값
+  vertical_ratio: 1.5  # 위/아래 판정: |dy| 가 수평거리의 몇 배 이상일 때
+
+viz:
+  memory_limit: 4GB
+  point_subsample: 4   # depth→포인트클라우드 픽셀 서브샘플링
