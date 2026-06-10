@@ -28,11 +28,17 @@ class VideoSource:
             raise RuntimeError(f"cannot open video source: {source!r}")
         self.is_file = isinstance(source, str)
         self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
-        self.proc_width = proc_width
         self.realtime = realtime
         w = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
         h = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        self.proc_height = int(round(h * proc_width / w / 2) * 2)
+        # proc_width는 '긴 변'의 픽셀 수 상한이다. 세로 영상에서 가로변을
+        # proc_width로 맞추면 오히려 업스케일이 되므로 긴 변 기준으로 잡는다.
+        if h > w:  # portrait
+            self.proc_height = min(proc_width, int(h))
+            self.proc_width = int(round(w * self.proc_height / h / 2) * 2)
+        else:
+            self.proc_width = min(proc_width, int(w))
+            self.proc_height = int(round(h * self.proc_width / w / 2) * 2)
 
     def _resize(self, frame: np.ndarray) -> np.ndarray:
         if frame.shape[1] == self.proc_width:
