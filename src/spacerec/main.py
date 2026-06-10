@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import time
+from pathlib import Path
 
 import spacerec  # noqa: F401  (env vars must be set before heavy imports)
 
@@ -73,6 +74,9 @@ def main() -> None:
                         help="process every frame instead of wall-clock pacing")
     parser.add_argument("--profile", action="store_true",
                         help="print per-stage timings every 10 frames")
+    parser.add_argument("--map", default=None, metavar="PATH",
+                        help="세션 간 지도/객체 영속화 파일 (.npz). 있으면 불러와 "
+                             "재위치추정 후 이어서 누적, 종료 시 저장")
     args = parser.parse_args()
 
     cfg = Config.load(args.config)
@@ -109,6 +113,17 @@ def main() -> None:
     K_WARMUP = 10
     K_samples: list[np.ndarray] = []
     registry = ObjectRegistry(cfg.objects)
+
+    saved_state = None
+    reloc_done = False
+    if args.map:
+        from .persistence import load_state
+        saved_state = load_state(args.map)
+        if saved_state is not None:
+            print(f"loaded saved world: {len(saved_state.points)} pts, "
+                  f"{len(saved_state.obj_classes)} objects — 재위치추정 대기")
+        else:
+            print(f"no saved world at {args.map} (새로 시작, 종료 시 저장)")
     dyn_classes = set(cfg.detect.dynamic_classes)
     sub = cfg.viz.point_subsample
     bw = cfg.depth.process_res  # 백엔드 입력 가로 해상도
@@ -219,6 +234,22 @@ def main() -> None:
             if embedder is not None and observations:
                 embedder.embed(frame.bgr, observations)
             visible = registry.update(observations, frame.ts)
+
+            # 이전 세션 지도가 있으면 임베딩 매칭으로 재위치추정을 시도
+            if saved_state is not None and not reloc_done and frame_count % 10 == 0:
+                from .persistence import icp_refine, merge_into_session, relocalize
+                result = relocalize(saved_state, registry)
+                if result is not None:
+                    T, matches, rms = result
+                    T = icp_refine(T, saved_state.points, worldmap.points,
+                                   cfg.backend.voxel_size)
+                    merge_into_session(saved_state, T, matches, worldmap,
+                                       registry, frame.ts)
+                    viz.log_global_map(worldmap.points, worldmap.colors)
+                    print(f"[reloc] 이전 지도 정렬 성공: 매칭 {len(matches)}개, "
+                          f"rms={rms:.3f}, scale={T[0]:.3f} → 병합 완료")
+                    reloc_done = True
+
             objects = registry.stable_objects(frame.ts)
             viz.log_objects(objects, build_graph(objects, cfg.graph), visible)
             t4 = time.perf_counter()
@@ -246,6 +277,19 @@ def main() -> None:
             if len(worldmap.points) != before:
                 idle_since = time.monotonic()
             time.sleep(0.3)
+        if args.map:
+            from .persistence import save_state
+            if saved_state is not None and not reloc_done:
+                # 이전 지도와 정렬하지 못함 — 덮어쓰면 이전 공간이 사라지므로
+                # 별도 파일로 저장해 보존한다
+                alt = str(Path(args.map).with_suffix(".unmerged.npz"))
+                n = save_state(alt, worldmap, registry, viz.meters_per_unit)
+                print(f"[reloc] 정렬 실패 — 이전 지도 보존, 이번 세션은 {alt}에 "
+                      f"저장 ({n} objects)")
+            else:
+                n = save_state(args.map, worldmap, registry, viz.meters_per_unit)
+                print(f"world saved to {args.map} "
+                      f"({len(worldmap.points)} pts, {n} objects)")
     finally:
         backend.stop()
         source.release()

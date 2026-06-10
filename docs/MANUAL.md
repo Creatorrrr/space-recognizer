@@ -91,6 +91,7 @@ uv pip install -p .venv --no-deps depth-anything-3
 | `--max-seconds <초>` | 앞부분 N초만 처리하고 종료 (빠른 동작 확인용) |
 | `--no-realtime` | 벽시계 페이싱 없이 모든 프레임을 처리 (오프라인 분석·검증용) |
 | `--profile` | 10프레임마다 단계별 처리 시간(ms) 출력 (성능 진단용) |
+| `--map <경로>` | **세션 간 누적**: 종료 시 지도+객체를 .npz로 저장하고, 다음 실행에서 불러와 이어서 누적. 시작 시 이전 세션 객체들과 외형 매칭으로 좌표계를 자동 정렬(재위치추정) |
 
 예시:
 
@@ -100,7 +101,16 @@ uv pip install -p .venv --no-deps depth-anything-3
 
 # 프레임을 하나도 빠뜨리지 않고 정밀 처리 (재생 속도 무시)
 .venv/bin/python -m spacerec.main --source sources/my_room.mp4 --no-realtime
+
+# 같은 공간을 여러 번 돌며 지도를 점점 완성 (세션 간 누적)
+.venv/bin/python -m spacerec.main --source 0 --map maps/my_room.npz
 ```
+
+> **`--map` 동작 방식**: 같은 공간이면 이전 세션에서 본 물체(침대, 의자 등)를
+> 외형으로 알아보고 좌표계를 자동 정렬한 뒤 이전 지도를 병합합니다
+> (`[reloc] 이전 지도 정렬 성공 ...` 로그). 같은 물체가 3개 이상 다시
+> 보여야 정렬이 가능합니다. 다른 공간이라 정렬에 실패하면 이전 파일을
+> 보존하고 이번 세션은 `*.unmerged.npz`로 따로 저장합니다.
 
 > **realtime 모드란?** 영상 파일도 웹캠처럼 동작하도록, 처리가 느리면 그만큼
 > 프레임을 건너뜁니다. 실사용(웹캠) 조건과 동일한 동작을 재현하기 위한 기본값입니다.

@@ -26,6 +26,7 @@ uv pip install -p .venv --no-deps depth-anything-3   # numpy<2/xformers 핀 우�
 # 특정 영상 / 웹캠으로 실행
 .venv/bin/python -m spacerec.main --source sources/sample_720p.mp4
 .venv/bin/python -m spacerec.main --source 0          # 웹캠 (카메라 권한 필요)
+.venv/bin/python -m spacerec.main --source 0 --map maps/room.npz  # 세션 간 누적
 
 # 옵션
 #   --max-seconds 8     : 앞 8초만 처리
