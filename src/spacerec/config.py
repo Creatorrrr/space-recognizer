@@ -42,7 +42,7 @@ class BackendCfg:
 class ObjectsCfg:
     ema_alpha: float = 0.3
     merge_radius: float = 0.5
-    dynamic_var_thresh: float = 0.15
+    dynamic_var_thresh: float = 0.3
 
 
 @dataclass

@@ -79,14 +79,42 @@ class Visualizer:
     def log_global_map(self, points: np.ndarray, colors: np.ndarray) -> None:
         rr.log("world/points", rr.Points3D(points, colors=colors, radii=0.006))
 
-    def log_live_objects(self, names: list[str], positions: np.ndarray) -> None:
-        """Phase 2 임시: 현재 프레임에서 관측된 객체 위치 점."""
-        if len(names) == 0:
-            rr.log("world/objects/live", rr.Clear(recursive=False))
+    def log_objects(self, objects: list, edges: list, visible: set[int]) -> None:
+        """월드 오브젝트 노드(영속) + 관계 엣지 그래프.
+
+        현재 보이는 노드는 불투명, 화면 밖/가려진 노드는 반투명으로 그려
+        '기억된 위치'임을 시각적으로 구분한다.
+        """
+        if not objects:
+            rr.log("world/objects", rr.Clear(recursive=True))
             return
-        rr.log("world/objects/live", rr.Points3D(
-            positions, labels=names, radii=0.04,
-            colors=[_color_for(n) for n in names]))
+        positions = np.array([o.position for o in objects], dtype=np.float32)
+        colors = []
+        for o in objects:
+            c = _color_for(o.cls_name)
+            colors.append(c if o.obj_id in visible else c[:3] + [80])
+        rr.log("world/objects/nodes", rr.Points3D(
+            positions, labels=[o.label for o in objects],
+            colors=colors, radii=0.035))
+
+        if edges:
+            strips = np.array([[e.a.position, e.b.position] for e in edges],
+                              dtype=np.float32)
+            edge_colors = [[255, 170, 60, 200] if e.relation == "above"
+                           else [160, 160, 170, 140] for e in edges]
+            rr.log("world/objects/edges", rr.LineStrips3D(
+                strips, colors=edge_colors, radii=0.0035,
+                labels=[e.label for e in edges], show_labels=False))
+        else:
+            rr.log("world/objects/edges", rr.Clear(recursive=False))
+
+        # 동적 객체의 시간 궤적 (후순위 기능, 있으면 그려줌)
+        dyn = [o for o in objects if o.is_dynamic and len(o.trajectory) >= 2]
+        if dyn:
+            rr.log("world/objects/dyn_traj", rr.LineStrips3D(
+                [np.array([p for _, p in o.trajectory], dtype=np.float32)
+                 for o in dyn],
+                colors=[_color_for(o.cls_name) for o in dyn], radii=0.002))
 
     def log_frame(self, bgr: np.ndarray, depth: np.ndarray | None,
                   detections: list[Detection]) -> None:

@@ -29,7 +29,7 @@ backend:
 objects:
   ema_alpha: 0.3
   merge_radius: 0.5    # 동일 class 재등장 병합 반경 (장면 스케일 단위)
-  dynamic_var_thresh: 0.15
+  dynamic_var_thresh: 0.3
 
 graph:
   near_dist: 1.2       # 근접 엣지 거리 임계값

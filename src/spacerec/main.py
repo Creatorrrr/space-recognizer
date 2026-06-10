@@ -19,7 +19,8 @@ from .capture import VideoSource
 from .config import Config
 from .depth import DepthEstimator
 from .detect import Detection, ObjectDetector
-from .objects import localize_objects
+from .graph import build_graph
+from .objects import ObjectRegistry, localize_objects
 from .viz import Visualizer
 from .vo import VisualOdometry, default_intrinsics
 from .worldmap import GlobalMap
@@ -92,6 +93,7 @@ def main() -> None:
     print("waiting for backend process...")
     backend.wait_ready()
     calib = DepthCalibration()
+    registry = ObjectRegistry(cfg.objects)
     dyn_classes = set(cfg.detect.dynamic_classes)
     sub = cfg.viz.point_subsample
     bw = cfg.depth.process_res  # 백엔드 입력 가로 해상도
@@ -144,10 +146,11 @@ def main() -> None:
                 cols = frame.bgr[::sub, ::sub, ::-1]
                 viz.log_live_points(pts.reshape(-1, 3), cols.reshape(-1, 3))
             located = localize_objects(detections, depth, vo.K, pose.T_wc)
-            viz.log_live_objects(
-                [f"{d.cls_name}#{d.track_id}" for d, _ in located],
-                worldmap.to_global_points(
-                    np.array([p for _, p in located]).reshape(-1, 3)))
+            located_global = [(det, worldmap.to_global_points(p[None])[0])
+                              for det, p in located]
+            visible = registry.update(located_global, frame.ts)
+            objects = registry.stable_objects(frame.ts)
+            viz.log_objects(objects, build_graph(objects, cfg.graph), visible)
             frame_count += 1
             if frame_count % 30 == 0:
                 fps = frame_count / (time.monotonic() - t_start)
@@ -174,6 +177,12 @@ def main() -> None:
         if frame_count:
             print(f"done: {frame_count} frames in {elapsed:.1f}s "
                   f"({frame_count / elapsed:.1f} FPS)")
+        if registry.objects:
+            print(f"world objects ({len(registry.objects)}):")
+            for o in registry.objects.values():
+                print(f"  {o.label:>16} pos=({o.position[0]:+.2f},"
+                      f"{o.position[1]:+.2f},{o.position[2]:+.2f}) "
+                      f"obs={o.n_obs} last_seen={o.last_seen:.1f}s")
 
 
 if __name__ == "__main__":
