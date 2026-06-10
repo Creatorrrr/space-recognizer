@@ -68,6 +68,7 @@ class WorldObject:
     n_obs: int = 1
     is_dynamic: bool = False
     embedding: np.ndarray | None = None
+    miss_count: int = 0  # '보여야 하는데 안 보임' 연속 증거 수
     history: deque = field(default_factory=lambda: deque(maxlen=12))
     trajectory: list = field(default_factory=list)  # (ts, pos) — dynamic 객체용
 
@@ -185,6 +186,7 @@ class ObjectRegistry:
                 obj.embedding /= np.linalg.norm(obj.embedding) + 1e-9
         obj.last_seen = ts
         obj.n_obs += 1
+        obj.miss_count = 0
         obj.history.append(obs.position.copy())
         self._update_dynamic(obj, ts)
 
@@ -208,6 +210,55 @@ class ObjectRegistry:
             del self.objects[oid]
             self._track_to_obj = {t: i for t, i in self._track_to_obj.items()
                                   if i != oid}
+
+    def decay_absent(self, visible: set[int],
+                     observations: list[Observation],
+                     positions_live: dict[int, np.ndarray],
+                     T_wc_live: np.ndarray, K: np.ndarray,
+                     depth: np.ndarray, limit: int) -> None:
+        """부재 증거 처리: 노드가 카메라 시야 중앙에 있고 가려지지도 않았는데
+        해당 클래스가 검출되지 않는 상황이 누적되면 제거한다.
+
+        잘못된 클래스로 박제된 유령 노드와 실제로 치워진 물체가 모두 이
+        경로로 정리된다. 동적 물체는 '마지막 위치 기억' 계약을 지키기 위해
+        제외한다.
+        """
+        h, w = depth.shape
+        R, t = T_wc_live[:3, :3], T_wc_live[:3, 3]
+        for obj in list(self.objects.values()):
+            if obj.obj_id in visible or obj.is_dynamic:
+                continue
+            # 같은 클래스 검출이 근처에 있으면 연관 실패일 수 있으므로 패스
+            if any(o.det.cls_name == obj.cls_name
+                   and np.linalg.norm(o.position - obj.position)
+                   < 2 * self._gate(obj) for o in observations):
+                continue
+            p_live = positions_live.get(obj.obj_id)
+            if p_live is None:
+                continue
+            cam = R.T @ (p_live - t)
+            if cam[2] < 0.3:
+                continue
+            u = K[0, 0] * cam[0] / cam[2] + K[0, 2]
+            v = K[1, 1] * cam[1] / cam[2] + K[1, 2]
+            mx, my = 0.1 * w, 0.1 * h  # 화면 가장자리는 판정 제외
+            if not (mx < u < w - mx and my < v < h - my):
+                continue
+            ui, vi = int(u), int(v)
+            patch = depth[max(0, vi - 2):vi + 3, max(0, ui - 2):ui + 3]
+            if patch.size == 0:
+                continue
+            z_meas = float(np.median(patch))
+            # 측정 depth가 노드 위치보다 멀다 = 그 자리가 비어 있는 게 보인다
+            if z_meas > cam[2] - max(0.1, 0.3 * obj.size):
+                obj.miss_count += 1
+                if obj.miss_count >= limit:
+                    print(f"[obj] {obj.label} 제거 — 부재 증거 {limit}회 "
+                          f"(시야 안·비가림인데 미검출)")
+                    del self.objects[obj.obj_id]
+                    self._track_to_obj = {
+                        tid: oid for tid, oid in self._track_to_obj.items()
+                        if oid != obj.obj_id}
 
     def stable_objects(self, now: float) -> list[WorldObject]:
         """시각화/그래프용: 1회성 오검출을 걸러낸 객체 목록."""

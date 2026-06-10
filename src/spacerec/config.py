@@ -50,6 +50,7 @@ class ObjectsCfg:
     appearance: bool = True        # DINOv2 외형 임베딩 re-ID 사용
     app_weight: float = 0.6        # 매칭 비용에서 외형 항의 가중치
     app_gate: float = 0.4          # 이보다 낮은 cos 유사도면 같은 물체로 안 봄
+    absence_limit: int = 12        # '보여야 하는데 안 보임' 누적 시 노드 제거
 
 
 @dataclass

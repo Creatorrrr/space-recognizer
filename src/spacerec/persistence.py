@@ -140,8 +140,12 @@ def merge_into_session(saved: SavedState, T: Sim3,
                        matches: list[tuple[int, int]],
                        worldmap: GlobalMap, registry: ObjectRegistry,
                        now: float) -> None:
-    """정렬된 이전 지도·객체를 현재 세션에 흡수한다."""
-    worldmap.fuse(sim3_apply(T, saved.points), saved.colors)
+    """정렬된 이전 지도·객체를 현재 세션에 흡수한다.
+
+    이전 지도는 중간 가중치(2.0)로 들어간다 — 새 세션의 관측이 시선 관통
+    (carving) 증거를 몇 번 쌓으면 이전 세션의 잘못된 표면도 지워질 수 있다.
+    """
+    worldmap.fuse(sim3_apply(T, saved.points), saved.colors, weight=2.0)
 
     matched_saved = {c for _, c in matches}
     matched_cur = {r: c for r, c in matches}

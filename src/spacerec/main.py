@@ -20,6 +20,7 @@ from .capture import VideoSource
 from .config import Config
 from .depth import DepthEstimator
 from .detect import Detection, ObjectDetector
+from .geometry import sim3_apply, sim3_inverse
 from .graph import build_graph
 from .objects import ObjectRegistry, localize_objects
 from .viz import Visualizer
@@ -36,7 +37,8 @@ def _drain_backend_results(backend: ReconstructionBackend, worldmap: GlobalMap,
             res = backend.results.get_nowait()
         except Exception:
             return calib
-        worldmap.fuse(res.points, res.colors)
+        worldmap.fuse(res.points, res.colors,
+                      origins=res.view_origins, view_idx=res.point_view_idx)
         worldmap.set_correction_target(res.T_global_live)
         if res.calib.inlier_frac > 0.3:
             calib = res.calib
@@ -234,6 +236,14 @@ def main() -> None:
             if embedder is not None and observations:
                 embedder.embed(frame.bgr, observations)
             visible = registry.update(observations, frame.ts)
+
+            # 부재 증거: 보여야 하는 위치인데 안 보이는 노드는 신뢰를 깎는다
+            T_lg = sim3_inverse(worldmap.T_global_live)
+            positions_live = {o.obj_id: sim3_apply(T_lg, o.position[None])[0]
+                              for o in registry.objects.values()}
+            registry.decay_absent(visible, observations, positions_live,
+                                  pose.T_wc, vo.K, depth,
+                                  cfg.objects.absence_limit)
 
             # 이전 세션 지도가 있으면 임베딩 매칭으로 재위치추정을 시도
             if saved_state is not None and not reloc_done and frame_count % 10 == 0:

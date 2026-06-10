@@ -50,6 +50,8 @@ class BackendResult:
     intrinsics: np.ndarray | None = None  # DA3 추정 K (process 해상도 기준)
     depth_size: tuple[int, int] = (0, 0)  # (w, h) of the K's reference image
     meters_per_unit: float | None = None  # metric 앵커 환산 계수 (표시용)
+    view_origins: np.ndarray | None = None  # (V,3) 각 뷰의 카메라 원점 (전역)
+    point_view_idx: np.ndarray | None = None  # (N,) 각 포인트가 나온 뷰 번호
     window_ids: list[int] = field(default_factory=list)
     runtime_s: float = 0.0
 
@@ -184,7 +186,11 @@ class _Worker:
                 alpha, beta = win_cal.a, win_cal.b
 
         # ---- fuse static points (라이브 스케일, 전역 frame) ----
-        pts_list, col_list = [], []
+        # 각 포인트의 출처 뷰와 카메라 원점도 함께 보낸다 — 지도 쪽에서
+        # 시선 관통(free-space carving)으로 잘못된 옛 표면을 지우는 데 사용.
+        pts_list, col_list, vidx_list = [], [], []
+        view_origins = np.array(
+            [sim3_apply(S, T[:3, 3][None])[0] for T in T_wc_win])
         for i, kf in enumerate(window):
             keep = static_valid(i, kf)
             vs, us = np.nonzero(keep)
@@ -199,9 +205,12 @@ class _Worker:
             rgb_small = cv2.resize(kf.rgb, (dw, dh), interpolation=cv2.INTER_AREA)
             pts_list.append(world)
             col_list.append(rgb_small[vs, us])
+            vidx_list.append(np.full(len(world), i, np.uint8))
 
         points = np.concatenate(pts_list) if pts_list else np.empty((0, 3))
         colors = np.concatenate(col_list) if col_list else np.empty((0, 3), np.uint8)
+        point_view_idx = (np.concatenate(vidx_list) if vidx_list
+                          else np.empty(0, np.uint8))
 
         # ---- live frame -> global correction ----
         T_gl = robust_sim3([kf.T_wc_live for kf in window],
@@ -237,6 +246,7 @@ class _Worker:
             kf_global_poses=dict(self.kf_global_poses),
             intrinsics=np.median(pred.intrinsics, axis=0),
             depth_size=(dw, dh), meters_per_unit=self._meters_per_unit,
+            view_origins=view_origins, point_view_idx=point_view_idx,
             window_ids=ids, runtime_s=time.monotonic() - t0)
 
 
