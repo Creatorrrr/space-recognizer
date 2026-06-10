@@ -1,0 +1,46 @@
+[project]
+name = "spacerec"
+version = "0.1.0"
+description = "Webcam-based real-time 3D space and object recognition on Apple Silicon"
+requires-python = ">=3.12,<3.13"
+# NOTE: awesome-depth-anything-3 (DA3 MPS wrapper) is installed separately with
+# --no-deps because it pins numpy<2 while rerun-sdk 0.33 needs numpy>=2.
+# Its runtime deps are listed here explicitly instead.
+dependencies = [
+    "torch>=2.10",
+    "torchvision",
+    "numpy>=2",
+    "scipy",
+    "opencv-python",
+    "ultralytics",
+    "lap>=0.5.12",
+    "moviepy==1.0.3",
+    "pycolmap",
+    "rerun-sdk>=0.33",
+    "open3d",
+    "pyyaml",
+    # deps of awesome-depth-anything-3 (sans numpy<2 pin)
+    "einops",
+    "e3nn",
+    "evo",
+    "huggingface-hub",
+    "imageio",
+    "kornia>=0.7.0",
+    "omegaconf",
+    "pillow",
+    "plyfile",
+    "safetensors",
+    "trimesh",
+    "typer>=0.12.0",
+    "requests",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/spacerec"]
