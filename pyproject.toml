@@ -3,9 +3,12 @@ name = "spacerec"
 version = "0.1.0"
 description = "Webcam-based real-time 3D space and object recognition on Apple Silicon"
 requires-python = ">=3.12,<3.13"
-# NOTE: awesome-depth-anything-3 (DA3 MPS wrapper) is installed separately with
-# --no-deps because it pins numpy<2 while rerun-sdk 0.33 needs numpy>=2.
+# NOTE: depth-anything-3 (official ByteDance package) is installed separately with
+# --no-deps because it pins numpy<2 and hard-depends on xformers (CUDA-only),
+# while its code actually falls back to F.scaled_dot_product_attention — works on MPS.
 # Its runtime deps are listed here explicitly instead.
+# (The community wrapper awesome-depth-anything-3 was tried first but its
+#  checkpoint loading is broken: near-constant depth output. Do not use it.)
 dependencies = [
     "torch>=2.10",
     "torchvision",

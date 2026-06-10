@@ -29,6 +29,7 @@ def _color_for(name: str) -> list[int]:
 
 class Visualizer:
     def __init__(self, app_id: str = "spacerec", memory_limit: str = "4GB"):
+        self._trajectory: list[np.ndarray] = []
         rr.init(app_id)
         # venv를 활성화하지 않고 실행해도 뷰어 바이너리를 찾도록 명시 경로 사용
         viewer = shutil.which("rerun") or str(Path(sys.executable).parent / "rerun")
@@ -53,6 +54,36 @@ class Visualizer:
 
     def set_time(self, ts: float) -> None:
         rr.set_time("video", duration=ts)
+
+    def log_camera(self, T_wc: np.ndarray, K: np.ndarray,
+                   width: int, height: int) -> None:
+        rr.log("world/camera", rr.Transform3D(translation=T_wc[:3, 3],
+                                              mat3x3=T_wc[:3, :3]))
+        rr.log("world/camera/image", rr.Pinhole(
+            image_from_camera=K.astype(np.float32),
+            resolution=[width, height],
+            camera_xyz=rr.ViewCoordinates.RDF,
+            image_plane_distance=0.3,
+        ))
+        self._trajectory.append(T_wc[:3, 3].copy())
+        if len(self._trajectory) >= 2:
+            rr.log("world/trajectory", rr.LineStrips3D(
+                [np.array(self._trajectory, dtype=np.float32)],
+                colors=[[120, 180, 255, 255]], radii=0.004))
+
+    def log_live_points(self, points_cam: np.ndarray, colors: np.ndarray) -> None:
+        """Current-frame point cloud in camera coordinates (entity transform
+        places it in the world)."""
+        rr.log("world/camera/points", rr.Points3D(points_cam, colors=colors, radii=0.008))
+
+    def log_live_objects(self, names: list[str], positions: np.ndarray) -> None:
+        """Phase 2 임시: 현재 프레임에서 관측된 객체 위치 점."""
+        if len(names) == 0:
+            rr.log("world/objects/live", rr.Clear(recursive=False))
+            return
+        rr.log("world/objects/live", rr.Points3D(
+            positions, labels=names, radii=0.04,
+            colors=[_color_for(n) for n in names]))
 
     def log_frame(self, bgr: np.ndarray, depth: np.ndarray | None,
                   detections: list[Detection]) -> None:

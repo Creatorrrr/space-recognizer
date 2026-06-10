@@ -8,3 +8,4 @@ import os
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+os.environ.setdefault("DA3_LOG_LEVEL", "WARN")  # 추론마다 INFO 3줄 출력 방지
