@@ -45,8 +45,10 @@ def main() -> None:
     dyn = set(cfg.detect.dynamic_classes)
     traj = []
 
+    frame_scale = 1.0
+
     def drain() -> None:
-        nonlocal calib
+        nonlocal calib, frame_scale
         while True:
             try:
                 res = be.results.get_nowait()
@@ -56,6 +58,7 @@ def main() -> None:
             wm.set_correction_target(res.T_global_live)
             if res.calib.inlier_frac > 0.3:
                 calib = res.calib
+                frame_scale = 1.0  # main.py와 동일: 이중 적용 방지
             if res.intrinsics is not None:
                 K = res.intrinsics.copy()
                 K[0] *= W / res.depth_size[0]
@@ -68,11 +71,20 @@ def main() -> None:
         if i % args.stride:
             continue
         raw = dep.infer(frame.bgr)
-        d = calib.apply(raw)
+        d = calib.apply(raw) * frame_scale
         dets = det.track(frame.bgr)
         gray = cv2.cvtColor(frame.bgr, cv2.COLOR_BGR2GRAY)
         excl = dynamic_mask(dets, (H, W), dyn)
         r = vo.process(gray, d, frame.ts, excl)
+        if r.feat_uv is not None and len(r.feat_uv) >= 20:
+            u = r.feat_uv[:, 0].astype(int).clip(0, W - 1)
+            v = r.feat_uv[:, 1].astype(int).clip(0, H - 1)
+            z_meas = d[v, u]
+            ok = (z_meas > 1e-6) & (r.feat_z > 1e-6)
+            if ok.sum() >= 20:
+                ratio = float(np.clip(np.median(r.feat_z[ok] / z_meas[ok]),
+                                      0.8, 1.25))
+                frame_scale = float(np.clip(frame_scale * ratio ** 0.3, 0.5, 2.0))
         traj.append(wm.to_global_pose(r.T_wc)[:3, 3])
         if r.is_keyframe:
             small = cv2.resize(frame.bgr, (bw, bh))
@@ -81,7 +93,7 @@ def main() -> None:
                 r.T_wc.copy(), cv2.resize(raw, (bw, bh)),
                 None if excl is None else
                 cv2.resize(excl.astype(np.uint8), (bw, bh)).astype(bool),
-                (calib.a, calib.b)))
+                (calib.a * frame_scale, calib.b * frame_scale)))
             kf_id += 1
         drain()
         wm.step_correction()

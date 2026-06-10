@@ -46,7 +46,9 @@ class Visualizer:
                     rrb.Spatial2DView(origin="world/camera/image", name="Live RGB",
                                       contents=["world/camera/image/rgb",
                                                 "world/camera/image/detections"]),
-                    rrb.Spatial2DView(origin="world/camera/image/depth", name="Depth"),
+                    rrb.Spatial2DView(origin="world/camera/depth", name="Depth"),
+                    rrb.TimeSeriesView(origin="calib", name="Depth Calibration"),
+                    row_shares=[2, 2, 1],
                 ),
                 rrb.Spatial3DView(origin="world", name="3D World"),
                 column_shares=[1, 2],
@@ -72,10 +74,21 @@ class Visualizer:
                 [np.array(self._trajectory, dtype=np.float32)],
                 colors=[[120, 180, 255, 255]], radii=0.004))
 
-    def log_live_points(self, points_cam: np.ndarray, colors: np.ndarray) -> None:
-        """Current-frame point cloud in camera coordinates (entity transform
-        places it in the world)."""
-        rr.log("world/camera/points", rr.Points3D(points_cam, colors=colors, radii=0.008))
+    def log_live_points(self, points_world: np.ndarray, colors: np.ndarray) -> None:
+        """Latest-keyframe preview cloud, already in *global* coordinates.
+
+        카메라 엔티티 아래(카메라 좌표)에 로깅하면 다음 키프레임까지 이전 점들이
+        움직이는 카메라에 붙어 따라다니며 지도와 어긋나 보인다. 전역 좌표로 변환해
+        독립 엔티티에 로깅해야 제자리에 고정된다.
+        """
+        rr.log("world/live_preview", rr.Points3D(points_world, colors=colors,
+                                                 radii=0.008))
+
+    def log_calibration(self, a: float, b: float, frame_scale: float) -> None:
+        """depth 캘리브레이션이 실제로 동작 중인지 시계열로 보여준다."""
+        rr.log("calib/a", rr.Scalars([a]))
+        rr.log("calib/b", rr.Scalars([b]))
+        rr.log("calib/frame_scale", rr.Scalars([frame_scale]))
 
     def log_global_map(self, points: np.ndarray, colors: np.ndarray) -> None:
         rr.log("world/points", rr.Points3D(points, colors=colors, radii=0.006))
@@ -122,13 +135,26 @@ class Visualizer:
                 colors=[_color_for(o.cls_name) for o in dyn], radii=0.002))
 
     def log_frame(self, bgr: np.ndarray, depth: np.ndarray | None,
-                  detections: list[Detection]) -> None:
+                  detections: list[Detection], K: np.ndarray | None = None) -> None:
         rr.log("world/camera/image/rgb",
                rr.Image(bgr, color_model=rr.ColorModel.BGR).compress(jpeg_quality=75))
         if depth is not None:
-            # 시각화 부담을 줄이기 위해 절반 해상도로 로깅
-            rr.log("world/camera/image/depth",
-                   rr.DepthImage(depth[::2, ::2], colormap=rr.components.Colormap.Viridis))
+            # 절반 해상도로 로깅하되, 반드시 그에 맞는 절반 스케일 Pinhole을 함께
+            # 단다. (전체 해상도 Pinhole 밑에 절반 해상도 depth를 넣으면 3D 뷰의
+            # depth 역투영이 2배 어긋난다 — 실제로 겪었던 버그)
+            half = depth[::2, ::2]
+            if K is not None:
+                K_half = K.copy()
+                K_half[:2] *= 0.5
+                rr.log("world/camera/depth", rr.Pinhole(
+                    image_from_camera=K_half.astype(np.float32),
+                    resolution=[half.shape[1], half.shape[0]],
+                    camera_xyz=rr.ViewCoordinates.RDF,
+                    image_plane_distance=0.01,
+                ))
+            rr.log("world/camera/depth",
+                   rr.DepthImage(half, meter=1.0,
+                                 colormap=rr.components.Colormap.Viridis))
         if detections:
             labels = [f"{d.cls_name}#{d.track_id}" for d in detections]
             rr.log("world/camera/image/detections", rr.Boxes2D(

@@ -52,6 +52,10 @@ class PoseResult:
     n_tracked: int
     is_keyframe: bool
     lost: bool = False
+    # PnP inlier 특징점들: 현재 프레임 픽셀 좌표와, 키프레임 3D로부터 예측한
+    # 카메라 z-depth. depth 맵의 프레임별 스케일 검증/보정에 사용한다.
+    feat_uv: np.ndarray | None = None
+    feat_z: np.ndarray | None = None
 
 
 _LK_PARAMS = dict(winSize=(21, 21), maxLevel=3,
@@ -126,7 +130,11 @@ class VisualOdometry:
         T_cw[:3, :3] = R
         T_cw[:3, 3] = tvec.ravel()
         self.T_wc = np.linalg.inv(T_cw)
-        return PoseResult(self.T_wc.copy(), len(inliers) / n, n, False)
+
+        idx = inliers.ravel()
+        z_pred = (self._pts3d[idx] @ R.T + tvec.ravel())[:, 2]
+        return PoseResult(self.T_wc.copy(), len(inliers) / n, n, False,
+                          feat_uv=self._pts2d[idx].copy(), feat_z=z_pred)
 
     def _make_keyframe(self, gray: np.ndarray, depth: np.ndarray, ts: float,
                        exclude_mask: np.ndarray | None) -> None:

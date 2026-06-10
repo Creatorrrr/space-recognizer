@@ -99,6 +99,7 @@ def main() -> None:
     print("waiting for backend process...")
     backend.wait_ready()
     calib = DepthCalibration()
+    frame_scale = 1.0  # 키프레임 3D 기준의 프레임별 mono depth 스케일 보정
     registry = ObjectRegistry(cfg.objects)
     dyn_classes = set(cfg.detect.dynamic_classes)
     sub = cfg.viz.point_subsample
@@ -119,11 +120,25 @@ def main() -> None:
             t1 = time.perf_counter()
             raw_depth = depth_est.infer(frame.bgr)
             t2 = time.perf_counter()
-            depth = calib.apply(raw_depth)
+            depth = calib.apply(raw_depth) * frame_scale
             gray = cv2.cvtColor(frame.bgr, cv2.COLOR_BGR2GRAY)
             excl = dynamic_mask(detections, (H, W), dyn_classes)
             pose = vo.process(gray, depth, frame.ts, excl)
             t3 = time.perf_counter()
+
+            # 프레임별 depth 스케일 보정: 키프레임에 고정된 3D 특징점의 예측
+            # z와 이번 프레임 depth 맵의 측정 z를 비교해, mono depth의 프레임별
+            # 스케일 요동을 다음 프레임부터 상쇄한다 (log-EMA, 한 프레임 지연).
+            if pose.feat_uv is not None and len(pose.feat_uv) >= 20:
+                u = pose.feat_uv[:, 0].astype(int).clip(0, W - 1)
+                v = pose.feat_uv[:, 1].astype(int).clip(0, H - 1)
+                z_meas = depth[v, u]
+                ok = (z_meas > 1e-6) & (pose.feat_z > 1e-6)
+                if ok.sum() >= 20:
+                    ratio = float(np.clip(
+                        np.median(pose.feat_z[ok] / z_meas[ok]), 0.8, 1.25))
+                    frame_scale = float(np.clip(frame_scale * ratio ** 0.3,
+                                                0.5, 2.0))
 
             if pose.is_keyframe:
                 small = cv2.resize(frame.bgr, (bw, bh), interpolation=cv2.INTER_AREA)
@@ -135,27 +150,39 @@ def main() -> None:
                     dyn_mask=None if excl is None else
                              cv2.resize(excl.astype(np.uint8), (bw, bh),
                                         interpolation=cv2.INTER_NEAREST).astype(bool),
+                    calib_ab=(calib.a * frame_scale, calib.b * frame_scale),
                 ))
                 kf_counter += 1
 
             # 백엔드 결과 반영 (논블로킹)
-            calib = _drain_backend_results(backend, worldmap, viz, calib, vo, (W, H))
+            new_calib = _drain_backend_results(backend, worldmap, viz, calib,
+                                               vo, (W, H))
+            if new_calib is not calib:
+                # 새 calib은 키프레임 시점의 frame_scale까지 흡수해 피팅된 값.
+                # frame_scale을 리셋하지 않으면 같은 보정이 이중 적용되어
+                # 스케일이 복리로 표류한다 (calib a가 2.2+까지 증식했던 버그).
+                calib = new_calib
+                frame_scale = 1.0
             worldmap.step_correction()
 
             T_wc_global = worldmap.to_global_pose(pose.T_wc)
-            viz.log_frame(frame.bgr, depth, detections)
+            viz.log_frame(frame.bgr, depth, detections, vo.K)
             viz.log_camera(T_wc_global, vo.K, W, H)
+            viz.log_calibration(calib.a, calib.b, frame_scale)
             if pose.is_keyframe:
-                # 키프레임마다 현재 프레임 포인트클라우드 미리보기 (카메라 좌표계,
-                # world/camera 트리의 전역 pose 변환이 적용됨)
+                # 키프레임마다 현재 프레임 포인트클라우드 미리보기를 *전역 좌표*로
+                # 변환해 로깅 (카메라 좌표로 두면 다음 키프레임까지 카메라를 따라
+                # 움직여 지도와 어긋나 보인다)
                 scale = worldmap.T_global_live[0]
                 d = depth[::sub, ::sub] * scale
                 Kv = vo.K
                 vs, us = np.mgrid[0:H:sub, 0:W:sub].astype(np.float32)
                 pts = np.stack([(us - Kv[0, 2]) / Kv[0, 0] * d,
                                 (vs - Kv[1, 2]) / Kv[1, 1] * d, d], axis=-1)
+                pts_global = (pts.reshape(-1, 3) @ T_wc_global[:3, :3].T
+                              + T_wc_global[:3, 3])
                 cols = frame.bgr[::sub, ::sub, ::-1]
-                viz.log_live_points(pts.reshape(-1, 3), cols.reshape(-1, 3))
+                viz.log_live_points(pts_global, cols.reshape(-1, 3))
             located = localize_objects(detections, depth, vo.K, pose.T_wc)
             located_global = [(det, worldmap.to_global_points(p[None])[0])
                               for det, p in located]
@@ -173,7 +200,8 @@ def main() -> None:
                 p = pose.T_wc[:3, 3]
                 print(f"t={frame.ts:5.1f}s processed={frame_count} avg {fps:.1f} FPS | "
                       f"pos=({p[0]:+.2f},{p[1]:+.2f},{p[2]:+.2f}) "
-                      f"inliers={pose.inlier_ratio:.2f} n={pose.n_tracked}"
+                      f"inliers={pose.inlier_ratio:.2f} n={pose.n_tracked} "
+                      f"fscale={frame_scale:.3f}"
                       f"{' LOST' if pose.lost else ''}")
         # 영상 종료 후 진행 중인 백엔드 윈도 결과를 기다려 지도에 반영
         print("video ended; draining backend...")
