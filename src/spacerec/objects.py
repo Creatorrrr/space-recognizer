@@ -2,8 +2,12 @@
 
 The registry remembers every recognized object's position in the *global*
 frame. Objects that leave the view or get occluded keep their last known
-position; when a same-class object reappears near a lost object's position
-it is merged back into the same node (simple re-identification).
+position; when an object reappears it is matched back to its node by
+**position + appearance** (Hungarian assignment with per-object gates).
+
+위치 단서만 쓰면 같은 클래스의 이웃 물체(한 방의 침대 두 대)를 구분할 수
+없고, 잘못 병합된 노드를 EMA가 끌고 가며 오류가 전파된다 — 실측으로 확인된
+실패 모드라서 외형 임베딩과 전역 매칭을 함께 사용한다.
 """
 
 from __future__ import annotations
@@ -12,14 +16,24 @@ from collections import deque
 from dataclasses import dataclass, field
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 from .config import ObjectsCfg
 from .detect import Detection
 
+_INF = 1e9
+
+
+@dataclass
+class Observation:
+    det: Detection
+    position: np.ndarray          # global frame
+    size: float                   # 대략적 3D 지름 (장면 단위)
+    emb: np.ndarray | None = None  # 외형 임베딩 (L2 정규화, AppearanceEmbedder)
+
 
 def localize_objects(detections: list[Detection], depth: np.ndarray,
-                     K: np.ndarray, T_wc: np.ndarray
-                     ) -> list[tuple[Detection, np.ndarray]]:
+                     K: np.ndarray, T_wc: np.ndarray) -> list[Observation]:
     """Mask-interior depth median -> camera-frame 3D -> world-frame position."""
     results = []
     for det in detections:
@@ -38,7 +52,9 @@ def localize_objects(detections: list[Detection], depth: np.ndarray,
                         (v - K[1, 2]) / K[1, 1] * z,
                         z])
         world = T_wc[:3, :3] @ cam + T_wc[:3, 3]
-        results.append((det, world))
+        x0, y0, x1, y1 = det.box
+        size = float(np.hypot(x1 - x0, y1 - y0) * z / K[0, 0])
+        results.append(Observation(det=det, position=world, size=size))
     return results
 
 
@@ -48,8 +64,10 @@ class WorldObject:
     cls_name: str
     position: np.ndarray            # global frame (EMA)
     last_seen: float
+    size: float = 0.3               # 3D 지름 (EMA)
     n_obs: int = 1
     is_dynamic: bool = False
+    embedding: np.ndarray | None = None
     history: deque = field(default_factory=lambda: deque(maxlen=12))
     trajectory: list = field(default_factory=list)  # (ts, pos) — dynamic 객체용
 
@@ -66,63 +84,135 @@ class ObjectRegistry:
         self._track_to_obj: dict[int, int] = {}
         self._next_id = 0
 
-    def update(self, located: list[tuple[Detection, np.ndarray]], ts: float
-               ) -> set[int]:
+    # ------------------------------------------------------------------
+    def update(self, observations: list[Observation], ts: float) -> set[int]:
         """Associate this frame's localized detections; returns visible obj ids."""
-        located = self._dedup(located)
+        observations = self._dedup(observations)
         visible: set[int] = set()
-        for det, pos in located:
+
+        # 1) 트래커 id 지름길: 직전 프레임부터 이어지는 추적은 신뢰하되,
+        #    위치 게이트로 트래커의 id 스위치 사고는 걸러낸다.
+        pending: list[Observation] = []
+        for obs in observations:
             obj = None
-            if det.track_id >= 0 and det.track_id in self._track_to_obj:
-                obj = self.objects.get(self._track_to_obj[det.track_id])
-                if obj is not None and obj.cls_name != det.cls_name:
-                    obj = None  # 트래커 id 재사용으로 클래스가 바뀐 경우
-            if obj is None:
-                obj = self._reidentify(det, pos, visible)
-            if obj is None:
-                obj = WorldObject(self._next_id, det.cls_name, pos.copy(), ts)
-                self.objects[obj.obj_id] = obj
-                self._next_id += 1
+            if obs.det.track_id >= 0 and obs.det.track_id in self._track_to_obj:
+                cand = self.objects.get(self._track_to_obj[obs.det.track_id])
+                if cand is not None and cand.cls_name == obs.det.cls_name:
+                    # 끊김 없이 이어지는 추적은 거리와 무관하게 신뢰한다
+                    # (움직이는 물체는 EMA 위치가 뒤처져 게이트를 벗어난다).
+                    # 추적이 한동안 끊겼다 같은 id가 오면 게이트로 재검증.
+                    gap = ts - cand.last_seen
+                    if (gap < 1.5
+                            or np.linalg.norm(cand.position - obs.position)
+                            < 1.5 * self._gate(cand)):
+                        obj = cand
+            if obj is not None and obj.obj_id not in visible:
+                self._apply(obj, obs, ts)
+                visible.add(obj.obj_id)
             else:
-                a = self.cfg.ema_alpha
-                obj.position = (1 - a) * obj.position + a * pos
-                obj.last_seen = ts
-                obj.n_obs += 1
-            if det.track_id >= 0:
-                self._track_to_obj[det.track_id] = obj.obj_id
-            obj.history.append(pos.copy())
-            self._update_dynamic(obj, ts)
+                pending.append(obs)
+
+        # 2) 나머지는 헝가리안 전역 매칭 (위치 + 외형 비용)
+        candidates = [o for o in self.objects.values() if o.obj_id not in visible]
+        if pending and candidates:
+            cost = np.full((len(pending), len(candidates)), _INF)
+            for i, obs in enumerate(pending):
+                for j, obj in enumerate(candidates):
+                    cost[i, j] = self._match_cost(obs, obj)
+            rows, cols = linear_sum_assignment(np.minimum(cost, _INF))
+            matched_idx = set()
+            for r, c in zip(rows, cols):
+                if cost[r, c] >= _INF:
+                    continue
+                obj = candidates[c]
+                gap = ts - obj.last_seen
+                if gap > 1.0:
+                    print(f"[reid] {obj.label} 재획득 (공백 {gap:.1f}s, "
+                          f"cost={cost[r, c]:.2f})")
+                self._apply(obj, pending[r], ts)
+                visible.add(obj.obj_id)
+                if pending[r].det.track_id >= 0:
+                    self._track_to_obj[pending[r].det.track_id] = obj.obj_id
+                matched_idx.add(r)
+            pending = [obs for i, obs in enumerate(pending) if i not in matched_idx]
+
+        # 3) 매칭되지 않은 검출 -> 새 객체
+        for obs in pending:
+            obj = WorldObject(self._next_id, obs.det.cls_name,
+                              obs.position.copy(), ts, size=obs.size,
+                              embedding=None if obs.emb is None else obs.emb.copy())
+            self.objects[obj.obj_id] = obj
+            self._next_id += 1
+            if obs.det.track_id >= 0:
+                self._track_to_obj[obs.det.track_id] = obj.obj_id
+            obj.history.append(obs.position.copy())
             visible.add(obj.obj_id)
+            print(f"[obj] new {obj.label} size={obj.size:.2f}")
+
+        self._prune(ts)
         return visible
 
-    def _dedup(self, located: list[tuple[Detection, np.ndarray]]
-               ) -> list[tuple[Detection, np.ndarray]]:
+    # ------------------------------------------------------------------
+    def _gate(self, obj: WorldObject) -> float:
+        """물체 크기에 비례하는 연관 반경 (큰 가구일수록 위치 추정이 출렁임)."""
+        return float(np.clip(0.8 * obj.size, 0.15, self.cfg.merge_radius))
+
+    def _match_cost(self, obs: Observation, obj: WorldObject) -> float:
+        if obj.cls_name != obs.det.cls_name:
+            return _INF
+        gate = self._gate(obj)
+        dist = float(np.linalg.norm(obj.position - obs.position))
+        if dist > gate:
+            return _INF
+        cost = dist / gate
+        if obs.emb is not None and obj.embedding is not None:
+            cos = float(obs.emb @ obj.embedding)
+            if cos < self.cfg.app_gate:
+                return _INF  # 외형이 다르면 위치가 겹쳐도 다른 물체
+            cost += self.cfg.app_weight * (1.0 - cos)
+        return cost
+
+    def _apply(self, obj: WorldObject, obs: Observation, ts: float) -> None:
+        # 동적 물체는 EMA 지연을 줄여 실제 위치를 빠르게 따라가게 한다
+        a = 0.6 if obj.is_dynamic else self.cfg.ema_alpha
+        obj.position = (1 - a) * obj.position + a * obs.position
+        obj.size = (1 - a) * obj.size + a * obs.size
+        if obs.emb is not None:
+            if obj.embedding is None:
+                obj.embedding = obs.emb.copy()
+            else:
+                obj.embedding = 0.8 * obj.embedding + 0.2 * obs.emb
+                obj.embedding /= np.linalg.norm(obj.embedding) + 1e-9
+        obj.last_seen = ts
+        obj.n_obs += 1
+        obj.history.append(obs.position.copy())
+        self._update_dynamic(obj, ts)
+
+    def _dedup(self, observations: list[Observation]) -> list[Observation]:
         """동일 클래스가 거의 같은 3D 위치에 중복 검출되면 conf 높은 쪽만 유지."""
-        keep: list[tuple[Detection, np.ndarray]] = []
-        for det, pos in sorted(located, key=lambda x: -x[0].conf):
-            radius = self.cfg.merge_radius * 0.4
-            if any(det.cls_name == k.cls_name
-                   and np.linalg.norm(pos - kp) < radius for k, kp in keep):
+        keep: list[Observation] = []
+        for obs in sorted(observations, key=lambda o: -o.det.conf):
+            radius = max(0.15, 0.5 * obs.size)
+            if any(obs.det.cls_name == k.det.cls_name
+                   and np.linalg.norm(obs.position - k.position) < radius
+                   for k in keep):
                 continue
-            keep.append((det, pos))
+            keep.append(obs)
         return keep
+
+    def _prune(self, ts: float) -> None:
+        """한두 번 관측되고 다시는 확인되지 않는 노드(불량 검출)는 제거."""
+        stale = [oid for oid, o in self.objects.items()
+                 if o.n_obs <= 2 and ts - o.last_seen > 8.0]
+        for oid in stale:
+            del self.objects[oid]
+            self._track_to_obj = {t: i for t, i in self._track_to_obj.items()
+                                  if i != oid}
 
     def stable_objects(self, now: float) -> list[WorldObject]:
         """시각화/그래프용: 1회성 오검출을 걸러낸 객체 목록."""
         return [o for o in self.objects.values()
                 if o.n_obs >= 3 or now - o.last_seen < 1.0]
-
-    def _reidentify(self, det: Detection, pos: np.ndarray,
-                    claimed: set[int]) -> WorldObject | None:
-        """Same class + within merge radius -> same world object."""
-        best, best_d = None, self.cfg.merge_radius
-        for obj in self.objects.values():
-            if obj.obj_id in claimed or obj.cls_name != det.cls_name:
-                continue
-            d = float(np.linalg.norm(obj.position - pos))
-            if d < best_d:
-                best, best_d = obj, d
-        return best
 
     def _update_dynamic(self, obj: WorldObject, ts: float) -> None:
         # 측정 노이즈(분산)가 아니라 방향성 있는 순변위로 움직임을 판정한다.

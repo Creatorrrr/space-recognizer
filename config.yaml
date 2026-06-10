@@ -29,8 +29,11 @@ backend:
 
 objects:
   ema_alpha: 0.3
-  merge_radius: 0.5    # 동일 class 재등장 병합 반경 (장면 스케일 단위)
+  merge_radius: 0.5    # 연관 게이트 상한 (기본은 물체 크기에 비례)
   dynamic_var_thresh: 0.3
+  appearance: true     # DINOv2 외형 임베딩으로 재등장 물체를 같은 노드에 복원
+  app_weight: 0.6
+  app_gate: 0.4        # cos 유사도가 이보다 낮으면 같은 물체로 보지 않음
 
 graph:
   near_dist: 1.2       # 근접 엣지 거리 임계값

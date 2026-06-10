@@ -84,6 +84,10 @@ def main() -> None:
     print("loading models...")
     detector = ObjectDetector(cfg.detect.model, conf=cfg.detect.conf)
     depth_est = DepthEstimator(cfg.depth.model, process_res=cfg.depth.process_res)
+    embedder = None
+    if cfg.objects.appearance:
+        from .appearance import AppearanceEmbedder
+        embedder = AppearanceEmbedder(depth_est.device)
     viz = Visualizer(memory_limit=cfg.viz.memory_limit)
     source = VideoSource(cfg.source, proc_width=cfg.proc_width, realtime=cfg.realtime)
     W, H = source.proc_width, source.proc_height
@@ -198,10 +202,12 @@ def main() -> None:
                               + T_wc_global[:3, 3])
                 cols = frame.bgr[::sub, ::sub, ::-1]
                 viz.log_live_points(pts_global, cols.reshape(-1, 3))
-            located = localize_objects(detections, depth, vo.K, pose.T_wc)
-            located_global = [(det, worldmap.to_global_points(p[None])[0])
-                              for det, p in located]
-            visible = registry.update(located_global, frame.ts)
+            observations = localize_objects(detections, depth, vo.K, pose.T_wc)
+            for obs in observations:
+                obs.position = worldmap.to_global_points(obs.position[None])[0]
+            if embedder is not None and observations:
+                embedder.embed(frame.bgr, observations)
+            visible = registry.update(observations, frame.ts)
             objects = registry.stable_objects(frame.ts)
             viz.log_objects(objects, build_graph(objects, cfg.graph), visible)
             t4 = time.perf_counter()

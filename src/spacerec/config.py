@@ -43,8 +43,11 @@ class BackendCfg:
 @dataclass
 class ObjectsCfg:
     ema_alpha: float = 0.3
-    merge_radius: float = 0.5
+    merge_radius: float = 0.5      # 연관 게이트의 상한 (크기 비례 게이트가 기본)
     dynamic_var_thresh: float = 0.3
+    appearance: bool = True        # DINOv2 외형 임베딩 re-ID 사용
+    app_weight: float = 0.6        # 매칭 비용에서 외형 항의 가중치
+    app_gate: float = 0.4          # 이보다 낮은 cos 유사도면 같은 물체로 안 봄
 
 
 @dataclass
