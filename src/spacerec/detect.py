@@ -1,4 +1,11 @@
-"""YOLO26-seg detection + ByteTrack tracking wrapper."""
+"""Detection + ByteTrack tracking wrapper.
+
+두 가지 모드를 지원한다:
+- 고정 클래스(COCO): YOLO26-seg 등 — vocabulary 미지정 시
+- 오픈 보캐뷸러리: YOLOE-seg + 텍스트 어휘 — COCO에 없는 실내 물체
+  (rug, wardrobe 등)를 올바른 라벨로 검출. COCO 모델은 이런 물체를
+  가장 비슷한 클래스(bed 등)로 오인하는 문제가 있었다.
+"""
 
 from __future__ import annotations
 
@@ -19,11 +26,18 @@ class Detection:
 
 
 class ObjectDetector:
-    def __init__(self, model_path: str, conf: float = 0.35, device: str | None = None):
-        from ultralytics import YOLO
-
+    def __init__(self, model_path: str, conf: float = 0.35, device: str | None = None,
+                 vocabulary: list[str] | None = None):
         self.device = device or ("mps" if torch.backends.mps.is_available() else "cpu")
-        self.model = YOLO(model_path)
+        if vocabulary:
+            from ultralytics import YOLOE
+
+            self.model = YOLOE(model_path)
+            self.model.set_classes(vocabulary, self.model.get_text_pe(vocabulary))
+        else:
+            from ultralytics import YOLO
+
+            self.model = YOLO(model_path)
         self.conf = conf
         self.names = self.model.names
 

@@ -82,7 +82,8 @@ def main() -> None:
         cfg.realtime = False
 
     print("loading models...")
-    detector = ObjectDetector(cfg.detect.model, conf=cfg.detect.conf)
+    detector = ObjectDetector(cfg.detect.model, conf=cfg.detect.conf,
+                              vocabulary=cfg.detect.vocabulary)
     depth_est = DepthEstimator(cfg.depth.model, process_res=cfg.depth.process_res)
     embedder = None
     if cfg.objects.appearance:
@@ -113,6 +114,16 @@ def main() -> None:
     bw = cfg.depth.process_res  # 백엔드 입력 가로 해상도
     bh = int(H * bw / W)
     kf_counter = 0
+
+    # 모델 첫 호출은 커널 컴파일로 수 초가 걸린다 (YOLOE ~3s 실측). 실시간
+    # 페이싱이 시작되기 전에 더미 프레임으로 전부 워밍업해 두지 않으면
+    # 짧은 영상에서는 워밍업이 재생 시간을 다 잡아먹는다.
+    print("warming up models...")
+    dummy = np.zeros((H, W, 3), np.uint8)
+    detector.track(dummy)
+    depth_est.infer(dummy)
+    if embedder is not None:
+        embedder.warmup()
 
     print(f"running on {cfg.source!r} ({W}x{H})")
     frame_count, t_start = 0, time.monotonic()

@@ -22,6 +22,12 @@ class AppearanceEmbedder:
         self.model = self.model.to(self.device).eval()
 
     @torch.no_grad()
+    def warmup(self) -> None:
+        """첫 추론의 커널 컴파일을 미리 치러 실시간 루프의 지연을 막는다."""
+        dummy = torch.zeros(1, 3, _INPUT, _INPUT, device=self.device)
+        self.model(dummy)
+
+    @torch.no_grad()
     def embed(self, bgr: np.ndarray, observations: list) -> None:
         """각 Observation의 crop을 배치로 임베딩해 obs.emb에 채운다 (L2 정규화)."""
         if not observations:

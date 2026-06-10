@@ -1,9 +1,21 @@
+# 가상환경/캐시
 .venv/
 __pycache__/
 *.pyc
-.DS_Store
-sources/
-models/
-*.rrd
 .pytest_cache/
 uv.lock
+.DS_Store
+
+# 입력 영상과 모델 가중치 (대용량 — 자동 다운로드/사용자 제공)
+sources/
+models/
+*.pt
+*.ts
+*.safetensors
+*.onnx
+
+# 실행 산출물
+*.rrd
+*.npz
+*.log
+runs/

@@ -191,6 +191,8 @@ proc_width: 1280                  # 처리 해상도. 낮추면 빨라짐 (예: 
 detect:
   conf: 0.35                      # 검출 신뢰도 임계값. 오검출 많으면 ↑ (0.45)
   dynamic_classes: [person, ...]  # 항상 '움직임'으로 간주해 지도에서 제외할 클래스
+  vocabulary: [bed, rug, ...]     # 인식할 물체 어휘 (자유 텍스트, YOLOE 모드).
+                                  # 원하는 물체 이름을 영어로 추가/삭제하면 됨
 
 vo:
   keyframe_interval_s: 0.5        # 키프레임 간격. 줄이면 정밀↑ 부하↑

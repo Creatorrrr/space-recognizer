@@ -8,12 +8,24 @@ depth:
   process_res: 504
 
 detect:
-  # s 모델 사용 이유: n(nano)은 바닥 카펫을 'bed'로 오인(COCO에 rug 클래스가
-  # 없어 가장 비슷한 클래스로 분류). s부터는 이 오인이 사라지고 +5ms 수준.
-  model: models/yolo26s-seg.pt
+  # YOLOE 오픈 보캐뷸러리 (기본): COCO에 없는 실내 물체(rug, wardrobe 등)를
+  # 올바른 라벨로 검출. MPS에서 33ms/frame로 yolo26s(50ms)보다 빠름.
+  # 고정 클래스로 돌리려면 model을 yolo26s-seg.pt로 바꾸고 vocabulary를 비울 것.
+  model: models/yoloe-11s-seg.pt
   conf: 0.35
   # 정적 지도에서 항상 제외할 클래스 (움직일 가능성 높음)
-  dynamic_classes: [person, cat, dog, bird, bicycle, car, motorcycle, bus, truck]
+  dynamic_classes: [person, cat, dog, bird]
+  # 인식할 어휘 (자유롭게 추가/삭제 가능 — 텍스트 임베딩은 시작 시 1회 계산)
+  vocabulary: [
+    person, cat, dog, bird,
+    bed, sofa, armchair, chair, stool, bench,
+    table, desk, wardrobe, cabinet, shelf, drawer, dresser,
+    rug, curtain, mirror, lamp, chandelier, pillow, blanket,
+    door, window, picture frame, clock, vase, potted plant,
+    tv, monitor, laptop, keyboard, speaker,
+    refrigerator, oven, microwave, sink, stove, coffee maker, toaster, kettle,
+    book, cup, bottle, bowl, box, backpack,
+  ]
 
 vo:
   max_corners: 600

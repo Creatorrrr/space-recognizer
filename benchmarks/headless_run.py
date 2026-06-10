@@ -28,7 +28,8 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = Config.load()
-    det = ObjectDetector(cfg.detect.model, conf=cfg.detect.conf)
+    det = ObjectDetector(cfg.detect.model, conf=cfg.detect.conf,
+                         vocabulary=cfg.detect.vocabulary)
     dep = DepthEstimator(cfg.depth.model)
     src = VideoSource(cfg.source, proc_width=cfg.proc_width, realtime=False)
     W, H = src.proc_width, src.proc_height

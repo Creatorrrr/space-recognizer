@@ -17,9 +17,11 @@ class DepthCfg:
 
 @dataclass
 class DetectCfg:
-    model: str = "models/yolo26n-seg.pt"
+    model: str = "models/yoloe-11s-seg.pt"
     conf: float = 0.35
     dynamic_classes: list[str] = field(default_factory=lambda: ["person"])
+    # 비어 있지 않으면 YOLOE 오픈 보캐뷸러리 모드로 동작
+    vocabulary: list[str] = field(default_factory=list)
 
 
 @dataclass

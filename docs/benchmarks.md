@@ -10,7 +10,8 @@
 | DA3-SMALL 멀티뷰 16뷰 | 2.7 s | — | ✅ |
 | yolo26n-seg predict | 33 ms/frame (30 FPS) | — | ✅ |
 | yolo26n-seg track (ByteTrack) | 45 ms/frame (22 FPS) | — | ✅ |
-| yolo26s-seg track (ByteTrack) | 50 ms/frame (20 FPS) | — | ✅ (기본 채택) |
+| yolo26s-seg track (ByteTrack) | 50 ms/frame (20 FPS) | — | ✅ |
+| yoloe-11s-seg track (오픈 보캐뷸러리, 45어휘) | 65~85 ms/frame | — | ✅ (기본 채택) |
 | 라이브 계층 합계 (depth+track) | ~110 ms → 5.1 FPS e2e 실측 | ≤ 200 ms | ✅ |
 
 ## 결정 사항
@@ -20,6 +21,16 @@
   0.65→0.78로 상승. track 비용은 45→50ms로 +5ms뿐.
   남은 어휘 한계(카펫·장식장 등 COCO 밖 물체)는 YOLOE(오픈 보캐뷸러리,
   ultralytics 8.4.63에 포함)로 해소 가능 — 필요 시 옵션으로 추가.
+- **YOLOE-11s-seg를 최종 기본으로 채택** (config의 `detect.vocabulary`로 어휘
+  지정). 카펫이 'rug', 장식장이 'cabinet/wardrobe' 등 올바른 라벨로 등록됨.
+  텍스트 인코더(mobileclip_blt.ts, 572MB)는 최초 1회 다운로드.
+  주의 1: `clip` 패키지가 토크나이저로 필요 — PyPI `clip-anytorch`로 충족
+  (ultralytics가 시도하는 git 직설치 불필요).
+  주의 2: 첫 추론이 커널 컴파일로 ~3초 → main이 페이싱 시작 전에 더미
+  프레임으로 전 모델을 워밍업하도록 수정함 (짧은 영상에서 워밍업이 재생
+  시간을 잠식하던 문제).
+  트레이드오프: 검출이 풍부해진 만큼 중복/노이즈 노드도 늘어남 (예: 같은
+  러그가 2노드로 분리될 수 있음). conf 상향(0.4~0.45)이나 어휘 축소로 조절.
 - **공식 `depth-anything-3` 0.1.1 패키지 채택** — MPS에서 SDPA로 그대로 동작.
   멀티뷰 출력: depth (V,280,504), extrinsics (V,3,4) w2c, intrinsics (V,3,3) @504px
 - ⚠️ **커뮤니티 래퍼 `awesome-depth-anything-3`는 사용 금지**: 체크포인트 로딩이 깨져

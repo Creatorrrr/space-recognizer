@@ -16,6 +16,7 @@ dependencies = [
     "scipy",
     "opencv-python",
     "ultralytics",
+    "clip-anytorch",  # YOLOE 텍스트 토크나이저 (import name: clip)
     "lap>=0.5.12",
     "moviepy==1.0.3",
     "pycolmap",
