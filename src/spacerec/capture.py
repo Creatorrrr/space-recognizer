@@ -56,10 +56,20 @@ class VideoSource:
         """Webcam, or file without pacing (process every frame)."""
         start = time.monotonic()
         index = -1
+        fails = 0
         while True:
             ok, frame = self.cap.read()
             if not ok:
-                return
+                if self.is_file:
+                    return
+                # 웹캠은 일시적 read 실패가 흔하다 — 특히 Continuity Camera
+                # (아이폰)는 깨어나는 데 1~2초 걸린다. 10초까지 재시도.
+                fails += 1
+                if fails > 100:
+                    return
+                time.sleep(0.1)
+                continue
+            fails = 0
             index += 1
             ts = index / self.fps if self.is_file else time.monotonic() - start
             yield Frame(ts=ts, bgr=self._resize(frame), index=index)

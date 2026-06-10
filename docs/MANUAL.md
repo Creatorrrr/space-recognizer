@@ -65,6 +65,11 @@ uv pip install -p .venv --no-deps depth-anything-3
 ```
 
 - `0`은 기본 카메라 인덱스입니다 (외장 캠은 `1`, `2`, ...).
+- **아이폰을 웹캠으로** (Continuity Camera): 아이폰이 같은 Apple ID로 근처에
+  있으면 자동으로 카메라 장치로 잡힙니다. 인덱스 확인:
+  `ffmpeg -f avfoundation -list_devices true -i ""` → 보통 `0`=내장 FaceTime,
+  `1`=아이폰, `2`=아이폰 데스크뷰. `--source 1`로 실행하면 됩니다.
+  아이폰이 잠자고 있으면 첫 프레임까지 1~2초 걸립니다(자동 재시도).
 - **최초 실행 시 macOS 카메라 권한이 필요합니다**:
   시스템 설정 → 개인정보 보호 및 보안 → 카메라 → 사용 중인 터미널 앱 허용.
   권한이 없으면 `cannot open video source: 0` 오류가 납니다.
