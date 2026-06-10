@@ -49,6 +49,7 @@ class BackendResult:
     kf_global_poses: dict[int, np.ndarray]
     intrinsics: np.ndarray | None = None  # DA3 추정 K (process 해상도 기준)
     depth_size: tuple[int, int] = (0, 0)  # (w, h) of the K's reference image
+    meters_per_unit: float | None = None  # metric 앵커 환산 계수 (표시용)
     window_ids: list[int] = field(default_factory=list)
     runtime_s: float = 0.0
 
@@ -81,12 +82,17 @@ class _Worker:
     """Backend state + window processing. Lives entirely in the child process."""
 
     def __init__(self, cfg: BackendCfg, model_name: str, device: str,
-                 process_res: int):
+                 process_res: int, metric_model: str | None = None):
         from depth_anything_3.api import DepthAnything3
 
         self.cfg = cfg
         self.process_res = process_res
         self.model = DepthAnything3.from_pretrained(model_name).to(device).eval()
+        self.metric_model = None
+        if cfg.metric_anchor and metric_model:
+            self.metric_model = (DepthAnything3.from_pretrained(metric_model)
+                                 .to(device).eval())
+        self._meters_per_unit: float | None = None
         self.kf_global_poses: dict[int, np.ndarray] = {}
         self._pending: list[BackendKeyframe] = []
         self._reconstructed: list[BackendKeyframe] = []
@@ -210,6 +216,18 @@ class _Worker:
             ref = alpha * pred.depth[-1] + beta
             calib = fit_affine_depth(raw, ref, static_valid(V - 1, newest))
 
+        # ---- (선택) metric 앵커: 라이브 스케일 1단위 = 몇 미터인지 추정 ----
+        # 지도/pose의 스케일은 건드리지 않고 표시용 환산 계수만 갱신한다.
+        if self.metric_model is not None:
+            metric = self.metric_model.inference(
+                [newest.rgb], process_res=self.process_res).depth[0]
+            d_live = alpha * pred.depth[-1] + beta
+            valid = static_valid(V - 1, newest) & (d_live > 1e-6) & (metric > 1e-6)
+            if valid.sum() > 500:
+                mpu = float(np.median(metric[valid] / d_live[valid]))
+                self._meters_per_unit = (mpu if self._meters_per_unit is None
+                                         else 0.7 * self._meters_per_unit + 0.3 * mpu)
+
         self._reconstructed.extend(new_kfs)
         # 윈도 중첩에 쓰일 최근 키프레임만 이미지를 유지 (메모리 해제)
         self._reconstructed = self._reconstructed[-self.cfg.overlap:]
@@ -218,15 +236,16 @@ class _Worker:
             points=points, colors=colors, T_global_live=T_gl, calib=calib,
             kf_global_poses=dict(self.kf_global_poses),
             intrinsics=np.median(pred.intrinsics, axis=0),
-            depth_size=(dw, dh), window_ids=ids,
-            runtime_s=time.monotonic() - t0)
+            depth_size=(dw, dh), meters_per_unit=self._meters_per_unit,
+            window_ids=ids, runtime_s=time.monotonic() - t0)
 
 
 def _worker_main(cfg: BackendCfg, model_name: str, device: str,
-                 process_res: int, in_q: mp.Queue, out_q: mp.Queue) -> None:
+                 process_res: int, metric_model: str | None,
+                 in_q: mp.Queue, out_q: mp.Queue) -> None:
     import spacerec  # noqa: F401  (env vars in the child process)
 
-    worker = _Worker(cfg, model_name, device, process_res)
+    worker = _Worker(cfg, model_name, device, process_res, metric_model)
     out_q.put("ready")
     worker.run(in_q, out_q)
 
@@ -235,19 +254,21 @@ class ReconstructionBackend:
     """Main-process handle: feeds keyframes to / reads results from the child."""
 
     def __init__(self, cfg: BackendCfg, model_name: str, device: str,
-                 process_res: int = 504):
+                 process_res: int = 504, metric_model: str | None = None):
         ctx = mp.get_context("spawn")
         self._in_q: mp.Queue = ctx.Queue()
         self.results: mp.Queue = ctx.Queue()
         self._proc = ctx.Process(
             target=_worker_main,
-            args=(cfg, model_name, device, process_res, self._in_q, self.results),
+            args=(cfg, model_name, device, process_res, metric_model,
+                  self._in_q, self.results),
             daemon=True)
 
     def start(self) -> None:
         self._proc.start()
 
-    def wait_ready(self, timeout: float = 120.0) -> None:
+    def wait_ready(self, timeout: float = 900.0) -> None:
+        """모델 가중치 최초 다운로드(수백 MB~GB)까지 포함해 기다린다."""
         msg = self.results.get(timeout=timeout)
         assert msg == "ready", f"unexpected backend message: {msg!r}"
 

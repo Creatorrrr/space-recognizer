@@ -10,8 +10,9 @@ import yaml
 
 @dataclass
 class DepthCfg:
-    model: str = "da3-small"
+    model: str = "depth-anything/DA3-SMALL"
     process_res: int = 504
+    metric_model: str = "depth-anything/DA3METRIC-LARGE"
 
 
 @dataclass
@@ -36,6 +37,7 @@ class BackendCfg:
     overlap: int = 6
     voxel_size: float = 0.03
     max_points: int = 800_000
+    metric_anchor: bool = False  # DA3METRIC로 미터 단위 추정 (느림, 선택)
 
 
 @dataclass

@@ -25,6 +25,7 @@ backend:
   overlap: 6           # 직전 윈도와 중첩 키프레임 수
   voxel_size: 0.03     # 전역 지도 voxel (장면 스케일 단위)
   max_points: 800000
+  metric_anchor: true   # DA3METRIC-LARGE로 미터 단위 추정 (윈도당 +0.3~1s)
 
 objects:
   ema_alpha: 0.3

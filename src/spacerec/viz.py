@@ -30,6 +30,7 @@ def _color_for(name: str) -> list[int]:
 class Visualizer:
     def __init__(self, app_id: str = "spacerec", memory_limit: str = "4GB"):
         self._trajectory: list[np.ndarray] = []
+        self.meters_per_unit: float | None = None  # metric 앵커가 있으면 거리 라벨에 사용
         rr.init(app_id)
         # venv를 활성화하지 않고 실행해도 뷰어 바이너리를 찾도록 명시 경로 사용
         viewer = shutil.which("rerun") or str(Path(sys.executable).parent / "rerun")
@@ -102,9 +103,13 @@ class Visualizer:
                               dtype=np.float32)
             edge_colors = [[255, 170, 60, 200] if e.relation == "above"
                            else [160, 160, 170, 140] for e in edges]
+            mpu = self.meters_per_unit
+            labels = [(f"{'↑' if e.relation == 'above' else '—'} "
+                       + (f"{e.dist * mpu:.2f}m" if mpu else f"{e.dist:.2f}"))
+                      for e in edges]
             rr.log("world/objects/edges", rr.LineStrips3D(
                 strips, colors=edge_colors, radii=0.0035,
-                labels=[e.label for e in edges], show_labels=False))
+                labels=labels, show_labels=False))
         else:
             rr.log("world/objects/edges", rr.Clear(recursive=False))
 

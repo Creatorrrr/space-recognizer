@@ -39,6 +39,8 @@ def _drain_backend_results(backend: ReconstructionBackend, worldmap: GlobalMap,
         worldmap.set_correction_target(res.T_global_live)
         if res.calib.inlier_frac > 0.3:
             calib = res.calib
+        if res.meters_per_unit is not None:
+            viz.meters_per_unit = res.meters_per_unit
         if res.intrinsics is not None and res.depth_size[0] > 0:
             # DA3가 추정한 intrinsics를 라이브 해상도로 환산해 VO에 반영
             K = res.intrinsics.copy()
@@ -46,10 +48,11 @@ def _drain_backend_results(backend: ReconstructionBackend, worldmap: GlobalMap,
             K[1] *= frame_wh[1] / res.depth_size[1]
             vo.set_intrinsics(K)
         viz.log_global_map(worldmap.points, worldmap.colors)
+        mpu = f" 1unit={res.meters_per_unit:.2f}m" if res.meters_per_unit else ""
         print(f"[backend] window={len(res.window_ids)}kf "
               f"{res.runtime_s:.1f}s map={len(worldmap.points)}pts "
               f"calib a={calib.a:.3f} b={calib.b:.3f} "
-              f"scale={res.T_global_live[0]:.3f}")
+              f"scale={res.T_global_live[0]:.3f}{mpu}")
 
 
 def dynamic_mask(detections: list[Detection], shape: tuple[int, int],
@@ -70,6 +73,8 @@ def main() -> None:
     parser.add_argument("--max-seconds", type=float, default=None)
     parser.add_argument("--no-realtime", action="store_true",
                         help="process every frame instead of wall-clock pacing")
+    parser.add_argument("--profile", action="store_true",
+                        help="print per-stage timings every 10 frames")
     args = parser.parse_args()
 
     cfg = Config.load(args.config)
@@ -88,7 +93,8 @@ def main() -> None:
     vo = VisualOdometry(K, cfg.vo)
     worldmap = GlobalMap(cfg.backend)
     backend = ReconstructionBackend(cfg.backend, cfg.depth.model,
-                                    depth_est.device, cfg.depth.process_res)
+                                    depth_est.device, cfg.depth.process_res,
+                                    metric_model=cfg.depth.metric_model)
     backend.start()
     print("waiting for backend process...")
     backend.wait_ready()
@@ -102,17 +108,22 @@ def main() -> None:
 
     print(f"running on {cfg.source!r} ({W}x{H})")
     frame_count, t_start = 0, time.monotonic()
+    t_loop_end = t_start
     try:
         for frame in source.frames():
             if args.max_seconds and frame.ts > args.max_seconds:
                 break
             viz.set_time(frame.ts)
+            t0 = time.perf_counter()
             detections = detector.track(frame.bgr)
+            t1 = time.perf_counter()
             raw_depth = depth_est.infer(frame.bgr)
+            t2 = time.perf_counter()
             depth = calib.apply(raw_depth)
             gray = cv2.cvtColor(frame.bgr, cv2.COLOR_BGR2GRAY)
             excl = dynamic_mask(detections, (H, W), dyn_classes)
             pose = vo.process(gray, depth, frame.ts, excl)
+            t3 = time.perf_counter()
 
             if pose.is_keyframe:
                 small = cv2.resize(frame.bgr, (bw, bh), interpolation=cv2.INTER_AREA)
@@ -151,7 +162,12 @@ def main() -> None:
             visible = registry.update(located_global, frame.ts)
             objects = registry.stable_objects(frame.ts)
             viz.log_objects(objects, build_graph(objects, cfg.graph), visible)
+            t4 = time.perf_counter()
             frame_count += 1
+            t_loop_end = time.monotonic()
+            if args.profile and frame_count % 10 == 0:
+                print(f"  [prof] yolo={1e3 * (t1 - t0):.0f} depth={1e3 * (t2 - t1):.0f} "
+                      f"vo={1e3 * (t3 - t2):.0f} viz+rest={1e3 * (t4 - t3):.0f} ms")
             if frame_count % 30 == 0:
                 fps = frame_count / (time.monotonic() - t_start)
                 p = pose.T_wc[:3, 3]
@@ -173,8 +189,8 @@ def main() -> None:
     finally:
         backend.stop()
         source.release()
-        elapsed = time.monotonic() - t_start
-        if frame_count:
+        elapsed = t_loop_end - t_start
+        if frame_count and elapsed > 0:
             print(f"done: {frame_count} frames in {elapsed:.1f}s "
                   f"({frame_count / elapsed:.1f} FPS)")
         if registry.objects:
