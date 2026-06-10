@@ -41,12 +41,10 @@ def _drain_backend_results(backend: ReconstructionBackend, worldmap: GlobalMap,
             calib = res.calib
         if res.meters_per_unit is not None:
             viz.meters_per_unit = res.meters_per_unit
-        if res.intrinsics is not None and res.depth_size[0] > 0:
-            # DA3가 추정한 intrinsics를 라이브 해상도로 환산해 VO에 반영
-            K = res.intrinsics.copy()
-            K[0] *= frame_wh[0] / res.depth_size[0]
-            K[1] *= frame_wh[1] / res.depth_size[1]
-            vo.set_intrinsics(K)
+        # 주의: 여기서 vo.set_intrinsics()를 호출하면 안 된다. 실행 도중 K가
+        # 바뀌면 VO 병진/키프레임 3D의 스케일이 전환 시점 전후로 달라져,
+        # 기존 지도 위에 다른 크기의 공간이 겹쳐 그려진다 (8초 시점에 공간이
+        # 갑자기 커지던 버그). K는 시작 시 첫 프레임의 DA3 추정으로 고정한다.
         viz.log_global_map(worldmap.points, worldmap.colors)
         mpu = f" 1unit={res.meters_per_unit:.2f}m" if res.meters_per_unit else ""
         print(f"[backend] window={len(res.window_ids)}kf "
@@ -100,6 +98,11 @@ def main() -> None:
     backend.wait_ready()
     calib = DepthCalibration()
     frame_scale = 1.0  # 키프레임 3D 기준의 프레임별 mono depth 스케일 보정
+    # DA3의 프레임별 intrinsics 추정은 출렁임이 크다(fx 740~1015 관측).
+    # 처음 K_WARMUP 프레임 동안 표본을 모아 중앙값으로 확정한 뒤 VO를 시작해야
+    # 실행 도중 K가 바뀌며 지도 스케일이 갈라지는 일이 없다.
+    K_WARMUP = 10
+    K_samples: list[np.ndarray] = []
     registry = ObjectRegistry(cfg.objects)
     dyn_classes = set(cfg.detect.dynamic_classes)
     sub = cfg.viz.point_subsample
@@ -119,6 +122,18 @@ def main() -> None:
             detections = detector.track(frame.bgr)
             t1 = time.perf_counter()
             raw_depth = depth_est.infer(frame.bgr)
+            if len(K_samples) < K_WARMUP:
+                if depth_est.last_K is not None:
+                    K_samples.append(depth_est.last_K)
+                if len(K_samples) == K_WARMUP:
+                    vo.set_intrinsics(np.median(np.stack(K_samples), axis=0))
+                    print(f"intrinsics fixed (median of {K_WARMUP}): "
+                          f"fx={vo.K[0, 0]:.0f} fy={vo.K[1, 1]:.0f}")
+                else:
+                    # K 확정 전에는 VO/지도를 시작하지 않는다 (2D 패널만 갱신)
+                    viz.log_frame(frame.bgr, calib.apply(raw_depth), detections)
+                    frame_count += 1
+                    continue
             t2 = time.perf_counter()
             depth = calib.apply(raw_depth) * frame_scale
             gray = cv2.cvtColor(frame.bgr, cv2.COLOR_BGR2GRAY)

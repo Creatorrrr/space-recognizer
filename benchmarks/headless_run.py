@@ -46,6 +46,7 @@ def main() -> None:
     traj = []
 
     frame_scale = 1.0
+    K_samples: list[np.ndarray] = []
 
     def drain() -> None:
         nonlocal calib, frame_scale
@@ -59,11 +60,7 @@ def main() -> None:
             if res.calib.inlier_frac > 0.3:
                 calib = res.calib
                 frame_scale = 1.0  # main.py와 동일: 이중 적용 방지
-            if res.intrinsics is not None:
-                K = res.intrinsics.copy()
-                K[0] *= W / res.depth_size[0]
-                K[1] *= H / res.depth_size[1]
-                vo.set_intrinsics(K)
+            # K는 첫 프레임에서 고정 — 도중에 바꾸면 지도 스케일이 갈라진다
             print(f"[res] map={len(wm.points)} scale={res.T_global_live[0]:.3f} "
                   f"a={calib.a:.3f} fx={vo.K[0, 0]:.0f}")
 
@@ -71,6 +68,13 @@ def main() -> None:
         if i % args.stride:
             continue
         raw = dep.infer(frame.bgr)
+        if len(K_samples) < 10:  # main.py와 동일한 K 워밍업
+            if dep.last_K is not None:
+                K_samples.append(dep.last_K)
+            if len(K_samples) == 10:
+                vo.set_intrinsics(np.median(np.stack(K_samples), axis=0))
+            else:
+                continue
         d = calib.apply(raw) * frame_scale
         dets = det.track(frame.bgr)
         gray = cv2.cvtColor(frame.bgr, cv2.COLOR_BGR2GRAY)
