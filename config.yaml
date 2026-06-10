@@ -8,7 +8,9 @@ depth:
   process_res: 504
 
 detect:
-  model: models/yolo26n-seg.pt
+  # s 모델 사용 이유: n(nano)은 바닥 카펫을 'bed'로 오인(COCO에 rug 클래스가
+  # 없어 가장 비슷한 클래스로 분류). s부터는 이 오인이 사라지고 +5ms 수준.
+  model: models/yolo26s-seg.pt
   conf: 0.35
   # 정적 지도에서 항상 제외할 클래스 (움직일 가능성 높음)
   dynamic_classes: [person, cat, dog, bird, bicycle, car, motorcycle, bus, truck]

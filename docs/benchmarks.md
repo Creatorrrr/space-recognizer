@@ -10,10 +10,16 @@
 | DA3-SMALL 멀티뷰 16뷰 | 2.7 s | — | ✅ |
 | yolo26n-seg predict | 33 ms/frame (30 FPS) | — | ✅ |
 | yolo26n-seg track (ByteTrack) | 45 ms/frame (22 FPS) | — | ✅ |
+| yolo26s-seg track (ByteTrack) | 50 ms/frame (20 FPS) | — | ✅ (기본 채택) |
 | 라이브 계층 합계 (depth+track) | ~110 ms → 5.1 FPS e2e 실측 | ≤ 200 ms | ✅ |
 
 ## 결정 사항
-- **YOLO26n-seg 채택** (YOLO11 폴백 불필요, MPS 정상 동작, mask+track id 확인)
+- **YOLO26s-seg 채택** (당초 n-seg → s-seg로 상향). n(nano)은 바닥 카펫을
+  'bed' conf 0.3대로 오인 — COCO에 rug 클래스가 없어 가장 비슷한 클래스로
+  분류함. s부터는 같은 프레임에서 카펫 오검출이 사라지고 진짜 침대 conf가
+  0.65→0.78로 상승. track 비용은 45→50ms로 +5ms뿐.
+  남은 어휘 한계(카펫·장식장 등 COCO 밖 물체)는 YOLOE(오픈 보캐뷸러리,
+  ultralytics 8.4.63에 포함)로 해소 가능 — 필요 시 옵션으로 추가.
 - **공식 `depth-anything-3` 0.1.1 패키지 채택** — MPS에서 SDPA로 그대로 동작.
   멀티뷰 출력: depth (V,280,504), extrinsics (V,3,4) w2c, intrinsics (V,3,3) @504px
 - ⚠️ **커뮤니티 래퍼 `awesome-depth-anything-3`는 사용 금지**: 체크포인트 로딩이 깨져
