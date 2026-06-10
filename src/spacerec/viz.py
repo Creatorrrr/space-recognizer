@@ -76,6 +76,9 @@ class Visualizer:
         places it in the world)."""
         rr.log("world/camera/points", rr.Points3D(points_cam, colors=colors, radii=0.008))
 
+    def log_global_map(self, points: np.ndarray, colors: np.ndarray) -> None:
+        rr.log("world/points", rr.Points3D(points, colors=colors, radii=0.006))
+
     def log_live_objects(self, names: list[str], positions: np.ndarray) -> None:
         """Phase 2 임시: 현재 프레임에서 관측된 객체 위치 점."""
         if len(names) == 0:
