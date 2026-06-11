@@ -19,8 +19,10 @@ import cv2
 import numpy as np
 import torch
 
+from spacerec.device import select_torch_device
+
 VIDEO = sys.argv[1] if len(sys.argv) > 1 else "sources/10135156-uhd_3840_2160_30fps.mp4"
-DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
+DEVICE = select_torch_device()
 
 
 def grab_frames(path: str, n: int, width: int = 1280) -> list[np.ndarray]:

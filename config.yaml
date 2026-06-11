@@ -8,10 +8,12 @@ depth:
   process_res: 504
 
 detect:
-  # YOLOE 오픈 보캐뷸러리 (기본): COCO에 없는 실내 물체(rug, wardrobe 등)를
-  # 올바른 라벨로 검출. MPS에서 33ms/frame로 yolo26s(50ms)보다 빠름.
+  # YOLOE-26 오픈 보캐뷸러리 (기본): COCO에 없는 실내 물체(rug, wardrobe 등)를
+  # 올바른 라벨로 검출. 26s는 11s 대비 핵심 가구 신뢰도가 높고 중복 검출이
+  # 적으며 MPS track 60ms로 더 빠름 (NMS-free E2E). 텍스트 인코더는
+  # MobileCLIP2(mobileclip2_b.ts, 자동 다운로드).
   # 고정 클래스로 돌리려면 model을 yolo26s-seg.pt로 바꾸고 vocabulary를 비울 것.
-  model: models/yoloe-11s-seg.pt
+  model: models/yoloe-26s-seg.pt
   conf: 0.35
   # 정적 지도에서 항상 제외할 클래스 (움직일 가능성 높음)
   dynamic_classes: [person, cat, dog, bird]

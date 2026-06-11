@@ -2,7 +2,7 @@
 
 > ⚠️ **이 문서는 구현 착수 시점의 설계 스냅샷입니다.** 구현 과정에서 다음이
 > 변경·추가되었습니다 (현재 상태는 `README.md`, 변경 근거는 `docs/benchmarks.md`):
-> - 검출: YOLO26n-seg → **YOLOE-11s-seg 오픈 보캐뷸러리** (COCO 어휘 한계 해소)
+> - 검출: YOLO26n-seg → YOLOE-11s-seg → **YOLOE-26s-seg 오픈 보캐뷸러리** (COCO 어휘 한계 해소)
 > - DA3: 커뮤니티 MPS 래퍼 → **공식 depth-anything-3 패키지** (래퍼 결함 발견)
 > - 백엔드 pose: DA3 extrinsics 사용 불가 판명 → **라이브 VO pose 사용**
 > - 추가된 기능: DINOv2 외형 re-ID, 증거 기반 지도 갱신(free-space carving),

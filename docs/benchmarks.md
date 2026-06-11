@@ -11,7 +11,8 @@
 | yolo26n-seg predict | 33 ms/frame (30 FPS) | — | ✅ |
 | yolo26n-seg track (ByteTrack) | 45 ms/frame (22 FPS) | — | ✅ |
 | yolo26s-seg track (ByteTrack) | 50 ms/frame (20 FPS) | — | ✅ |
-| yoloe-11s-seg track (오픈 보캐뷸러리, 45어휘) | 65~85 ms/frame | — | ✅ (기본 채택) |
+| yoloe-11s-seg track (오픈 보캐뷸러리, 45어휘) | 65~85 ms/frame | — | ✅ |
+| yoloe-26s-seg track (오픈 보캐뷸러리, 45어휘) | 60 ms/frame | — | ✅ (기본 채택) |
 | 라이브 계층 합계 (depth+track) | ~110 ms → 5.1 FPS e2e 실측 | ≤ 200 ms | ✅ |
 
 ## 결정 사항
@@ -21,7 +22,7 @@
   0.65→0.78로 상승. track 비용은 45→50ms로 +5ms뿐.
   남은 어휘 한계(카펫·장식장 등 COCO 밖 물체)는 YOLOE(오픈 보캐뷸러리,
   ultralytics 8.4.63에 포함)로 해소 가능 — 필요 시 옵션으로 추가.
-- **YOLOE-11s-seg를 최종 기본으로 채택** (config의 `detect.vocabulary`로 어휘
+- **YOLOE-11s-seg를 기본으로 채택** (config의 `detect.vocabulary`로 어휘
   지정). 카펫이 'rug', 장식장이 'cabinet/wardrobe' 등 올바른 라벨로 등록됨.
   텍스트 인코더(mobileclip_blt.ts, 572MB)는 최초 1회 다운로드.
   주의 1: `clip` 패키지가 토크나이저로 필요 — PyPI `clip-anytorch`로 충족
@@ -37,6 +38,18 @@
   depth가 ~1.1 상수 + 격자 노이즈로 출력됨 (mono/multi-view, CPU/MPS 모두). 공식
   패키지로 교차 검증해 확인. HF 모델 id는 `depth-anything/DA3-SMALL` 사용.
 - 백엔드 윈도 8~16뷰 모두 5초 주기 내 처리 가능 (2.3~2.7s)
+- **(2026-06-11) YOLOE-26s-seg로 상향, 최종 기본 채택.** 같은 어휘·동일 프레임
+  비교에서 11s 대비: 핵심 가구 신뢰도 상승(침대 0.77→0.87, 램프 0.76→0.92),
+  중복 검출 감소(NMS-free E2E), track 60ms로 더 빠름. recall은 소폭 감소
+  (rug 신뢰도 0.85→0.6대 — conf 0.35 통과). e2e 회귀: 침실 bed 2노드+re-ID,
+  rug 2노드(실제 개수 일치), 주방 refrigerator 0.7~0.9, --map 재위치추정
+  매칭 7개 성공. realtime 모드는 프레임 샘플링 분산으로 실행별 노드 구성이
+  다소 달라짐(11s도 동일).
+  텍스트 인코더가 **MobileCLIP2**(mobileclip2_b.ts, 242MB)로 교체됨 — 자동
+  다운로드 실패 시: `curl -L -o mobileclip2_b.ts
+  https://github.com/ultralytics/assets/releases/download/v8.4.0/mobileclip2_b.ts`
+  (프로젝트 루트에 두면 됨). 구 인코더(mobileclip_blt.ts)와 yoloe-11s 가중치는
+  더 이상 필요 없음.
 
 ## 환경 주의사항 (필수)
 - `KMP_DUPLICATE_LIB_OK=TRUE` 필요 — pycolmap/torch가 각자 libomp를 번들해 OpenMP 중복 초기화 크래시 발생. 앱 엔트리포인트에서 import 전에 설정.

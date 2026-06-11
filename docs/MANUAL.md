@@ -13,7 +13,7 @@
 | OS | macOS |
 | Python | 3.12 (uv로 가상환경 생성) |
 | GPU | 불필요 — Apple MPS만 사용 (CUDA 불필요) |
-| 디스크 | 모델 가중치 약 2.5GB (최초 실행 시 자동 다운로드) |
+| 디스크 | 모델 가중치 약 2.2GB (최초 실행 시 자동 다운로드) |
 | 네트워크 | 최초 실행 시에만 필요 (Hugging Face 가중치 다운로드) |
 
 ---
@@ -54,7 +54,7 @@ uv pip install -p .venv --no-deps depth-anything-3
 ```
 
 - `config.yaml`의 `source`(기본: `sources/sample_720p.mp4`)를 입력으로 사용합니다.
-- 첫 실행은 모델 다운로드(약 2.5GB) 때문에 수 분 걸릴 수 있습니다.
+- 첫 실행은 모델 다운로드(약 2.2GB) 때문에 수 분 걸릴 수 있습니다.
   콘솔에 `waiting for backend process...`가 길게 보여도 정상입니다.
 - Rerun 뷰어 창이 자동으로 열립니다.
 
