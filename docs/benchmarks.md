@@ -111,3 +111,33 @@
 - 16뷰 LARGE@504 윈도가 1초 내이므로 5초 주기 예산 대부분이 남는다 —
   Tier 3(gsplat 레이어)용 시간·VRAM 여유 확보.
 - 기준선/Tier1 결과물: `baseline_tier0.npz` / `tier1.npz` (루트, headless 산출)
+
+## Tier 2 — pose-conditioned 추론은 기각 (2026-06-11)
+
+VO pose/K를 DA3 멀티뷰의 입력 조건(`inference(extrinsics=, intrinsics=,
+align_to_input_ext_scale=True)`)으로 주는 방식을 구현·실측한 결과 **기하가
+오염되어 기본 비활성(`backend.pose_conditioned: false`)으로 기각**. 코드
+경로·퇴화 게이트·테스트는 향후 재평가용으로 유지.
+
+| 비교 (r=0.04 상호 커버리지) | 결과 |
+|---|---|
+| 무조건화 sanity 기준 (baseline vs tier1) | 60.6% / 38.0% |
+| VO pose 조건화 vs tier1 | **10.0% / 25.4%** + robust extent 0.6x 수축 |
+| 조건화 OFF 회귀 (tier2_off vs tier1) | 100% / 100% (비하락 확인) |
+
+원인 분리 실험:
+1. **조건화 메커니즘 자체는 정상**: 모델이 예측한 pose를 그대로 재입력하면
+   무조건화 출력 대비 depth 변화가 4~5%(중앙값)에 그침.
+2. **DA3 pose 정규화 클램프는 부차적**: `_normalize_extrinsics`가 median
+   카메라 거리(min 0.1 클램프)로 나누는데, 라이브 단위 베이스라인(~0.02)이
+   클램프에 걸린다. median=1 사전 스케일로 무력화해도 결과 불변 (10%/25%).
+3. **근본 원인 — VO 베이스라인과 DA3 pose prior의 충돌**: DA3-LARGE-1.1의
+   자체 예측 pose 스프레드는 같은 영상에서 VO의 약 1/10 (0.046 vs 0.46) —
+   Phase 3에서 SMALL로 확인한 "pose 헤드 병진 과소추정"이 LARGE에도 존재.
+   조건화는 이 prior와 모순되는 VO 병진을 기하에 강제 주입해 depth shape를
+   왜곡한다 (per-window α 0.65~0.73, mono calib a 0.86까지 요동).
+
+재평가 조건: (a) 루프 클로저 등으로 pose 품질이 좋아진 뒤, (b) DA3 후속
+버전이 pose 헤드 병진을 고친 뒤, (c) 베이스라인이 큰(빠른 이동) 촬영 패턴.
+부산물: 키프레임에 VO 고정 K 동봉(`BackendKeyframe.K`), 윈도 정합 계수
+α,β가 `[backend]` 로그에 노출(`pose-cond α= β=`), `benchmarks/compare_maps.py`.

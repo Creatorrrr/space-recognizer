@@ -50,10 +50,12 @@ def _drain_backend_results(backend: ReconstructionBackend, worldmap: GlobalMap,
         # 갑자기 커지던 버그). K는 시작 시 첫 프레임의 DA3 추정으로 고정한다.
         viz.log_global_map(worldmap.points, worldmap.colors)
         mpu = f" 1unit={res.meters_per_unit:.2f}m" if res.meters_per_unit else ""
+        pc = (f" pose-cond α={res.win_alpha:.3f} β={res.win_beta:.3f}"
+              if res.pose_conditioned else "")
         print(f"[backend] window={len(res.window_ids)}kf "
               f"{res.runtime_s:.1f}s map={len(worldmap.points)}pts "
               f"calib a={calib.a:.3f} b={calib.b:.3f} "
-              f"scale={res.T_global_live[0]:.3f}{mpu}")
+              f"scale={res.T_global_live[0]:.3f}{mpu}{pc}")
 
 
 def dynamic_mask(detections: list[Detection], shape: tuple[int, int],
@@ -190,6 +192,9 @@ def main() -> None:
 
             if pose.is_keyframe:
                 small = cv2.resize(frame.bgr, (bw, bh), interpolation=cv2.INTER_AREA)
+                Kb = vo.K.copy()           # VO 고정 K를 백엔드 입력 해상도로
+                Kb[0] *= bw / W
+                Kb[1] *= bh / H
                 backend.add_keyframe(BackendKeyframe(
                     kf_id=kf_counter, ts=frame.ts,
                     rgb=cv2.cvtColor(small, cv2.COLOR_BGR2RGB),
@@ -199,6 +204,7 @@ def main() -> None:
                              cv2.resize(excl.astype(np.uint8), (bw, bh),
                                         interpolation=cv2.INTER_NEAREST).astype(bool),
                     calib_ab=(calib.a * frame_scale, calib.b * frame_scale),
+                    K=Kb,
                 ))
                 kf_counter += 1
 

@@ -54,6 +54,10 @@ class BackendCfg:
     metric_anchor: bool = False  # DA3METRIC로 미터 단위 추정 (느림, 선택)
     # 멀티뷰 conf 하위 퍼센타일 컷 (모델 변형마다 conf 분포가 달라 튜닝 대상)
     conf_percentile: float = 30.0
+    # VO pose를 DA3 멀티뷰의 입력 조건으로 전달 (pose-conditioned 추론).
+    # 출력 depth가 처음부터 라이브 pose 스케일로 정합되어 윈도 간 일관성이
+    # 좋아진다. 베이스라인이 퇴화한 윈도는 자동으로 무조건화 폴백.
+    pose_conditioned: bool = False
 
 
 @dataclass

@@ -62,8 +62,10 @@ def main() -> None:
                 calib = res.calib
                 frame_scale = 1.0  # main.py와 동일: 이중 적용 방지
             # K는 첫 프레임에서 고정 — 도중에 바꾸면 지도 스케일이 갈라진다
+            pc = (f" pose-cond α={res.win_alpha:.3f} β={res.win_beta:.3f}"
+                  if res.pose_conditioned else "")
             print(f"[res] map={len(wm.points)} scale={res.T_global_live[0]:.3f} "
-                  f"a={calib.a:.3f} fx={vo.K[0, 0]:.0f}")
+                  f"a={calib.a:.3f} fx={vo.K[0, 0]:.0f}{pc}")
 
     for i, frame in enumerate(src.frames()):
         if i % args.stride:
@@ -93,12 +95,15 @@ def main() -> None:
         traj.append(wm.to_global_pose(r.T_wc)[:3, 3])
         if r.is_keyframe:
             small = cv2.resize(frame.bgr, (bw, bh))
+            Kb = vo.K.copy()
+            Kb[0] *= bw / W
+            Kb[1] *= bh / H
             be.add_keyframe(BackendKeyframe(
                 kf_id, frame.ts, cv2.cvtColor(small, cv2.COLOR_BGR2RGB),
                 r.T_wc.copy(), cv2.resize(raw, (bw, bh)),
                 None if excl is None else
                 cv2.resize(excl.astype(np.uint8), (bw, bh)).astype(bool),
-                (calib.a * frame_scale, calib.b * frame_scale)))
+                (calib.a * frame_scale, calib.b * frame_scale), K=Kb))
             kf_id += 1
         drain()
         wm.step_correction()

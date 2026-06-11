@@ -49,6 +49,11 @@ backend:
   max_points: 2000000
   metric_anchor: true   # DA3METRIC-LARGE로 미터 단위 추정 (윈도당 +0.3~1s)
   conf_percentile: 30.0 # 멀티뷰 conf 하위 컷 (모델 변형 교체 시 재튜닝 대상)
+  # VO pose를 DA3 입력 조건으로 주는 pose-conditioned 추론. 실측 결과 본
+  # 데이터에서 기하를 왜곡해(커버리지 60%→10~25%, docs/benchmarks.md Tier 2)
+  # 기본 비활성 — DA3 pose prior의 병진 과소추정과 VO 베이스라인이 충돌.
+  # 향후 pose 품질 개선(루프 클로저) 후 재평가용으로 코드 경로는 유지.
+  pose_conditioned: false
 
 objects:
   ema_alpha: 0.3

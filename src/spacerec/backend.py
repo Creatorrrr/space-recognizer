@@ -38,6 +38,7 @@ class BackendKeyframe:
     raw_depth: np.ndarray | None    # uncalibrated live mono depth (small)
     dyn_mask: np.ndarray | None     # dynamic-object mask (small, bool)
     calib_ab: tuple[float, float] = (1.0, 0.0)  # 생성 시점의 mono 보정 계수
+    K: np.ndarray | None = None     # VO 고정 intrinsics (rgb 해상도 기준, 3x3)
 
 
 @dataclass
@@ -54,6 +55,9 @@ class BackendResult:
     point_view_idx: np.ndarray | None = None  # (N,) 각 포인트가 나온 뷰 번호
     window_ids: list[int] = field(default_factory=list)
     runtime_s: float = 0.0
+    pose_conditioned: bool = False  # 이번 윈도가 pose 조건화로 추론됐는지
+    win_alpha: float = 1.0          # 멀티뷰→라이브 스케일 정합 계수 (모니터링용:
+    win_beta: float = 0.0           #  pose 조건화 시 항등에 수렴해야 정상)
 
 
 def robust_sim3(src_poses: list[np.ndarray], dst_poses: list[np.ndarray]) -> Sim3:
@@ -78,6 +82,43 @@ def robust_sim3(src_poses: list[np.ndarray], dst_poses: list[np.ndarray]) -> Sim
     R = dst_poses[-1][:3, :3] @ src_poses[-1][:3, :3].T
     t = dst_c[-1] - s * R @ src_c[-1]
     return s, R, t
+
+
+def build_pose_inputs(window: list[BackendKeyframe],
+                      min_spread: float = 1e-3
+                      ) -> tuple[np.ndarray, np.ndarray] | None:
+    """윈도 키프레임의 VO pose/K를 DA3 입력 형식으로 변환.
+
+    반환: (extrinsics (V,4,4) w2c, intrinsics (V,3,3)) — rgb 해상도 기준.
+    K가 없거나 카메라 중심의 스프레드가 퇴화하면 None (무조건화 폴백):
+    베이스라인이 노이즈 수준이면 입력 pose와 예측 pose의 Umeyama 스케일
+    정합(align_to_input_ext_scale)이 불안정해 depth가 오염될 수 있다.
+
+    병진은 첫 뷰 기준 median 거리가 1이 되도록 미리 스케일한다. DA3의
+    _normalize_extrinsics가 median 거리로 나누되 min 0.1로 클램프하는데,
+    라이브 단위의 윈도 베이스라인(~0.02)은 클램프에 걸려 조건 신호가
+    5~10x 축소돼 기하가 왜곡된다 (실측: extent 0.64x 수축, 커버리지 붕괴).
+    미리 1로 맞추면 클램프가 무력화되고, 스케일 차이는 어차피 윈도 α,β
+    정합이 흡수한다.
+    """
+    if any(kf.K is None for kf in window):
+        return None
+    centers = np.array([kf.T_wc_live[:3, 3] for kf in window])
+    spread = float(np.linalg.norm(centers - centers.mean(0), axis=1).mean())
+    if len(window) < 3 or spread < min_spread:
+        return None
+    med = float(np.median(np.linalg.norm(centers - centers[0], axis=1)))
+    if med < min_spread:
+        return None
+    exts = []
+    for kf in window:
+        R = kf.T_wc_live[:3, :3]
+        c = kf.T_wc_live[:3, 3] / med
+        w2c = np.eye(4)
+        w2c[:3, :3] = R.T
+        w2c[:3, 3] = -R.T @ c
+        exts.append(w2c)
+    return np.stack(exts), np.stack([kf.K for kf in window])
 
 
 class _Worker:
@@ -136,8 +177,21 @@ class _Worker:
         window = old_kfs + new_kfs
         ids = [kf.kf_id for kf in window]
 
-        pred = self.model.inference([kf.rgb for kf in window],
-                                    process_res=self.process_res)
+        # ---- pose-conditioned 추론 (옵션): VO pose/K를 입력 조건으로 주면
+        # 출력 depth가 입력 pose 스케일로 정합되어 나온다 (패키지가 내부에서
+        # 예측 pose를 입력 pose에 Umeyama 정합 후 depth /= scale). 아래의
+        # α,β 정합은 안전망으로 유지하며, 조건화 시 항등에 수렴해야 정상.
+        pose_inputs = (build_pose_inputs(window)
+                       if self.cfg.pose_conditioned else None)
+        if pose_inputs is not None:
+            exts, ixts = pose_inputs
+            pred = self.model.inference([kf.rgb for kf in window],
+                                        extrinsics=exts, intrinsics=ixts,
+                                        align_to_input_ext_scale=True,
+                                        process_res=self.process_res)
+        else:
+            pred = self.model.inference([kf.rgb for kf in window],
+                                        process_res=self.process_res)
         V, dh, dw = pred.depth.shape
 
         # 윈도 pose는 라이브 VO pose를 그대로 사용한다. DA3-small의 pose 헤드는
@@ -248,7 +302,9 @@ class _Worker:
             intrinsics=np.median(pred.intrinsics, axis=0),
             depth_size=(dw, dh), meters_per_unit=self._meters_per_unit,
             view_origins=view_origins, point_view_idx=point_view_idx,
-            window_ids=ids, runtime_s=time.monotonic() - t0)
+            window_ids=ids, runtime_s=time.monotonic() - t0,
+            pose_conditioned=pose_inputs is not None,
+            win_alpha=alpha, win_beta=beta)
 
 
 def _worker_main(cfg: BackendCfg, model_name: str, device: str,
