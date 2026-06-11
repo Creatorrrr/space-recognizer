@@ -61,6 +61,22 @@ class BackendCfg:
 
 
 @dataclass
+class GaussianCfg:
+    """Gaussian Splatting 품질 레이어 (CUDA 전용, docs/upgrade-plan.md Tier 3).
+
+    voxel 지도(기하·증거 레이어)와 별개의 시각 품질 레이어 — 꺼도 기존
+    파이프라인은 동일하게 동작한다.
+    """
+    enabled: bool = False
+    period_s: float = 15.0      # 최적화 주기 (느슨해도 됨 — anytime 설계)
+    max_gaussians: int = 400_000
+    opt_steps: int = 150        # 주기당 최적화 스텝
+    spawn_stride: int = 4       # spawn 픽셀 서브샘플링
+    depth_loss_w: float = 0.3   # depth L1 가중치 (적은 뷰에서 기하 고정)
+    holdout_every: int = 8      # N번째 키프레임은 학습 제외 (PSNR 검증용)
+
+
+@dataclass
 class ObjectsCfg:
     ema_alpha: float = 0.3
     merge_radius: float = 0.5      # 연관 게이트의 상한 (크기 비례 게이트가 기본)
@@ -92,6 +108,7 @@ class Config:
     detect: DetectCfg = field(default_factory=DetectCfg)
     vo: VoCfg = field(default_factory=VoCfg)
     backend: BackendCfg = field(default_factory=BackendCfg)
+    gaussian: GaussianCfg = field(default_factory=GaussianCfg)
     objects: ObjectsCfg = field(default_factory=ObjectsCfg)
     graph: GraphCfg = field(default_factory=GraphCfg)
     viz: VizCfg = field(default_factory=VizCfg)
@@ -101,8 +118,8 @@ class Config:
         raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
         sections = {
             "depth": DepthCfg, "detect": DetectCfg, "vo": VoCfg,
-            "backend": BackendCfg, "objects": ObjectsCfg,
-            "graph": GraphCfg, "viz": VizCfg,
+            "backend": BackendCfg, "gaussian": GaussianCfg,
+            "objects": ObjectsCfg, "graph": GraphCfg, "viz": VizCfg,
         }
         kwargs = {}
         for key, value in raw.items():

@@ -141,3 +141,44 @@ align_to_input_ext_scale=True)`)으로 주는 방식을 구현·실측한 결과
 버전이 pose 헤드 병진을 고친 뒤, (c) 베이스라인이 큰(빠른 이동) 촬영 패턴.
 부산물: 키프레임에 VO 고정 K 동봉(`BackendKeyframe.K`), 윈도 정합 계수
 α,β가 `[backend]` 로그에 노출(`pose-cond α= β=`), `benchmarks/compare_maps.py`.
+
+## Tier 3 — gsplat Gaussian 품질 레이어 (2026-06-11)
+
+### Windows 빌드 레시피 (필수 — PyPI 1.5.3은 torch 2.11 비호환)
+
+PyPI gsplat 1.5.3은 torch 2.11에서 (a) 사설 API `_jit_compile` 시그니처
+변경, (b) torch 헤더 C++ 표준 충돌로 JIT 컴파일이 깨진다. **git main을
+소스 빌드**해야 하며, 다음 함정 4개를 모두 처리해야 한다:
+
+```
+git clone https://github.com/nerfstudio-project/gsplat.git && cd gsplat
+git submodule update --init --recursive     # (1) glm 서브모듈 필수
+# (2) setup.py 패치: return [gsplat_ext, inference_ext] → return [gsplat_ext]
+#     experimental 렌더러 확장이 Linux 전용 `uint` 타입을 써서 MSVC 빌드 실패
+# vcvars64.bat 환경에서, 환경 변수 4개 설정 후 설치:
+#   VSLANG=1033 + TORCH_DONT_CHECK_COMPILER_ABI=1
+#     (3) 한국어 MSVC의 cl 배너를 torch가 oem 코덱으로 디코드하다 크래시 — ABI
+#         체크(경고용)를 끄면 우회됨
+#   DISTUTILS_USE_SDK=1                      # (4) VC 환경에서 setup 빌드 요구사항
+#   TORCH_CUDA_ARCH_LIST=8.9                 # RTX 4080 (빌드 시간 단축)
+pip install . --no-deps --no-build-isolation
+```
+
+사전 컴파일 확장으로 설치되므로 **런타임에는 MSVC 불필요** (JIT 없음).
+
+### 게이트 실측 (RTX 4080)
+
+| 항목 | 측정값 |
+|---|---|
+| import + 첫 렌더 (사전 컴파일) | 0.1s + 0.1s |
+| 최적화 스텝 (5k gaussians, 504×283, RGB+ED) | 4.0 ms/step |
+| e2e (sample_720p, GS 2주기) | 13,148 gaussians, held-out PSNR 20.5dB |
+| GS 주기 처리 시간 | 0.8~2.6 s (15초 주기 예산 내) |
+| 라이브 FPS 간섭 | 6.0 → 6.2 FPS (간섭 없음, 별도 프로세스) |
+
+- PSNR 20.5dB는 3.6초 영상·2주기(~300스텝) 기준 — 긴 세션에서 주기가
+  쌓일수록 상승 여지. held-out 뷰(8번째 키프레임마다 학습 제외)로 측정.
+- gsplat 미설치/빌드 실패 시 GS 레이어만 자동 비활성 (`[gs] gsplat 사용
+  불가` 경고) — 나머지 파이프라인 무영향 확인.
+- 재실행: `python benchmarks/bench_gsplat.py` (게이트), e2e는 main 실행 후
+  `[gs]` 로그와 Rerun `GS Render` 패널 확인.

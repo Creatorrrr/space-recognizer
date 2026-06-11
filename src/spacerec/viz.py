@@ -28,28 +28,34 @@ def _color_for(name: str) -> list[int]:
 
 
 class Visualizer:
-    def __init__(self, app_id: str = "spacerec", memory_limit: str = "4GB"):
+    def __init__(self, app_id: str = "spacerec", memory_limit: str = "4GB",
+                 gs_panel: bool = False):
         self._trajectory: list[np.ndarray] = []
         self.meters_per_unit: float | None = None  # metric 앵커가 있으면 거리 라벨에 사용
         rr.init(app_id)
         # venv를 활성화하지 않고 실행해도 뷰어 바이너리를 찾도록 명시 경로 사용
         viewer = shutil.which("rerun") or str(Path(sys.executable).parent / "rerun")
         rr.spawn(memory_limit=memory_limit, executable_path=viewer)
-        rr.send_blueprint(self._blueprint())
+        rr.send_blueprint(self._blueprint(gs_panel))
         rr.log("world", rr.ViewCoordinates.RDF, static=True)
 
     @staticmethod
-    def _blueprint() -> rrb.Blueprint:
+    def _blueprint(gs_panel: bool = False) -> rrb.Blueprint:
+        rows = [
+            rrb.Spatial2DView(origin="world/camera/image", name="Live RGB",
+                              contents=["world/camera/image/rgb",
+                                        "world/camera/image/detections"]),
+            rrb.Spatial2DView(origin="world/camera/depth", name="Depth"),
+            rrb.TimeSeriesView(origin="calib", name="Depth Calibration"),
+        ]
+        shares = [2, 2, 1]
+        if gs_panel:
+            rows.insert(2, rrb.Spatial2DView(origin="gs/render",
+                                             name="GS Render"))
+            shares = [2, 2, 2, 1]
         return rrb.Blueprint(
             rrb.Horizontal(
-                rrb.Vertical(
-                    rrb.Spatial2DView(origin="world/camera/image", name="Live RGB",
-                                      contents=["world/camera/image/rgb",
-                                                "world/camera/image/detections"]),
-                    rrb.Spatial2DView(origin="world/camera/depth", name="Depth"),
-                    rrb.TimeSeriesView(origin="calib", name="Depth Calibration"),
-                    row_shares=[2, 2, 1],
-                ),
+                rrb.Vertical(*rows, row_shares=shares),
                 rrb.Spatial3DView(origin="world", name="3D World"),
                 column_shares=[1, 2],
             ),
@@ -92,6 +98,14 @@ class Visualizer:
 
     def log_global_map(self, points: np.ndarray, colors: np.ndarray) -> None:
         rr.log("world/points", rr.Points3D(points, colors=colors, radii=0.006))
+
+    def log_gaussians(self, points_global: np.ndarray, colors: np.ndarray,
+                      render: np.ndarray | None = None) -> None:
+        """GS 레이어 미리보기: gaussian 중심점(전역 좌표) + 최신 시점 렌더."""
+        rr.log("world/gaussians", rr.Points3D(points_global, colors=colors,
+                                              radii=0.005))
+        if render is not None:
+            rr.log("gs/render", rr.Image(render))
 
     def log_objects(self, objects: list, edges: list, visible: set[int]) -> None:
         """월드 오브젝트 노드(영속) + 관계 엣지 그래프.

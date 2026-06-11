@@ -55,6 +55,18 @@ backend:
   # 향후 pose 품질 개선(루프 클로저) 후 재평가용으로 코드 경로는 유지.
   pose_conditioned: false
 
+# Gaussian Splatting 품질 레이어 (CUDA 전용 — docs/upgrade-plan.md Tier 3).
+# voxel 지도와 독립적인 시각 품질 레이어. gsplat 미설치/컴파일 실패 시
+# 자동으로 비활성되고 나머지 파이프라인은 그대로 동작한다.
+gaussian:
+  enabled: true
+  period_s: 15        # 최적화 주기 (느슨해도 됨 — 미완료분은 다음 주기로 이월)
+  max_gaussians: 400000
+  opt_steps: 150      # 주기당 최적화 스텝
+  spawn_stride: 4     # spawn 픽셀 서브샘플링
+  depth_loss_w: 0.3   # depth L1 가중치 (뷰가 적을 때 기하 고정)
+  holdout_every: 8    # N번째 키프레임은 학습 제외 → PSNR 검증용
+
 objects:
   ema_alpha: 0.3
   merge_radius: 0.5    # 연관 게이트 상한 (기본은 물체 크기에 비례)

@@ -4,6 +4,8 @@
 
 - 실시간으로 물체를 검출·추적하고 3D 위치를 추정하며 (YOLOE 오픈 보캐뷸러리 + DA3-Small depth)
 - 5초 주기 멀티뷰 재구성으로 정적 공간의 3D 지도를 점점 완성하고 (DA3-Large any-view)
+- (CUDA) 15초 주기 **3D Gaussian Splatting 품질 레이어**로 렌더링 가능한
+  정적 지도를 추가로 다듬으며 (gsplat — `gaussian.enabled`),
 - 별도 3D 뷰어(Rerun)에 **오브젝트 노드 + 관계 그래프**를 그리고,
 - 화면 밖으로 나가거나 가려진 물체의 위치를 **계속 기억**해서 표시합니다.
 
@@ -71,6 +73,13 @@ YOLOE-26s-seg + MobileCLIP2 텍스트 인코더 0.3GB, DINOv2-small)가 자동
   → 멀티뷰 depth를 라이브 스케일로 정합(α,β) → 전역 지도 voxel 융합
   → mono depth 보정(a,b), intrinsics 추정, (옵션) metric 앵커
   → T_global_live(Sim3)를 부드럽게 갱신 — 객체 위치가 점프하지 않음
+
+[GS 품질 레이어 — 15초 주기, 별도 프로세스, CUDA 전용 (gaussian.enabled)]
+  키프레임(RGB+pose+보정 depth+동적 mask) → gsplat 3D Gaussian 점진 최적화
+  → 동적 물체가 제거된 렌더링 가능한 정적 지도 (Rerun: world/gaussians,
+    GS Render 패널). held-out 키프레임 PSNR로 품질 검증.
+  voxel 지도와 독립 — gsplat 미설치/실패 시 이 레이어만 자동 비활성.
+  설치(소스 빌드 필요): docs/benchmarks.md "Tier 3" 섹션 참고.
 
 [월드 모델 — 증거 기반 갱신]
   GlobalMap: 가중치 voxel + free-space carving — 새 관측의 시선이 옛 표면을

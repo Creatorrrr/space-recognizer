@@ -97,7 +97,8 @@ def main() -> None:
     if cfg.objects.appearance:
         from .appearance import AppearanceEmbedder
         embedder = AppearanceEmbedder(depth_est.device)
-    viz = Visualizer(memory_limit=cfg.viz.memory_limit)
+    use_gs = cfg.gaussian.enabled and depth_est.device == "cuda"
+    viz = Visualizer(memory_limit=cfg.viz.memory_limit, gs_panel=use_gs)
     source = VideoSource(cfg.source, proc_width=cfg.proc_width, realtime=cfg.realtime)
     W, H = source.proc_width, source.proc_height
     K = default_intrinsics(W, H)
@@ -107,9 +108,19 @@ def main() -> None:
                                     depth_est.device,
                                     cfg.depth.backend_process_res_resolved,
                                     metric_model=cfg.depth.metric_model)
+    gs_backend = None
+    if use_gs:
+        from .gs_backend import GaussianBackend
+        gs_backend = GaussianBackend(cfg.gaussian)
+        gs_backend.start()
     backend.start()
     print("waiting for backend process...")
     backend.wait_ready()
+    if gs_backend is not None:
+        # 첫 실행은 gsplat CUDA 커널 JIT 컴파일로 수 분 걸릴 수 있다 (캐시 후 수 초).
+        if not gs_backend.wait_ready():
+            print(f"[gs] gsplat 사용 불가 — GS 레이어 비활성: {gs_backend.failed}")
+            gs_backend = None
     calib = DepthCalibration()
     frame_scale = 1.0  # 키프레임 3D 기준의 프레임별 mono depth 스케일 보정
     # DA3의 프레임별 intrinsics 추정은 출렁임이 크다(fx 740~1015 관측).
@@ -195,7 +206,7 @@ def main() -> None:
                 Kb = vo.K.copy()           # VO 고정 K를 백엔드 입력 해상도로
                 Kb[0] *= bw / W
                 Kb[1] *= bh / H
-                backend.add_keyframe(BackendKeyframe(
+                kf = BackendKeyframe(
                     kf_id=kf_counter, ts=frame.ts,
                     rgb=cv2.cvtColor(small, cv2.COLOR_BGR2RGB),
                     T_wc_live=pose.T_wc.copy(),
@@ -205,10 +216,25 @@ def main() -> None:
                                         interpolation=cv2.INTER_NEAREST).astype(bool),
                     calib_ab=(calib.a * frame_scale, calib.b * frame_scale),
                     K=Kb,
-                ))
+                )
+                backend.add_keyframe(kf)
+                if gs_backend is not None:
+                    gs_backend.add_keyframe(kf)
                 kf_counter += 1
 
             # 백엔드 결과 반영 (논블로킹)
+            if gs_backend is not None:
+                while True:
+                    try:
+                        gres = gs_backend.results.get_nowait()
+                    except Exception:
+                        break
+                    # GS는 live 좌표계에서 최적화 — 표시 시점에 전역으로 변환
+                    viz.log_gaussians(worldmap.to_global_points(gres.means),
+                                      gres.colors, gres.render)
+                    psnr = (f" psnr={gres.psnr:.1f}dB" if gres.psnr else "")
+                    print(f"[gs] {gres.n_gaussians} gaussians "
+                          f"{gres.runtime_s:.1f}s{psnr}")
             new_calib = _drain_backend_results(backend, worldmap, viz, calib,
                                                vo, (W, H))
             if new_calib is not calib:
@@ -286,9 +312,23 @@ def main() -> None:
         # 영상 종료 후 진행 중인 백엔드 윈도 결과를 기다려 지도에 반영
         print("video ended; draining backend...")
         idle_since = time.monotonic()
-        while time.monotonic() - idle_since < 8.0:
+        gs_deadline = time.monotonic() + (cfg.gaussian.period_s + 5.0
+                                          if gs_backend is not None else 0.0)
+        while (time.monotonic() - idle_since < 8.0
+               or time.monotonic() < gs_deadline):
             before = len(worldmap.points)
             calib = _drain_backend_results(backend, worldmap, viz, calib, vo, (W, H))
+            if gs_backend is not None:
+                try:
+                    gres = gs_backend.results.get_nowait()
+                    viz.log_gaussians(worldmap.to_global_points(gres.means),
+                                      gres.colors, gres.render)
+                    psnr = (f" psnr={gres.psnr:.1f}dB" if gres.psnr else "")
+                    print(f"[gs] {gres.n_gaussians} gaussians "
+                          f"{gres.runtime_s:.1f}s{psnr}")
+                    gs_deadline = 0.0  # 첫 결과를 받았으면 더 기다리지 않는다
+                except Exception:
+                    pass
             for _ in range(10):
                 worldmap.step_correction()
             if len(worldmap.points) != before:
@@ -309,6 +349,8 @@ def main() -> None:
                       f"({len(worldmap.points)} pts, {n} objects)")
     finally:
         backend.stop()
+        if gs_backend is not None:
+            gs_backend.stop()
         source.release()
         elapsed = t_loop_end - t_start
         if frame_count and elapsed > 0:
