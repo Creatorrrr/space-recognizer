@@ -13,7 +13,7 @@
 | OS | macOS |
 | Python | 3.12 (uv로 가상환경 생성) |
 | GPU | 불필요 — Apple MPS만 사용 (CUDA 불필요) |
-| 디스크 | 모델 가중치 약 2GB (최초 실행 시 자동 다운로드) |
+| 디스크 | 모델 가중치 약 2.5GB (최초 실행 시 자동 다운로드) |
 | 네트워크 | 최초 실행 시에만 필요 (Hugging Face 가중치 다운로드) |
 
 ---
@@ -40,7 +40,7 @@ uv pip install -p .venv --no-deps depth-anything-3
 설치 확인:
 
 ```bash
-.venv/bin/python -m pytest tests/ -q     # 13개 테스트가 통과해야 합니다
+.venv/bin/python -m pytest tests/ -q     # 전체 테스트(24개)가 통과해야 합니다
 ```
 
 ---
@@ -54,7 +54,7 @@ uv pip install -p .venv --no-deps depth-anything-3
 ```
 
 - `config.yaml`의 `source`(기본: `sources/sample_720p.mp4`)를 입력으로 사용합니다.
-- 첫 실행은 모델 다운로드(약 2GB) 때문에 수 분 걸릴 수 있습니다.
+- 첫 실행은 모델 다운로드(약 2.5GB) 때문에 수 분 걸릴 수 있습니다.
   콘솔에 `waiting for backend process...`가 길게 보여도 정상입니다.
 - Rerun 뷰어 창이 자동으로 열립니다.
 
@@ -132,6 +132,8 @@ uv pip install -p .venv --no-deps depth-anything-3
 │ (검출 박스)   │       3D World           │
 ├──────────────┤  (지도·궤적·그래프)        │
 │  Depth       │                          │
+├──────────────┤                          │
+│ Depth Calib. │                          │
 └──────────────┴──────────────────────────┘
                 [타임라인]
 ```
@@ -139,13 +141,19 @@ uv pip install -p .venv --no-deps depth-anything-3
 ### Live RGB (좌상단)
 - 실시간 영상 위에 검출 박스와 `클래스#추적id` 라벨이 표시됩니다.
 
-### Depth (좌하단)
+### Depth (좌중단)
 - 보정된 실시간 depth 맵 (밝을수록 멂, Viridis 컬러맵).
+
+### Depth Calibration (좌하단)
+- depth 보정 계수의 시계열: `a`/`b`(5초 주기 멀티뷰 기준 affine 보정),
+  `frame_scale`(프레임 단위 스케일 보정). 값이 시간에 따라 움직이면
+  캘리브레이션이 정상 동작 중인 것입니다 (`a`는 보통 1.0 부근).
 
 ### 3D World (우측) — 핵심 화면
 | 요소 | 의미 |
 |---|---|
-| 컬러 점들 | 지금까지 누적된 **정적 공간의 3D 지도** (움직이는 물체는 제외됨) |
+| 컬러 점들 | 지금까지 누적된 **정적 공간의 3D 지도** (움직이는 물체는 제외됨). 증거 기반으로 갱신됨 — 잘못 만들어진 표면은 그 자리를 다시 비추면 지워지고, 단발성 오류로는 좋은 지도가 망가지지 않음 |
+| 옅은 점들 (`world/live_preview`) | 최신 키프레임의 실시간 depth 미리보기 (지도에 융합되기 전 모습) |
 | 파란 선 | 카메라가 지나온 궤적 |
 | 피라미드(frustum) | 현재 카메라 위치와 시선 방향 |
 | **구 + 라벨** | 인식된 오브젝트 노드 (`chair#5` 등) |
@@ -168,13 +176,20 @@ uv pip install -p .venv --no-deps depth-anything-3
 ### 콘솔 출력 읽는 법
 
 ```
-t=  9.1s processed=30 avg 3.4 FPS | pos=(-0.30,+0.07,+0.31) inliers=0.75 n=270
+t=  9.1s processed=30 avg 3.4 FPS | pos=(-0.30,+0.07,+0.31) inliers=0.75 n=270 fscale=0.987
 [backend] window=12kf 3.6s map=24471pts calib a=0.998 b=0.002 scale=1.000 1unit=4.03m
+[obj] new rug#4 size=0.41
+[reid] bed#0 재획득 (공백 6.0s, cost=0.44)
 ```
 
-- `inliers`: 카메라 추적 품질 (0.5 이상이면 양호, `LOST` 표시는 추적 실패)
+- `inliers`: 카메라 추적 품질 (0.5 이상이면 양호, `LOST` 표시는 추적 실패),
+  `fscale`: 프레임 단위 depth 스케일 보정값 (1.0 부근이 정상)
 - `[backend] ...`: 5초 주기 재구성 결과 — 지도 포인트 수, depth 보정 계수,
   `1unit=...m`은 상대 단위→미터 환산 계수
+- `[obj] new ...`: 새 물체 등록 / `[reid] ... 재획득`: 화면 밖에 있다 돌아온
+  물체를 같은 노드로 복원 / `[obj] ... 제거 — 부재 증거`: 보여야 하는 자리에
+  계속 없는 물체(치워졌거나 오인식) 정리 / `[reloc] ...`: `--map` 이전 세션
+  지도 정렬
 - 종료 시 `world objects (N):` 목록으로 기억된 모든 물체와 위치가 출력됩니다.
 
 ---
@@ -219,8 +234,11 @@ backend:
   metric_anchor: true             # 미터 단위 추정. 끄면 FPS가 다소 오름
 
 objects:
-  merge_radius: 0.5               # 재등장 병합 반경. 같은 물체가 둘로 나뉘면 ↑
+  merge_radius: 0.5               # 재등장 병합 반경의 상한 (기본은 물체 크기 비례)
   dynamic_var_thresh: 0.3         # 움직임 판정 민감도. 오판 많으면 ↑
+  appearance: true                # DINOv2 외형 임베딩 re-ID (같은 클래스 이웃 구분)
+  app_gate: 0.4                   # 외형 유사도 게이트. 낮추면 병합 관대해짐
+  absence_limit: 12               # '보여야 하는데 안 보임' 누적 시 노드 제거
 
 graph:
   near_dist: 1.2                  # 근접 엣지 거리 임계값. 엣지가 너무 많으면 ↓
@@ -235,8 +253,11 @@ graph:
 | FPS가 너무 낮다 | `backend.metric_anchor: false` → `proc_width: 960` → `backend.window_size: 8` |
 | 지도가 듬성듬성하다 | `backend.voxel_size: 0.02`, `viz.point_subsample: 2` |
 | 카메라 추적이 자주 끊긴다 | 더 천천히 촬영, `vo.keyframe_interval_s: 0.3` |
-| 같은 물체가 여러 노드로 등록된다 | `objects.merge_radius: 0.8` |
+| 같은 물체가 여러 노드로 등록된다 | `objects.merge_radius: 0.8`, `objects.app_gate: 0.3` |
 | 정지한 물체에 `~`(동적) 표시가 붙는다 | `objects.dynamic_var_thresh: 0.5` |
+| 오검출/중복 노드가 많다 (YOLOE) | `detect.conf: 0.45`, `vocabulary`에서 불필요 어휘 제거 |
+| 치워진 물체 노드가 너무 오래 남는다 | `objects.absence_limit: 6` |
+| 멀쩡한 물체 노드가 사라진다 | `objects.absence_limit: 24` |
 
 ---
 
@@ -279,8 +300,16 @@ graph:
 천천히, 질감 있는 장면을 비추면 자동으로 복구됩니다.
 
 **Q. 지도가 두 겹으로 어긋나 보입니다.**
-장시간 사용으로 drift가 누적된 경우입니다. 현재 버전은 루프 클로저가 없으므로
-긴 세션에서는 어쩔 수 없습니다. 재시작하면 새 지도로 시작합니다.
+장시간 사용으로 drift가 누적된 경우입니다. 어긋난 옛 표면은 그 자리를 다시
+천천히 비추면 빈 공간 증거(carving)로 점차 지워지지만, drift 자체를 되돌리는
+루프 클로저는 아직 없습니다. 재시작(또는 `--map`으로 재시작 후 재위치추정)이
+가장 빠른 해결책입니다.
+
+**Q. 잘못 인식됐던 물체/표면이 안 사라집니다.**
+그 자리를 카메라로 몇 초간 똑바로 비추세요. 표면은 시선 관통 증거로 지워지고
+(5초 주기 백엔드가 돌 때마다), 물체 노드는 "보여야 하는데 안 보임"이
+`absence_limit`(기본 12회)만큼 누적되면 제거됩니다. 가려져 있거나 화면
+가장자리에 있으면 부재로 세지 않으므로 정면으로 비춰야 합니다.
 
 **Q. 물체 위치가 미터로 안 나오고 이상한 단위입니다.**
 `backend.metric_anchor: true`인지 확인하세요. 켜져 있어도 첫 백엔드 결과

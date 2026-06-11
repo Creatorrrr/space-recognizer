@@ -1,5 +1,13 @@
 # Space Recognizer — 웹캠 기반 실시간 3D 공간·오브젝트 인식 시스템 설계 및 작업 계획
 
+> ⚠️ **이 문서는 구현 착수 시점의 설계 스냅샷입니다.** 구현 과정에서 다음이
+> 변경·추가되었습니다 (현재 상태는 `README.md`, 변경 근거는 `docs/benchmarks.md`):
+> - 검출: YOLO26n-seg → **YOLOE-11s-seg 오픈 보캐뷸러리** (COCO 어휘 한계 해소)
+> - DA3: 커뮤니티 MPS 래퍼 → **공식 depth-anything-3 패키지** (래퍼 결함 발견)
+> - 백엔드 pose: DA3 extrinsics 사용 불가 판명 → **라이브 VO pose 사용**
+> - 추가된 기능: DINOv2 외형 re-ID, 증거 기반 지도 갱신(free-space carving),
+>   객체 부재 처리, 세션 간 영속화+재위치추정(`--map`), 아이폰 Continuity Camera
+
 ## 1. 컨텍스트
 
 웹캠(개발 단계에서는 `sources/`의 영상을 웹캠 입력으로 에뮬레이션)으로 주변 공간을 돌아다니며 촬영하면:
