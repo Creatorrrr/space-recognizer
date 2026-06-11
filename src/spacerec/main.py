@@ -154,8 +154,17 @@ def main() -> None:
             print(f"no saved world at {args.map} (새로 시작, 종료 시 저장)")
     dyn_classes = set(cfg.detect.dynamic_classes)
     sub = cfg.viz.point_subsample
-    bw = cfg.depth.backend_process_res_resolved  # 백엔드 입력 가로 해상도
-    bh = int(H * bw / W)
+    # 백엔드 입력 해상도는 '긴 변' 기준 (DA3 upper_bound_resize와 동일 의미).
+    # 세로 영상에서 가로변 기준으로 잡으면 키프레임 배열·GS 렌더 해상도가
+    # 의도의 3.2배 픽셀이 되어 VRAM 16GB 포화→WDDM 스왑으로 백엔드 윈도가
+    # 30초까지 느려진다 (frames.mov 720x1280 실측 — docs/benchmarks.md).
+    bres = cfg.depth.backend_process_res_resolved
+    if H > W:  # portrait
+        bh = bres
+        bw = int(round(W * bres / H / 2) * 2)
+    else:
+        bw = bres
+        bh = int(round(H * bres / W / 2) * 2)
     kf_counter = 0
 
     # 모델 첫 호출은 커널 컴파일로 수 초가 걸린다 (YOLOE ~3s 실측). 실시간

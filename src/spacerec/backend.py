@@ -187,6 +187,11 @@ class _Worker:
                     out_q.put(result)
                     print(f"[backend-worker] window done in {result.runtime_s:.1f}s",
                           flush=True)
+                if self.device == "cuda":
+                    # 윈도 사이(수 초)에 예약 VRAM을 반환 — 라이브/GS 프로세스와
+                    # 16GB를 나눠 쓰므로 캐시를 쥐고 있으면 WDDM 스왑을 유발
+                    import torch
+                    torch.cuda.empty_cache()
             except Exception:
                 traceback.print_exc()
 
@@ -480,3 +485,19 @@ class ReconstructionBackend:
             self._proc.join(timeout=30)
             if self._proc.is_alive():
                 self._proc.terminate()
+        _drain_and_close(self._in_q, self.results)
+
+
+def _drain_and_close(*queues: mp.Queue) -> None:
+    """종료 행 방지: 큐에 남은 대형 항목(키프레임/결과 배열)이 feeder
+    스레드의 pipe 쓰기를 막으면 인터프리터 exit가 영원히 멈춘다 — 좀비
+    프로세스가 CUDA 컨텍스트(VRAM)를 계속 쥐는 사고로 실측됨. 남은 항목을
+    버리고 feeder join을 포기시킨다."""
+    for q in queues:
+        try:
+            while True:
+                q.get_nowait()
+        except Exception:
+            pass
+        q.cancel_join_thread()
+        q.close()

@@ -53,8 +53,14 @@ def main() -> None:
     be.start()
     be.wait_ready()
     calib = DepthCalibration()
-    bw = cfg.depth.backend_process_res_resolved
-    bh = int(H * bw / W)
+    # 백엔드 입력은 '긴 변' 기준 (main.py와 동일 — 세로 영상 메모리 폭증 방지)
+    bres = cfg.depth.backend_process_res_resolved
+    if H > W:
+        bh = bres
+        bw = int(round(W * bres / H / 2) * 2)
+    else:
+        bw = bres
+        bh = int(round(H * bres / W / 2) * 2)
     kf_id = 0
     dyn = set(cfg.detect.dynamic_classes)
     traj = []

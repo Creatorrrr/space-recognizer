@@ -31,6 +31,10 @@ _PRUNE_OPACITY = 0.05   # 이보다 투명한 gaussian은 주기마다 제거
 _SPAWN_ALPHA = 0.5      # 렌더 알파가 이보다 낮은 픽셀에만 신규 spawn (중복 방지)
 _MAX_TRAIN_KF = 48      # 학습 키프레임 링버퍼 (메모리 상한)
 _VIZ_MAX_PTS = 200_000  # 미리보기로 보내는 최대 포인트 수
+_DUTY = 0.5             # 주기 중 최적화에 쓰는 비율 — 0.8은 백엔드/라이브를
+                        # GPU에서 굶겼다 (frames.mov 실측: 백엔드 윈도 97s)
+_MIN_FREE_VRAM = 1.5e9  # 전역 VRAM 여유가 이보다 작으면 이번 주기 최적화 스킵
+                        # (WDDM 스왑 진입 = 전 프로세스 10~30x 슬로다운 방지)
 
 
 @dataclass
@@ -244,7 +248,13 @@ class _GsWorker:
                 pending = []
                 if not self.params or not self.train_views:
                     continue
-                deadline = last_run + self.cfg.period_s * 0.8
+                free, _ = torch.cuda.mem_get_info()
+                if free < _MIN_FREE_VRAM:
+                    print(f"[gs] VRAM 여유 부족({free / 2**30:.1f}GiB) — "
+                          f"이번 주기 최적화 건너뜀", flush=True)
+                    torch.cuda.empty_cache()
+                    continue
+                deadline = last_run + self.cfg.period_s * _DUTY
                 self._optimize(deadline)
                 self._prune()
 
@@ -266,6 +276,9 @@ class _GsWorker:
                     psnr=self._eval_psnr(),
                     render=render, render_kf_id=newest.kf_id,
                     runtime_s=time.monotonic() - t0))
+                # 예약(reserved) VRAM을 OS에 반환 — 3개 CUDA 프로세스가
+                # 캐시를 각자 쥐고 있으면 합산이 16GB를 넘는다
+                torch.cuda.empty_cache()
             except Exception:
                 traceback.print_exc()
 
@@ -334,3 +347,5 @@ class GaussianBackend:
             self._proc.join(timeout=15)
             if self._proc.is_alive():
                 self._proc.terminate()
+        from .backend import _drain_and_close
+        _drain_and_close(self._in_q, self.results)
