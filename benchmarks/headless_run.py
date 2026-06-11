@@ -26,11 +26,12 @@ def main() -> None:
     ap.add_argument("--stride", type=int, default=3)
     ap.add_argument("--out", default="/tmp/map.npz")
     ap.add_argument("--source", default=None)
+    ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--no-loop", action="store_true",
                     help="루프 클로저 강제 비활성 (A/B 비교용)")
     args = ap.parse_args()
 
-    cfg = Config.load()
+    cfg = Config.load(args.config)
     if args.source:
         cfg.source = args.source
     if args.no_loop:

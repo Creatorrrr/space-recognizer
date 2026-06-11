@@ -1,0 +1,95 @@
+# spacerec 기본 설정
+source: sources/sample_720p.mp4  # 파일 경로 또는 웹캠 인덱스(정수)
+realtime: true        # true면 파일도 벽시계 기준으로 프레임 드롭 (웹캠 에뮬레이션)
+proc_width: 1280      # 처리 해상도 (가로)
+
+depth:
+  model: depth-anything/DA3-SMALL  # HF model id (공식 depth-anything-3 패키지)
+  process_res: 504
+  # 백엔드 멀티뷰 전용 상향 (CUDA 여유 활용 — docs/upgrade-plan.md Tier 1).
+  # 비우면 라이브와 동일한 model/process_res 사용 (MPS 등 저사양 폴백).
+  backend_model: ""   # legacy: 라이브와 동일 (DA3-SMALL)
+  # 672px×16뷰는 any-view 어텐션 비용 폭증으로 윈도 15s+/VRAM 16GB 소진 (실측).
+  # 504px×16뷰가 시간/메모리 게이트 내 최대 구성.
+  backend_process_res: 0
+
+detect:
+  # YOLOE-26 오픈 보캐뷸러리 (기본): COCO에 없는 실내 물체(rug, wardrobe 등)를
+  # 올바른 라벨로 검출. 26s는 11s 대비 핵심 가구 신뢰도가 높고 중복 검출이
+  # 적으며 MPS track 60ms로 더 빠름 (NMS-free E2E). 텍스트 인코더는
+  # MobileCLIP2(mobileclip2_b.ts, 자동 다운로드).
+  # 고정 클래스로 돌리려면 model을 yolo26s-seg.pt로 바꾸고 vocabulary를 비울 것.
+  model: models/yoloe-26s-seg.pt
+  conf: 0.35
+  # 정적 지도에서 항상 제외할 클래스 (움직일 가능성 높음)
+  dynamic_classes: [person, cat, dog, bird]
+  # 인식할 어휘 (자유롭게 추가/삭제 가능 — 텍스트 임베딩은 시작 시 1회 계산)
+  vocabulary: [
+    person, cat, dog, bird,
+    bed, sofa, armchair, chair, stool, bench,
+    table, desk, wardrobe, cabinet, shelf, drawer, dresser,
+    rug, curtain, mirror, lamp, chandelier, pillow, blanket,
+    door, window, picture frame, clock, vase, potted plant,
+    tv, monitor, laptop, keyboard, speaker,
+    refrigerator, oven, microwave, sink, stove, coffee maker, toaster, kettle,
+    book, cup, bottle, bowl, box, backpack,
+  ]
+
+vo:
+  max_corners: 600
+  keyframe_interval_s: 0.5
+  keyframe_min_flow_px: 40.0
+  min_inlier_ratio: 0.5
+
+backend:
+  period_s: 5.0
+  window_size: 12      # 멀티뷰 윈도 키프레임 수
+  overlap: 6           # 직전 윈도와 중첩 키프레임 수
+  voxel_size: 0.03     # 전역 지도 voxel (장면 스케일 단위)
+  max_points: 800000
+  metric_anchor: true   # DA3METRIC-LARGE로 미터 단위 추정 (윈도당 +0.3~1s)
+  conf_percentile: 30.0 # 멀티뷰 conf 하위 컷 (모델 변형 교체 시 재튜닝 대상)
+  # VO pose를 DA3 입력 조건으로 주는 pose-conditioned 추론. 실측 결과 본
+  # 데이터에서 기하를 왜곡해(커버리지 60%→10~25%, docs/benchmarks.md Tier 2)
+  # 기본 비활성 — DA3 pose prior의 병진 과소추정과 VO 베이스라인이 충돌.
+  # 향후 pose 품질 개선(루프 클로저) 후 재평가용으로 코드 경로는 유지.
+  pose_conditioned: false
+
+# 루프 클로저 (docs/upgrade-plan.md Tier 4): 같은 장소 재방문을 감지해
+# VO drift를 pose graph로 보정. objects.appearance 필요 (DINOv2 공유).
+loop:
+  enabled: false
+  sim_thresh: 0.62   # 키프레임 임베딩 cos 유사도 후보 임계값
+  min_gap_s: 10      # 이보다 가까운 시점끼리는 루프로 안 봄
+  min_inliers: 25    # ORB+depth 3D-3D RANSAC inlier 하한 (오탐 기각)
+  inlier_dist: 0.05  # inlier 거리 임계값 (장면 단위)
+  max_kf_store: 600  # 루프 탐색용 키프레임 저장 상한 (~170MB RAM)
+
+# Gaussian Splatting 품질 레이어 (CUDA 전용 — docs/upgrade-plan.md Tier 3).
+# voxel 지도와 독립적인 시각 품질 레이어. gsplat 미설치/컴파일 실패 시
+# 자동으로 비활성되고 나머지 파이프라인은 그대로 동작한다.
+gaussian:
+  enabled: false
+  period_s: 15        # 최적화 주기 (느슨해도 됨 — 미완료분은 다음 주기로 이월)
+  max_gaussians: 400000
+  opt_steps: 150      # 주기당 최적화 스텝
+  spawn_stride: 4     # spawn 픽셀 서브샘플링
+  depth_loss_w: 0.3   # depth L1 가중치 (뷰가 적을 때 기하 고정)
+  holdout_every: 8    # N번째 키프레임은 학습 제외 → PSNR 검증용
+
+objects:
+  ema_alpha: 0.3
+  merge_radius: 0.5    # 연관 게이트 상한 (기본은 물체 크기에 비례)
+  dynamic_var_thresh: 0.3
+  appearance: true     # DINOv2 외형 임베딩으로 재등장 물체를 같은 노드에 복원
+  app_weight: 0.6
+  app_gate: 0.4        # cos 유사도가 이보다 낮으면 같은 물체로 보지 않음
+  absence_limit: 12    # 시야 안·비가림인데 미검출이 이만큼 누적되면 노드 제거
+
+graph:
+  near_dist: 1.2       # 근접 엣지 거리 임계값
+  vertical_ratio: 1.5  # 위/아래 판정: |dy| 가 수평거리의 몇 배 이상일 때
+
+viz:
+  memory_limit: 4GB
+  point_subsample: 4   # depth→포인트클라우드 픽셀 서브샘플링
