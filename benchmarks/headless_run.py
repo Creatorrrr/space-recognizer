@@ -25,18 +25,30 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--stride", type=int, default=3)
     ap.add_argument("--out", default="/tmp/map.npz")
+    ap.add_argument("--source", default=None)
+    ap.add_argument("--no-loop", action="store_true",
+                    help="루프 클로저 강제 비활성 (A/B 비교용)")
     args = ap.parse_args()
 
     cfg = Config.load()
+    if args.source:
+        cfg.source = args.source
+    if args.no_loop:
+        cfg.loop.enabled = False
     det = ObjectDetector(cfg.detect.model, conf=cfg.detect.conf,
                          vocabulary=cfg.detect.vocabulary)
     dep = DepthEstimator(cfg.depth.model)
+    embedder = None
+    if cfg.loop.enabled:
+        from spacerec.appearance import AppearanceEmbedder
+        embedder = AppearanceEmbedder(dep.device)
     src = VideoSource(cfg.source, proc_width=cfg.proc_width, realtime=False)
     W, H = src.proc_width, src.proc_height
     vo = VisualOdometry(default_intrinsics(W, H), cfg.vo)
     wm = GlobalMap(cfg.backend)
     be = ReconstructionBackend(cfg.backend, cfg.depth.backend_model_resolved,
-                               dep.device, cfg.depth.backend_process_res_resolved)
+                               dep.device, cfg.depth.backend_process_res_resolved,
+                               loop_cfg=cfg.loop if embedder else None)
     be.start()
     be.wait_ready()
     calib = DepthCalibration()
@@ -56,7 +68,11 @@ def main() -> None:
                 res = be.results.get_nowait()
             except Exception:
                 return
-            wm.fuse(res.points, res.colors)
+            wm.fuse(res.points, res.colors, epoch=res.epoch)
+            if res.loop_corrections:
+                wm.apply_corrections(res.loop_corrections)
+                print(f"[loop] {res.loop_log} "
+                      f"({len(res.loop_corrections)} epochs)")
             wm.set_correction_target(res.T_global_live)
             if res.calib.inlier_frac > 0.3:
                 calib = res.calib
@@ -95,15 +111,17 @@ def main() -> None:
         traj.append(wm.to_global_pose(r.T_wc)[:3, 3])
         if r.is_keyframe:
             small = cv2.resize(frame.bgr, (bw, bh))
+            small_rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
             Kb = vo.K.copy()
             Kb[0] *= bw / W
             Kb[1] *= bh / H
             be.add_keyframe(BackendKeyframe(
-                kf_id, frame.ts, cv2.cvtColor(small, cv2.COLOR_BGR2RGB),
+                kf_id, frame.ts, small_rgb,
                 r.T_wc.copy(), cv2.resize(raw, (bw, bh)),
                 None if excl is None else
                 cv2.resize(excl.astype(np.uint8), (bw, bh)).astype(bool),
-                (calib.a * frame_scale, calib.b * frame_scale), K=Kb))
+                (calib.a * frame_scale, calib.b * frame_scale), K=Kb,
+                emb=embedder.embed_frame(small_rgb) if embedder else None))
             kf_id += 1
         drain()
         wm.step_correction()

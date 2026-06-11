@@ -26,7 +26,8 @@ import numpy as np
 
 from .calib import DepthCalibration, fit_affine_depth
 from .config import BackendCfg
-from .geometry import SIM3_IDENTITY, Sim3, sim3_apply, sim3_on_pose, umeyama_sim3
+from .geometry import (SIM3_IDENTITY, Sim3, sim3_apply, sim3_compose,
+                       sim3_inverse, sim3_on_pose, umeyama_sim3)
 
 
 @dataclass
@@ -39,6 +40,7 @@ class BackendKeyframe:
     dyn_mask: np.ndarray | None     # dynamic-object mask (small, bool)
     calib_ab: tuple[float, float] = (1.0, 0.0)  # 생성 시점의 mono 보정 계수
     K: np.ndarray | None = None     # VO 고정 intrinsics (rgb 해상도 기준, 3x3)
+    emb: np.ndarray | None = None   # DINOv2 전역 임베딩 (루프 클로저용)
 
 
 @dataclass
@@ -58,6 +60,10 @@ class BackendResult:
     pose_conditioned: bool = False  # 이번 윈도가 pose 조건화로 추론됐는지
     win_alpha: float = 1.0          # 멀티뷰→라이브 스케일 정합 계수 (모니터링용:
     win_beta: float = 0.0           #  pose 조건화 시 항등에 수렴해야 정상)
+    epoch: int = 0                  # 이번 윈도의 지도 epoch (voxel 출처 추적)
+    # 루프 클로저가 수락된 경우: epoch별 지도 보정 Sim3 + 로그 문자열
+    loop_corrections: dict[int, Sim3] | None = None
+    loop_log: str = ""
 
 
 def robust_sim3(src_poses: list[np.ndarray], dst_poses: list[np.ndarray]) -> Sim3:
@@ -77,8 +83,11 @@ def robust_sim3(src_poses: list[np.ndarray], dst_poses: list[np.ndarray]) -> Sim
     if len(src_poses) >= 2:
         d_src = np.linalg.norm(src_c[-1] - src_c[0])
         d_dst = np.linalg.norm(dst_c[-1] - dst_c[0])
-        if d_src > 1e-6 and d_dst > 1e-6:
-            s = float(d_dst / d_src)
+        # 베이스라인이 노이즈 수준이면 두 미세 거리의 비율이 그대로 스케일이
+        # 되어 폭주한다 (실측 9.8x — 카메라 정지 구간). 충분한 거리에서만
+        # 추정하고 비율도 상식 범위로 클램프.
+        if d_src > 1e-3 and d_dst > 1e-3:
+            s = float(np.clip(d_dst / d_src, 0.5, 2.0))
     R = dst_poses[-1][:3, :3] @ src_poses[-1][:3, :3].T
     t = dst_c[-1] - s * R @ src_c[-1]
     return s, R, t
@@ -125,7 +134,8 @@ class _Worker:
     """Backend state + window processing. Lives entirely in the child process."""
 
     def __init__(self, cfg: BackendCfg, model_name: str, device: str,
-                 process_res: int, metric_model: str | None = None):
+                 process_res: int, metric_model: str | None = None,
+                 loop_cfg=None):
         from depth_anything_3.api import DepthAnything3
 
         self.cfg = cfg
@@ -140,6 +150,18 @@ class _Worker:
         self.kf_global_poses: dict[int, np.ndarray] = {}
         self._pending: list[BackendKeyframe] = []
         self._reconstructed: list[BackendKeyframe] = []
+        # ---- 루프 클로저 상태 (loop_cfg가 있을 때만) ----
+        self.loop_cfg = loop_cfg
+        self.detector = None
+        if loop_cfg is not None and loop_cfg.enabled:
+            from .loop import LoopDetector
+            self.detector = LoopDetector(loop_cfg.sim_thresh,
+                                         loop_cfg.min_gap_s,
+                                         loop_cfg.max_kf_store)
+        self._epoch = 0
+        self._epoch_kfs: dict[int, list[int]] = {}   # epoch -> 그 윈도의 kf ids
+        # 루프 검증용 키프레임 저장: id -> (ts, gray u8, depth f16, K)
+        self._kf_store: dict[int, tuple] = {}
 
     def run(self, in_q: mp.Queue, out_q: mp.Queue) -> None:
         last_run = time.monotonic()
@@ -176,6 +198,7 @@ class _Worker:
         old_kfs = self._reconstructed[-self.cfg.overlap:]
         window = old_kfs + new_kfs
         ids = [kf.kf_id for kf in window]
+        self._epoch_kfs[self._epoch] = ids
 
         # ---- pose-conditioned 추론 (옵션): VO pose/K를 입력 조건으로 주면
         # 출력 depth가 입력 pose 스케일로 정합되어 나온다 (패키지가 내부에서
@@ -296,6 +319,19 @@ class _Worker:
         # 윈도 중첩에 쓰일 최근 키프레임만 이미지를 유지 (메모리 해제)
         self._reconstructed = self._reconstructed[-self.cfg.overlap:]
 
+        # ---- 루프 클로저: 재방문 감지 → pose graph → epoch별 지도 보정 ----
+        corrections, loop_log, corr_newest = self._close_loops(new_kfs)
+        if corrections is not None:
+            # live→global 갱신은 재피팅이 아니라 *합성*으로: pose graph가
+            # 최신 노드를 얼마나 움직였는지(corr_newest)가 곧 현재 시점의
+            # 전역 보정량이다. pose 집합에 Umeyama를 다시 맞추면 보정이
+            # 비균일하게 변형시킨 카메라 배치 탓에 스케일이 폭주한다
+            # (실측: 윈도 전체 1.4~1.5, 신규만 써도 정지 구간에서 2.6~9.8).
+            T_gl = sim3_compose(corr_newest, T_gl)
+
+        epoch = self._epoch
+        self._epoch += 1
+
         return BackendResult(
             points=points, colors=colors, T_global_live=T_gl, calib=calib,
             kf_global_poses=dict(self.kf_global_poses),
@@ -304,15 +340,110 @@ class _Worker:
             view_origins=view_origins, point_view_idx=point_view_idx,
             window_ids=ids, runtime_s=time.monotonic() - t0,
             pose_conditioned=pose_inputs is not None,
-            win_alpha=alpha, win_beta=beta)
+            win_alpha=alpha, win_beta=beta,
+            epoch=epoch, loop_corrections=corrections, loop_log=loop_log)
+
+    # ------------------------------------------------------------------
+    # 루프 클로저 (docs/upgrade-plan.md Tier 4)
+    # ------------------------------------------------------------------
+    _MAX_GRAPH_NODES = 400
+
+    def _close_loops(self, new_kfs: list[BackendKeyframe]
+                     ) -> tuple[dict[int, Sim3] | None, str, Sim3]:
+        """새 키프레임에서 재방문을 찾아 수락되면 pose graph로 drift 보정.
+
+        반환: (epoch별 지도 보정 Sim3 dict | None, 로그 문자열,
+               최신 키프레임 노드의 보정 Sim3 — T_global_live 합성용).
+        kf_global_poses는 in-place로 보정된다.
+        """
+        if self.detector is None:
+            return None, "", SIM3_IDENTITY
+        from .loop import (match_3d3d, optimize_pose_graph, sequential_edges,
+                           sim3_from_matches)
+
+        lcfg = self.loop_cfg
+        accepted = []
+        for kf in new_kfs:
+            if kf.emb is None or kf.K is None or kf.raw_depth is None:
+                continue
+            a0, b0 = kf.calib_ab
+            gray = cv2.cvtColor(kf.rgb, cv2.COLOR_RGB2GRAY)
+            depth = (a0 * kf.raw_depth + b0).astype(np.float16)
+            hit = self.detector.query(kf.ts, kf.emb)
+            if (hit is not None and hit[0] in self._kf_store
+                    and hit[0] in self.kf_global_poses):
+                old_id, sim = hit
+                _, ogray, odepth, oK = self._kf_store[old_id]
+                pts_a, pts_b = match_3d3d(
+                    ogray, odepth.astype(np.float32), oK,
+                    gray, depth.astype(np.float32), kf.K)
+                res = sim3_from_matches(pts_a, pts_b, lcfg.inlier_dist,
+                                        min_inliers=lcfg.min_inliers)
+                if res is not None:
+                    T_ab, mask = res
+                    accepted.append((old_id, kf.kf_id, T_ab,
+                                     int(mask.sum()), sim))
+                else:
+                    print(f"[loop] 후보 기각 kf{old_id}->kf{kf.kf_id} "
+                          f"(sim={sim:.2f}, 3D 검증 실패)", flush=True)
+            self.detector.add(kf.kf_id, kf.ts, kf.emb)
+            self._kf_store[kf.kf_id] = (kf.ts, gray, depth, kf.K)
+            while len(self._kf_store) > lcfg.max_kf_store:
+                self._kf_store.pop(next(iter(self._kf_store)))
+
+        if not accepted or len(self.kf_global_poses) < 8:
+            return None, "", SIM3_IDENTITY
+
+        # ---- pose graph 노드 선정 (장시간 세션은 솎아냄) ----
+        all_ids = sorted(self.kf_global_poses)
+        must = {i for loop in accepted for i in loop[:2]}
+        if len(all_ids) > self._MAX_GRAPH_NODES:
+            stride = int(np.ceil(len(all_ids) / self._MAX_GRAPH_NODES))
+            node_ids = sorted(set(all_ids[::stride]) | must | {all_ids[-1]})
+        else:
+            node_ids = all_ids
+        idx = {k: i for i, k in enumerate(node_ids)}
+        poses = [self.kf_global_poses[k] for k in node_ids]
+
+        edges = sequential_edges(poses)
+        for old_id, new_id, T_ab, inl, _ in accepted:
+            if old_id in idx and new_id in idx:
+                edges.append((idx[old_id], idx[new_id], T_ab,
+                              min(1.5, inl / 50.0)))
+        corrected = optimize_pose_graph(poses, edges)
+
+        # 노드별 보정 Sim3 (corrected ∘ old⁻¹); 비노드 kf는 최근접 노드 보정 적용
+        node_corr: list[Sim3] = []
+        for k, old in zip(node_ids, poses):
+            node_corr.append(sim3_compose(
+                corrected[idx[k]],
+                sim3_inverse((1.0, old[:3, :3], old[:3, 3]))))
+        node_arr = np.array(node_ids)
+        for k in all_ids:
+            j = int(np.argmin(np.abs(node_arr - k)))
+            self.kf_global_poses[k] = sim3_on_pose(node_corr[j],
+                                                   self.kf_global_poses[k])
+
+        # epoch별 지도 보정: 각 윈도의 최신 kf에 대응하는 노드 보정 사용
+        corrections: dict[int, Sim3] = {}
+        for e, kf_ids in self._epoch_kfs.items():
+            j = int(np.argmin(np.abs(node_arr - kf_ids[-1])))
+            corrections[e] = node_corr[j]
+
+        mag = max(np.linalg.norm(c[2]) for c in node_corr)
+        log = "; ".join(f"kf{o}↔kf{nn} inl={i} sim={s_:.2f}"
+                        for o, nn, _, i, s_ in accepted)
+        j_newest = int(np.argmin(np.abs(node_arr - new_kfs[-1].kf_id)))
+        return corrections, f"{log} | max|t|={mag:.3f}", node_corr[j_newest]
 
 
 def _worker_main(cfg: BackendCfg, model_name: str, device: str,
-                 process_res: int, metric_model: str | None,
+                 process_res: int, metric_model: str | None, loop_cfg,
                  in_q: mp.Queue, out_q: mp.Queue) -> None:
     import spacerec  # noqa: F401  (env vars in the child process)
 
-    worker = _Worker(cfg, model_name, device, process_res, metric_model)
+    worker = _Worker(cfg, model_name, device, process_res, metric_model,
+                     loop_cfg=loop_cfg)
     out_q.put("ready")
     worker.run(in_q, out_q)
 
@@ -321,14 +452,15 @@ class ReconstructionBackend:
     """Main-process handle: feeds keyframes to / reads results from the child."""
 
     def __init__(self, cfg: BackendCfg, model_name: str, device: str,
-                 process_res: int = 504, metric_model: str | None = None):
+                 process_res: int = 504, metric_model: str | None = None,
+                 loop_cfg=None):
         ctx = mp.get_context("spawn")
         self._in_q: mp.Queue = ctx.Queue()
         self.results: mp.Queue = ctx.Queue()
         self._proc = ctx.Process(
             target=_worker_main,
             args=(cfg, model_name, device, process_res, metric_model,
-                  self._in_q, self.results),
+                  loop_cfg, self._in_q, self.results),
             daemon=True)
 
     def start(self) -> None:

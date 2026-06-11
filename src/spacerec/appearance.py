@@ -30,6 +30,17 @@ class AppearanceEmbedder:
         self.model(dummy)
 
     @torch.no_grad()
+    def embed_frame(self, rgb: np.ndarray) -> np.ndarray:
+        """전체 프레임의 전역 임베딩 (L2 정규화) — 키프레임 place recognition용."""
+        import cv2
+        img = cv2.resize(rgb.astype(np.float32) / 255.0, (_INPUT, _INPUT),
+                         interpolation=cv2.INTER_AREA)
+        img = (img - _IMAGENET_MEAN) / _IMAGENET_STD
+        batch = torch.from_numpy(img.transpose(2, 0, 1)[None]).to(self.device)
+        feat = self.model(batch).float().cpu().numpy()[0]
+        return feat / (np.linalg.norm(feat) + 1e-9)
+
+    @torch.no_grad()
     def embed(self, bgr: np.ndarray, observations: list) -> None:
         """각 Observation의 crop을 배치로 임베딩해 obs.emb에 채운다 (L2 정규화)."""
         if not observations:

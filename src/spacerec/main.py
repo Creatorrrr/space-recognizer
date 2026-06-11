@@ -38,12 +38,20 @@ def _drain_backend_results(backend: ReconstructionBackend, worldmap: GlobalMap,
         except Exception:
             return calib
         worldmap.fuse(res.points, res.colors,
-                      origins=res.view_origins, view_idx=res.point_view_idx)
+                      origins=res.view_origins, view_idx=res.point_view_idx,
+                      epoch=res.epoch)
+        if res.loop_corrections:
+            # 루프 클로저: 과거 epoch들의 voxel을 보정된 pose에 맞춰 이동
+            worldmap.apply_corrections(res.loop_corrections)
+            print(f"[loop] 루프 클로저 수락 — {res.loop_log} "
+                  f"(지도 {len(res.loop_corrections)} epoch 보정)")
         worldmap.set_correction_target(res.T_global_live)
         if res.calib.inlier_frac > 0.3:
             calib = res.calib
         if res.meters_per_unit is not None:
-            viz.meters_per_unit = res.meters_per_unit
+            # mpu는 live 스케일 기준 추정치 — 전역 좌표 거리에 쓰려면 현재
+            # live→global 스케일로 환산해야 한다 (루프 클로저 후 s≠1 가능).
+            viz.meters_per_unit = res.meters_per_unit / res.T_global_live[0]
         # 주의: 여기서 vo.set_intrinsics()를 호출하면 안 된다. 실행 도중 K가
         # 바뀌면 VO 병진/키프레임 3D의 스케일이 전환 시점 전후로 달라져,
         # 기존 지도 위에 다른 크기의 공간이 겹쳐 그려진다 (8초 시점에 공간이
@@ -97,6 +105,9 @@ def main() -> None:
     if cfg.objects.appearance:
         from .appearance import AppearanceEmbedder
         embedder = AppearanceEmbedder(depth_est.device)
+    use_loop = cfg.loop.enabled and embedder is not None
+    if cfg.loop.enabled and embedder is None:
+        print("[loop] objects.appearance가 꺼져 있어 루프 클로저 비활성")
     use_gs = cfg.gaussian.enabled and depth_est.device == "cuda"
     viz = Visualizer(memory_limit=cfg.viz.memory_limit, gs_panel=use_gs)
     source = VideoSource(cfg.source, proc_width=cfg.proc_width, realtime=cfg.realtime)
@@ -107,7 +118,8 @@ def main() -> None:
     backend = ReconstructionBackend(cfg.backend, cfg.depth.backend_model_resolved,
                                     depth_est.device,
                                     cfg.depth.backend_process_res_resolved,
-                                    metric_model=cfg.depth.metric_model)
+                                    metric_model=cfg.depth.metric_model,
+                                    loop_cfg=cfg.loop if use_loop else None)
     gs_backend = None
     if use_gs:
         from .gs_backend import GaussianBackend
@@ -206,9 +218,10 @@ def main() -> None:
                 Kb = vo.K.copy()           # VO 고정 K를 백엔드 입력 해상도로
                 Kb[0] *= bw / W
                 Kb[1] *= bh / H
+                small_rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
                 kf = BackendKeyframe(
                     kf_id=kf_counter, ts=frame.ts,
-                    rgb=cv2.cvtColor(small, cv2.COLOR_BGR2RGB),
+                    rgb=small_rgb,
                     T_wc_live=pose.T_wc.copy(),
                     raw_depth=cv2.resize(raw_depth, (bw, bh)),
                     dyn_mask=None if excl is None else
@@ -216,6 +229,7 @@ def main() -> None:
                                         interpolation=cv2.INTER_NEAREST).astype(bool),
                     calib_ab=(calib.a * frame_scale, calib.b * frame_scale),
                     K=Kb,
+                    emb=(embedder.embed_frame(small_rgb) if use_loop else None),
                 )
                 backend.add_keyframe(kf)
                 if gs_backend is not None:

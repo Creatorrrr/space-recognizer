@@ -55,6 +55,16 @@ backend:
   # 향후 pose 품질 개선(루프 클로저) 후 재평가용으로 코드 경로는 유지.
   pose_conditioned: false
 
+# 루프 클로저 (docs/upgrade-plan.md Tier 4): 같은 장소 재방문을 감지해
+# VO drift를 pose graph로 보정. objects.appearance 필요 (DINOv2 공유).
+loop:
+  enabled: true
+  sim_thresh: 0.62   # 키프레임 임베딩 cos 유사도 후보 임계값
+  min_gap_s: 10      # 이보다 가까운 시점끼리는 루프로 안 봄
+  min_inliers: 25    # ORB+depth 3D-3D RANSAC inlier 하한 (오탐 기각)
+  inlier_dist: 0.05  # inlier 거리 임계값 (장면 단위)
+  max_kf_store: 600  # 루프 탐색용 키프레임 저장 상한 (~170MB RAM)
+
 # Gaussian Splatting 품질 레이어 (CUDA 전용 — docs/upgrade-plan.md Tier 3).
 # voxel 지도와 독립적인 시각 품질 레이어. gsplat 미설치/컴파일 실패 시
 # 자동으로 비활성되고 나머지 파이프라인은 그대로 동작한다.

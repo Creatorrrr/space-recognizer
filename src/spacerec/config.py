@@ -61,6 +61,22 @@ class BackendCfg:
 
 
 @dataclass
+class LoopCfg:
+    """루프 클로저 (docs/upgrade-plan.md Tier 4).
+
+    DINOv2 키프레임 임베딩으로 재방문을 감지하고, ORB+depth 3D-3D RANSAC으로
+    상대 Sim3를 검증한 뒤 pose graph로 누적 drift를 보정한다.
+    objects.appearance가 켜져 있어야 동작한다 (임베더 공유).
+    """
+    enabled: bool = False
+    sim_thresh: float = 0.62    # 임베딩 cos 유사도 후보 임계값
+    min_gap_s: float = 10.0     # 이보다 가까운 시점끼리는 루프로 안 봄
+    min_inliers: int = 25       # 3D-3D RANSAC inlier 하한 (기각 게이트)
+    inlier_dist: float = 0.05   # inlier 거리 임계값 (장면 단위, ≈12cm@2.5m/unit)
+    max_kf_store: int = 600     # 루프 탐색용 키프레임 저장 상한
+
+
+@dataclass
 class GaussianCfg:
     """Gaussian Splatting 품질 레이어 (CUDA 전용, docs/upgrade-plan.md Tier 3).
 
@@ -109,6 +125,7 @@ class Config:
     vo: VoCfg = field(default_factory=VoCfg)
     backend: BackendCfg = field(default_factory=BackendCfg)
     gaussian: GaussianCfg = field(default_factory=GaussianCfg)
+    loop: LoopCfg = field(default_factory=LoopCfg)
     objects: ObjectsCfg = field(default_factory=ObjectsCfg)
     graph: GraphCfg = field(default_factory=GraphCfg)
     viz: VizCfg = field(default_factory=VizCfg)
@@ -118,7 +135,7 @@ class Config:
         raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
         sections = {
             "depth": DepthCfg, "detect": DetectCfg, "vo": VoCfg,
-            "backend": BackendCfg, "gaussian": GaussianCfg,
+            "backend": BackendCfg, "gaussian": GaussianCfg, "loop": LoopCfg,
             "objects": ObjectsCfg, "graph": GraphCfg, "viz": VizCfg,
         }
         kwargs = {}

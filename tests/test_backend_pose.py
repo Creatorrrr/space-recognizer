@@ -69,3 +69,24 @@ def test_too_few_views_falls_back():
 def test_spread_gate(spread_scale, expected):
     window = [_kf(i, [0.05 * i * spread_scale, 0, 0], K=K) for i in range(6)]
     assert (build_pose_inputs(window) is not None) is expected
+
+
+def test_robust_sim3_clamps_degenerate_scale():
+    from spacerec.backend import robust_sim3
+
+    # 카메라가 사실상 정지: 미세 베이스라인 비율이 스케일로 폭주하면 안 됨
+    def se3(p):
+        T = np.eye(4)
+        T[:3, 3] = p
+        return T
+
+    src = [se3([0, 0, 0]), se3([1e-5, 0, 0])]
+    dst = [se3([0, 0, 0]), se3([5e-4, 0, 0])]  # 비율 50x — 노이즈
+    s, R, t = robust_sim3(src, dst)
+    assert s == 1.0
+
+    # 정상 베이스라인에서는 비율 추정이 동작하되 [0.5, 2] 클램프
+    src = [se3([0, 0, 0]), se3([0.01, 0, 0])]
+    dst = [se3([0, 0, 0]), se3([0.05, 0, 0])]  # 비율 5x → 2.0으로 클램프
+    s, _, _ = robust_sim3(src, dst)
+    assert s == 2.0

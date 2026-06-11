@@ -32,6 +32,7 @@ class GlobalMap:
         self._psum = np.empty((0, 3), np.float64)
         self._csum = np.empty((0, 3), np.float64)
         self._cnt = np.empty(0, np.int64)
+        self._epoch = np.empty(0, np.int32)      # voxel별 마지막 갱신 epoch
         self.points = np.empty((0, 3), np.float32)
         self.colors = np.empty((0, 3), np.uint8)
         self._carve_pass = 0
@@ -49,8 +50,12 @@ class GlobalMap:
     def fuse(self, points: np.ndarray, colors: np.ndarray,
              origins: np.ndarray | None = None,
              view_idx: np.ndarray | None = None,
-             weight: float = 1.0) -> None:
-        """관측 포인트를 융합하고, 시선 정보가 있으면 free-space carving 수행."""
+             weight: float = 1.0, epoch: int = 0) -> None:
+        """관측 포인트를 융합하고, 시선 정보가 있으면 free-space carving 수행.
+
+        epoch은 이 포인트들을 만든 백엔드 윈도 번호 — 루프 클로저가 과거
+        구간의 drift를 보정할 때 voxel을 출처별로 이동시키는 데 쓰인다.
+        """
         points = np.asarray(points, np.float64).reshape(-1, 3)
         if len(points):
             colors = np.asarray(colors, np.float64).reshape(-1, 3)
@@ -70,17 +75,21 @@ class GlobalMap:
             ps = np.zeros((len(merged), 3))
             cs = np.zeros((len(merged), 3))
             ct = np.zeros(len(merged), np.int64)
+            ep = np.zeros(len(merged), np.int32)
             w[minv[:n_old]] = self._weight
             ps[minv[:n_old]] = self._psum
             cs[minv[:n_old]] = self._csum
             ct[minv[:n_old]] = self._cnt
+            ep[minv[:n_old]] = self._epoch
             idx_new = minv[n_old:]
             w[idx_new] = np.minimum(w[idx_new] + wnew, _MAX_W)
             ps[idx_new] += psum
             cs[idx_new] += csum
             ct[idx_new] += counts
+            ep[idx_new] = epoch
             self._keys, self._weight = merged, w
             self._psum, self._csum, self._cnt = ps, cs, ct
+            self._epoch = ep
 
         if origins is not None and view_idx is not None and len(points):
             self._carve(points, view_idx, np.asarray(origins, np.float64))
@@ -130,6 +139,41 @@ class GlobalMap:
         self._psum = self._psum[keep]
         self._csum = self._csum[keep]
         self._cnt = self._cnt[keep]
+        self._epoch = self._epoch[keep]
+
+    # ---- 루프 클로저 보정 ----------------------------------------------
+    def apply_corrections(self, corrections: dict[int, Sim3]) -> None:
+        """epoch별 Sim3로 voxel 평균 위치를 이동시키고 해시를 재구축한다.
+
+        루프 클로저가 과거 구간의 drift를 고치면, 그 구간에서 융합된
+        voxel들도 같은 변환으로 이동해야 지도가 보정된 pose와 일치한다.
+        """
+        if not len(self._keys) or not corrections:
+            return
+        cnt = np.maximum(self._cnt, 1)[:, None]
+        pts = self._psum / cnt
+        for e, T in corrections.items():
+            m = self._epoch == e
+            if m.any():
+                pts[m] = sim3_apply(T, pts[m])
+        self._psum = pts * cnt
+
+        # 위치가 바뀌었으므로 voxel 키 재계산 + 중복 병합
+        new_keys = self._quantize(pts)
+        merged, minv = np.unique(new_keys, return_inverse=True)
+        w = np.zeros(len(merged), np.float32)
+        ps = np.zeros((len(merged), 3))
+        cs = np.zeros((len(merged), 3))
+        ct = np.zeros(len(merged), np.int64)
+        ep = np.zeros(len(merged), np.int32)
+        np.add.at(ps, minv, self._psum)
+        np.add.at(cs, minv, self._csum)
+        np.add.at(ct, minv, self._cnt)
+        np.maximum.at(w, minv, self._weight)   # 병합 시 강한 증거 유지
+        np.maximum.at(ep, minv, self._epoch)
+        self._keys, self._weight = merged, w
+        self._psum, self._csum, self._cnt, self._epoch = ps, cs, ct, ep
+        self._materialize()
 
     def _enforce_cap(self) -> None:
         if len(self._keys) > self.cfg.max_points:

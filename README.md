@@ -74,6 +74,11 @@ YOLOE-26s-seg + MobileCLIP2 텍스트 인코더 0.3GB, DINOv2-small)가 자동
   → mono depth 보정(a,b), intrinsics 추정, (옵션) metric 앵커
   → T_global_live(Sim3)를 부드럽게 갱신 — 객체 위치가 점프하지 않음
 
+[루프 클로저 — 백엔드 내장 (loop.enabled, objects.appearance 필요)]
+  키프레임 DINOv2 임베딩 → 재방문 후보 → ORB+depth 3D-3D RANSAC Sim3 검증
+  → Sim3 pose graph → 키프레임 pose·voxel 지도(epoch별)·T_global_live 보정
+  → 오탐은 inlier 게이트에서 기각, 보정은 보간으로 무점프 반영
+
 [GS 품질 레이어 — 15초 주기, 별도 프로세스, CUDA 전용 (gaussian.enabled)]
   키프레임(RGB+pose+보정 depth+동적 mask) → gsplat 3D Gaussian 점진 최적화
   → 동적 물체가 제거된 렌더링 가능한 정적 지도 (Rerun: world/gaussians,
@@ -106,9 +111,11 @@ DA3-small pose 헤드의 병진 과소추정, 커뮤니티 래퍼 결함 등)이
 
 - 처리율은 백엔드 추론과 GPU를 공유하는 동안 약 2.5~4 FPS (목표 5~10 FPS의 하한).
   `backend.metric_anchor: false`로 끄면 다소 빨라집니다.
-- 전역 좌표계는 라이브 VO 궤적을 따르므로 장시간 사용 시 drift가 누적됩니다.
-  (DA3-small의 pose 헤드가 병진을 과소추정해 독립적 drift 보정원으로 쓸 수 없음 —
-  루프 클로저는 향후 과제)
+- 장시간 drift는 **루프 클로저**(`loop.enabled`)가 같은 장소 재방문 시
+  보정합니다 (DINOv2 place recognition + ORB/depth 3D-3D Sim3 검증 +
+  pose graph — docs/benchmarks.md Tier 4). 재방문이 없는 구간의 drift는
+  여전히 누적되며, 합성 부메랑 영상으로 검증됨 — 실내 재방문 실촬영
+  영상으로 추가 검증 권장.
 - 대형 가구는 카메라가 궤도를 돌 때 mask 중심이 이동해 dynamic으로 오판될 수 있음.
 - 동적 물체의 시간별 궤적은 기록·표시되지만(`world/objects/dyn_traj`) 검증은 후순위.
 - YOLOE 오픈 보캐뷸러리는 검출이 풍부한 대신 중복/노이즈 노드가 다소 늘 수 있음
