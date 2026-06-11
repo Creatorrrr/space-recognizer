@@ -382,15 +382,19 @@ class _Worker:
                 pts_a, pts_b = match_3d3d(
                     ogray, odepth.astype(np.float32), oK,
                     gray, depth.astype(np.float32), kf.K)
+                dg: dict = {}
                 res = sim3_from_matches(pts_a, pts_b, lcfg.inlier_dist,
-                                        min_inliers=lcfg.min_inliers)
+                                        min_inliers=lcfg.min_inliers, diag=dg)
                 if res is not None:
                     T_ab, mask = res
                     accepted.append((old_id, kf.kf_id, T_ab,
                                      int(mask.sum()), sim))
                 else:
                     print(f"[loop] 후보 기각 kf{old_id}->kf{kf.kf_id} "
-                          f"(sim={sim:.2f}, 3D 검증 실패)", flush=True)
+                          f"(sim={sim:.2f}, matches={dg.get('n', 0)}, "
+                          f"best_inl={dg.get('best_inl', 0)}, "
+                          f"med_s={dg.get('med_scale', float('nan')):.2f})",
+                          flush=True)
             self.detector.add(kf.kf_id, kf.ts, kf.emb)
             self._kf_store[kf.kf_id] = (kf.ts, gray, depth, kf.K)
             while len(self._kf_store) > lcfg.max_kf_store:

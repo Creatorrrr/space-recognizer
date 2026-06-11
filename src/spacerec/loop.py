@@ -75,29 +75,40 @@ class LoopDetector:
 
 def sim3_from_matches(pts_a: np.ndarray, pts_b: np.ndarray,
                       inlier_dist: float = 0.05, iters: int = 200,
-                      min_inliers: int = 12, rng_seed: int = 0
+                      min_inliers: int = 12, rng_seed: int = 0,
+                      diag: dict | None = None
                       ) -> tuple[Sim3, np.ndarray] | None:
     """대응점 (N,3)x2에서 RANSAC Umeyama로 b→a Sim3 추정.
 
     반환: (T_ab: pts_b를 pts_a 좌표로 보내는 Sim3, inlier mask) 또는 None.
+    diag를 주면 기각 사유 진단 정보를 채운다: n(매칭 수),
+    med_scale(샘플 스케일 중앙값 — 게이트 밖이면 스케일 drift가 원인),
+    best_inl(최대 인라이어 수 — 적으면 기하 불일치가 원인).
     """
     n = len(pts_a)
+    if diag is not None:
+        diag.update(n=n, med_scale=float("nan"), best_inl=0)
     if n < max(4, min_inliers):
         return None
     rng = np.random.default_rng(rng_seed)
     best_mask = None
+    scales = []
     for _ in range(iters):
         idx = rng.choice(n, 4, replace=False)
         try:
             T = umeyama_sim3(pts_b[idx], pts_a[idx])
         except np.linalg.LinAlgError:
             continue
+        scales.append(T[0])
         if not (0.2 < T[0] < 5.0):   # 비상식적 스케일은 기각
             continue
         d = np.linalg.norm(pts_a - (T[0] * pts_b @ T[1].T + T[2]), axis=1)
         mask = d < inlier_dist
         if best_mask is None or mask.sum() > best_mask.sum():
             best_mask = mask
+    if diag is not None and scales:
+        diag["med_scale"] = float(np.median(scales))
+        diag["best_inl"] = int(best_mask.sum()) if best_mask is not None else 0
     if best_mask is None or best_mask.sum() < min_inliers:
         return None
     T = umeyama_sim3(pts_b[best_mask], pts_a[best_mask])
