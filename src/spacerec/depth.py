@@ -22,6 +22,8 @@ class DepthEstimator:
     def infer(self, bgr: np.ndarray) -> np.ndarray:
         """Relative depth map at full frame resolution (float32, HxW)."""
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        # dtype 주의: 공식 패키지가 CUDA에서는 내부적으로 bf16 autocast를 적용한다
+        # (api.py model_forward). 외부 autocast 중첩은 무의미해 두지 않는다.
         pred = self.model.inference([rgb], process_res=self.process_res)
         depth = pred.depth[0].astype(np.float32)
         if pred.intrinsics is not None:

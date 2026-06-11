@@ -101,8 +101,9 @@ def main() -> None:
     K = default_intrinsics(W, H)
     vo = VisualOdometry(K, cfg.vo)
     worldmap = GlobalMap(cfg.backend)
-    backend = ReconstructionBackend(cfg.backend, cfg.depth.model,
-                                    depth_est.device, cfg.depth.process_res,
+    backend = ReconstructionBackend(cfg.backend, cfg.depth.backend_model_resolved,
+                                    depth_est.device,
+                                    cfg.depth.backend_process_res_resolved,
                                     metric_model=cfg.depth.metric_model)
     backend.start()
     print("waiting for backend process...")
@@ -128,7 +129,7 @@ def main() -> None:
             print(f"no saved world at {args.map} (새로 시작, 종료 시 저장)")
     dyn_classes = set(cfg.detect.dynamic_classes)
     sub = cfg.viz.point_subsample
-    bw = cfg.depth.process_res  # 백엔드 입력 가로 해상도
+    bw = cfg.depth.backend_process_res_resolved  # 백엔드 입력 가로 해상도
     bh = int(H * bw / W)
     kf_counter = 0
 

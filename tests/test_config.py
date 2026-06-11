@@ -1,5 +1,21 @@
-from spacerec.config import Config
+from spacerec.config import Config, DepthCfg
 from spacerec.device import select_torch_device
+
+
+def test_backend_model_falls_back_to_live_model():
+    cfg = DepthCfg()
+    assert cfg.backend_model_resolved == cfg.model
+    assert cfg.backend_process_res_resolved == cfg.process_res
+
+
+def test_backend_model_override():
+    cfg = DepthCfg(backend_model="depth-anything/DA3-LARGE-1.1",
+                   backend_process_res=672)
+    assert cfg.backend_model_resolved == "depth-anything/DA3-LARGE-1.1"
+    assert cfg.backend_process_res_resolved == 672
+    # 라이브 설정은 영향 받지 않는다
+    assert cfg.model == "depth-anything/DA3-SMALL"
+    assert cfg.process_res == 504
 
 
 def test_load_reads_utf8_config_comments(tmp_path):

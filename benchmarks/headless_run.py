@@ -35,12 +35,12 @@ def main() -> None:
     W, H = src.proc_width, src.proc_height
     vo = VisualOdometry(default_intrinsics(W, H), cfg.vo)
     wm = GlobalMap(cfg.backend)
-    be = ReconstructionBackend(cfg.backend, cfg.depth.model, dep.device,
-                               cfg.depth.process_res)
+    be = ReconstructionBackend(cfg.backend, cfg.depth.backend_model_resolved,
+                               dep.device, cfg.depth.backend_process_res_resolved)
     be.start()
     be.wait_ready()
     calib = DepthCalibration()
-    bw = cfg.depth.process_res
+    bw = cfg.depth.backend_process_res_resolved
     bh = int(H * bw / W)
     kf_id = 0
     dyn = set(cfg.detect.dynamic_classes)

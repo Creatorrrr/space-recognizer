@@ -6,6 +6,12 @@ proc_width: 1280      # 처리 해상도 (가로)
 depth:
   model: depth-anything/DA3-SMALL  # HF model id (공식 depth-anything-3 패키지)
   process_res: 504
+  # 백엔드 멀티뷰 전용 상향 (CUDA 여유 활용 — docs/upgrade-plan.md Tier 1).
+  # 비우면 라이브와 동일한 model/process_res 사용 (MPS 등 저사양 폴백).
+  backend_model: depth-anything/DA3-LARGE-1.1  # 0.35B, Apache-2.0, 2025-12 재학습판
+  # 672px×16뷰는 any-view 어텐션 비용 폭증으로 윈도 15s+/VRAM 16GB 소진 (실측).
+  # 504px×16뷰가 시간/메모리 게이트 내 최대 구성.
+  backend_process_res: 504
 
 detect:
   # YOLOE-26 오픈 보캐뷸러리 (기본): COCO에 없는 실내 물체(rug, wardrobe 등)를
@@ -37,11 +43,12 @@ vo:
 
 backend:
   period_s: 5.0
-  window_size: 12      # 멀티뷰 윈도 키프레임 수
-  overlap: 6           # 직전 윈도와 중첩 키프레임 수
-  voxel_size: 0.03     # 전역 지도 voxel (장면 스케일 단위)
-  max_points: 800000
+  window_size: 16      # 멀티뷰 윈도 키프레임 수
+  overlap: 8           # 직전 윈도와 중첩 키프레임 수
+  voxel_size: 0.02     # 전역 지도 voxel (장면 스케일 단위)
+  max_points: 2000000
   metric_anchor: true   # DA3METRIC-LARGE로 미터 단위 추정 (윈도당 +0.3~1s)
+  conf_percentile: 30.0 # 멀티뷰 conf 하위 컷 (모델 변형 교체 시 재튜닝 대상)
 
 objects:
   ema_alpha: 0.3

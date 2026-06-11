@@ -13,6 +13,18 @@ class DepthCfg:
     model: str = "depth-anything/DA3-SMALL"
     process_res: int = 504
     metric_model: str = "depth-anything/DA3METRIC-LARGE"
+    # 백엔드(5초 주기 멀티뷰)는 지연이 덜 중요하므로 더 큰 모델/해상도 사용.
+    # 비우면 라이브와 동일한 model/process_res를 쓴다 (CUDA 이전 동작).
+    backend_model: str = ""
+    backend_process_res: int = 0
+
+    @property
+    def backend_model_resolved(self) -> str:
+        return self.backend_model or self.model
+
+    @property
+    def backend_process_res_resolved(self) -> int:
+        return self.backend_process_res or self.process_res
 
 
 @dataclass
@@ -40,6 +52,8 @@ class BackendCfg:
     voxel_size: float = 0.03
     max_points: int = 800_000
     metric_anchor: bool = False  # DA3METRIC로 미터 단위 추정 (느림, 선택)
+    # 멀티뷰 conf 하위 퍼센타일 컷 (모델 변형마다 conf 분포가 달라 튜닝 대상)
+    conf_percentile: float = 30.0
 
 
 @dataclass

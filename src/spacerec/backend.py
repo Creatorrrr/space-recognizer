@@ -88,6 +88,7 @@ class _Worker:
         from depth_anything_3.api import DepthAnything3
 
         self.cfg = cfg
+        self.device = device
         self.process_res = process_res
         self.model = DepthAnything3.from_pretrained(model_name).to(device).eval()
         self.metric_model = None
@@ -159,7 +160,7 @@ class _Worker:
         for i, kf in enumerate(window):
             self.kf_global_poses[kf.kf_id] = sim3_on_pose(S, T_wc_win[i])
 
-        conf_thresh = (np.percentile(pred.conf, 30.0)
+        conf_thresh = (np.percentile(pred.conf, self.cfg.conf_percentile)
                        if pred.conf is not None else None)
 
         def static_valid(i: int, kf: BackendKeyframe) -> np.ndarray:
