@@ -6,13 +6,15 @@ import cv2
 import numpy as np
 import torch
 
+from .device import select_torch_device
+
 
 class DepthEstimator:
     def __init__(self, model_name: str = "depth-anything/DA3-SMALL",
                  process_res: int = 504, device: str | None = None):
         from depth_anything_3.api import DepthAnything3
 
-        self.device = device or ("mps" if torch.backends.mps.is_available() else "cpu")
+        self.device = select_torch_device(device)
         self.process_res = process_res
         self.model = DepthAnything3.from_pretrained(model_name).to(self.device).eval()
         self.last_K: np.ndarray | None = None  # DA3 추정 intrinsics (frame 해상도)

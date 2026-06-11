@@ -80,7 +80,7 @@ class Config:
 
     @classmethod
     def load(cls, path: str | Path = "config.yaml") -> "Config":
-        raw = yaml.safe_load(Path(path).read_text()) or {}
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
         sections = {
             "depth": DepthCfg, "detect": DetectCfg, "vo": VoCfg,
             "backend": BackendCfg, "objects": ObjectsCfg,

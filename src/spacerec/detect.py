@@ -15,6 +15,8 @@ import cv2
 import numpy as np
 import torch
 
+from .device import select_torch_device
+
 
 @dataclass
 class Detection:
@@ -28,7 +30,7 @@ class Detection:
 class ObjectDetector:
     def __init__(self, model_path: str, conf: float = 0.35, device: str | None = None,
                  vocabulary: list[str] | None = None):
-        self.device = device or ("mps" if torch.backends.mps.is_available() else "cpu")
+        self.device = select_torch_device(device)
         if vocabulary:
             from ultralytics import YOLOE
 

@@ -10,6 +10,8 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from .device import select_torch_device
+
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], np.float32)
 _INPUT = 224  # 14의 배수 (DINOv2 patch 14)
@@ -17,7 +19,7 @@ _INPUT = 224  # 14의 배수 (DINOv2 patch 14)
 
 class AppearanceEmbedder:
     def __init__(self, device: str | None = None):
-        self.device = device or ("mps" if torch.backends.mps.is_available() else "cpu")
+        self.device = select_torch_device(device)
         self.model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
         self.model = self.model.to(self.device).eval()
 
