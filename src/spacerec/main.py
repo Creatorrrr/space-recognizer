@@ -20,6 +20,7 @@ from .capture import VideoSource
 from .config import Config, VizCfg
 from .depth import DepthEstimator
 from .detect import Detection, ObjectDetector
+from .floor import estimate_floor, gravity_align_rotation
 from .geometry import sim3_apply, sim3_inverse
 from .graph import build_graph
 from .objects import ObjectRegistry, localize_objects
@@ -188,6 +189,7 @@ def main() -> None:
         bw = bres
         bh = int(round(H * bres / W / 2) * 2)
     kf_counter = 0
+    floor_align_attempted = False
 
     # 모델 첫 호출은 커널 컴파일로 수 초가 걸린다 (YOLOE ~3s 실측). 실시간
     # 페이싱이 시작되기 전에 더미 프레임으로 전부 워밍업해 두지 않으면
@@ -224,7 +226,20 @@ def main() -> None:
                     frame_count += 1
                     continue
             t2 = time.perf_counter()
-            depth = calib.apply(raw_depth) * frame_scale
+            calib_depth = calib.apply(raw_depth)
+            if cfg.vo.gravity_align and not floor_align_attempted:
+                floor = estimate_floor(calib_depth, vo.K)
+                if floor is not None:
+                    R0 = gravity_align_rotation(floor[0])
+                    vo.T_wc[:3, :3] = R0
+                    angle = np.degrees(np.arccos(np.clip((np.trace(R0) - 1.0) / 2.0,
+                                                         -1.0, 1.0)))
+                    print(f"[floor] gravity align: rotation {angle:.1f} deg "
+                          f"(inliers={floor[2]:.2f})")
+                else:
+                    print("[floor] gravity align skipped: no reliable floor plane")
+                floor_align_attempted = True
+            depth = calib_depth * frame_scale
             gray = cv2.cvtColor(frame.bgr, cv2.COLOR_BGR2GRAY)
             excl = dynamic_mask(detections, (H, W), dyn_classes)
             pose = vo.process(gray, depth, frame.ts, excl)

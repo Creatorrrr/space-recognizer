@@ -40,6 +40,8 @@ vo:
   keyframe_interval_s: 0.5
   keyframe_min_flow_px: 40.0
   min_inlier_ratio: 0.5
+  # 첫 VO 프레임 전에 하단 depth에서 바닥 평면을 찾아 RDF -Y로 중력 정렬
+  gravity_align: true
 
 backend:
   period_s: 5.0

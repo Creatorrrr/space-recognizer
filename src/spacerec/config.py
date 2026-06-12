@@ -42,6 +42,7 @@ class VoCfg:
     keyframe_interval_s: float = 0.5
     keyframe_min_flow_px: float = 40.0
     min_inlier_ratio: float = 0.5
+    gravity_align: bool = False
 
 
 @dataclass

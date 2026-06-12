@@ -1,4 +1,4 @@
-from spacerec.config import Config, DepthCfg, VizCfg
+from spacerec.config import Config, DepthCfg, VizCfg, VoCfg
 from spacerec.device import select_torch_device
 
 
@@ -73,6 +73,17 @@ def test_viz_cfg_defaults_and_loads_from_yaml(tmp_path):
     assert cfg.viz.show_live_preview is False
     assert cfg.viz.show_gaussians is False
     assert cfg.viz.map_recent_epochs == 3
+
+
+def test_vo_gravity_align_defaults_off_and_loads_from_yaml(tmp_path):
+    assert VoCfg().gravity_align is False
+
+    path = tmp_path / "config.yaml"
+    path.write_text("vo:\n  gravity_align: true\n", encoding="utf-8")
+
+    cfg = Config.load(path)
+
+    assert cfg.vo.gravity_align is True
 
 
 def test_select_torch_device_prefers_cuda(monkeypatch):
