@@ -63,6 +63,26 @@ def test_carving_resists_single_bad_pass():
     assert after > 0.5 * before  # 한 번의 오류로는 대부분 살아남음
 
 
+def test_recent_points_filters_by_last_voxel_epoch():
+    wm = GlobalMap(BackendCfg(voxel_size=0.05))
+    pts_e0 = np.array([[0.0, 0.0, 1.0], [0.2, 0.0, 1.0]], dtype=np.float32)
+    pts_e1 = np.array([[2.0, 0.0, 1.0], [2.2, 0.0, 1.0]], dtype=np.float32)
+    cols_e0 = np.full((2, 3), [10, 20, 30], dtype=np.uint8)
+    cols_e1 = np.full((2, 3), [100, 110, 120], dtype=np.uint8)
+
+    wm.fuse(pts_e0, cols_e0, epoch=0)
+    wm.fuse(pts_e1, cols_e1, epoch=1)
+
+    recent_pts, recent_cols = wm.recent_points(n_epochs=1, current_epoch=1)
+    assert len(recent_pts) == 2
+    assert np.all(recent_pts[:, 0] > 1.5)
+    assert np.all(recent_cols == np.array([100, 110, 120], dtype=np.uint8))
+
+    all_pts, all_cols = wm.recent_points(n_epochs=0, current_epoch=1)
+    assert all_pts is wm.points
+    assert all_cols is wm.colors
+
+
 def _obs(track_id, pos, cls_name="chair"):
     det = Detection(track_id=track_id, cls_name=cls_name, conf=0.9,
                     box=np.array([0, 0, 10, 10], np.float32), mask=None)

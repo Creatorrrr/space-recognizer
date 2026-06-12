@@ -189,6 +189,20 @@ class GlobalMap:
         self.points = (self._psum / cnt).astype(np.float32)
         self.colors = np.clip(self._csum / cnt, 0, 255).astype(np.uint8)
 
+    def recent_points(self, n_epochs: int, current_epoch: int
+                      ) -> tuple[np.ndarray, np.ndarray]:
+        if n_epochs <= 0:
+            return self.points, self.colors
+        cutoff = int(current_epoch) - int(n_epochs)
+        keep = self._epoch > cutoff
+        return self.points[keep], self.colors[keep]
+
+    @property
+    def latest_epoch(self) -> int:
+        if not len(self._epoch):
+            return 0
+        return int(self._epoch.max())
+
     # ---- live -> global correction ------------------------------------
     def set_correction_target(self, T: Sim3) -> None:
         self._T_gl_target = T

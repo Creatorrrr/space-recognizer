@@ -19,6 +19,7 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 
+from .config import VizCfg
 from .detect import Detection
 
 
@@ -28,14 +29,16 @@ def _color_for(name: str) -> list[int]:
 
 
 class Visualizer:
-    def __init__(self, app_id: str = "spacerec", memory_limit: str = "4GB",
-                 gs_panel: bool = False):
+    def __init__(self, app_id: str = "spacerec", memory_limit: str | None = None,
+                 gs_panel: bool = False, cfg: VizCfg | None = None):
+        self._cfg = cfg or VizCfg()
         self._trajectory: list[np.ndarray] = []
         self.meters_per_unit: float | None = None  # metric 앵커가 있으면 거리 라벨에 사용
         rr.init(app_id)
         # venv를 활성화하지 않고 실행해도 뷰어 바이너리를 찾도록 명시 경로 사용
         viewer = shutil.which("rerun") or str(Path(sys.executable).parent / "rerun")
-        rr.spawn(memory_limit=memory_limit, executable_path=viewer)
+        rr.spawn(memory_limit=memory_limit or self._cfg.memory_limit,
+                 executable_path=viewer)
         rr.send_blueprint(self._blueprint(gs_panel))
         rr.log("world", rr.ViewCoordinates.RDF, static=True)
 
@@ -87,6 +90,8 @@ class Visualizer:
         움직이는 카메라에 붙어 따라다니며 지도와 어긋나 보인다. 전역 좌표로 변환해
         독립 엔티티에 로깅해야 제자리에 고정된다.
         """
+        if not self._cfg.show_live_preview:
+            return
         rr.log("world/live_preview", rr.Points3D(points_world, colors=colors,
                                                  radii=0.008))
 
@@ -97,11 +102,15 @@ class Visualizer:
         rr.log("calib/frame_scale", rr.Scalars([frame_scale]))
 
     def log_global_map(self, points: np.ndarray, colors: np.ndarray) -> None:
+        if not self._cfg.show_map_points:
+            return
         rr.log("world/points", rr.Points3D(points, colors=colors, radii=0.006))
 
     def log_gaussians(self, points_global: np.ndarray, colors: np.ndarray,
                       render: np.ndarray | None = None) -> None:
         """GS 레이어 미리보기: gaussian 중심점(전역 좌표) + 최신 시점 렌더."""
+        if not self._cfg.show_gaussians:
+            return
         rr.log("world/gaussians", rr.Points3D(points_global, colors=colors,
                                               radii=0.005))
         if render is not None:

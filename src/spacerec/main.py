@@ -17,7 +17,7 @@ import numpy as np
 from .backend import BackendKeyframe, ReconstructionBackend
 from .calib import DepthCalibration
 from .capture import VideoSource
-from .config import Config
+from .config import Config, VizCfg
 from .depth import DepthEstimator
 from .detect import Detection, ObjectDetector
 from .geometry import sim3_apply, sim3_inverse
@@ -28,9 +28,19 @@ from .vo import VisualOdometry, default_intrinsics
 from .worldmap import GlobalMap
 
 
+def _map_points_for_viz(worldmap: GlobalMap, cfg: VizCfg,
+                        current_epoch: int | None = None
+                        ) -> tuple[np.ndarray, np.ndarray]:
+    if cfg.map_recent_epochs <= 0:
+        return worldmap.points, worldmap.colors
+    epoch = worldmap.latest_epoch if current_epoch is None else current_epoch
+    return worldmap.recent_points(cfg.map_recent_epochs, epoch)
+
+
 def _drain_backend_results(backend: ReconstructionBackend, worldmap: GlobalMap,
                            viz: Visualizer, calib: DepthCalibration,
-                           vo: VisualOdometry, frame_wh: tuple[int, int]
+                           vo: VisualOdometry, frame_wh: tuple[int, int],
+                           viz_cfg: VizCfg
                            ) -> DepthCalibration:
     while True:
         try:
@@ -65,7 +75,9 @@ def _drain_backend_results(backend: ReconstructionBackend, worldmap: GlobalMap,
         # 바뀌면 VO 병진/키프레임 3D의 스케일이 전환 시점 전후로 달라져,
         # 기존 지도 위에 다른 크기의 공간이 겹쳐 그려진다 (8초 시점에 공간이
         # 갑자기 커지던 버그). K는 시작 시 첫 프레임의 DA3 추정으로 고정한다.
-        viz.log_global_map(worldmap.points, worldmap.colors)
+        if viz_cfg.show_map_points:
+            map_points, map_colors = _map_points_for_viz(worldmap, viz_cfg, res.epoch)
+            viz.log_global_map(map_points, map_colors)
         mpu = f" 1unit={res.meters_per_unit:.2f}m" if res.meters_per_unit else ""
         pc = (f" pose-cond α={res.win_alpha:.3f} β={res.win_beta:.3f}"
               if res.pose_conditioned else "")
@@ -118,7 +130,7 @@ def main() -> None:
     if cfg.loop.enabled and embedder is None:
         print("[loop] objects.appearance가 꺼져 있어 루프 클로저 비활성")
     use_gs = cfg.gaussian.enabled and depth_est.device == "cuda"
-    viz = Visualizer(memory_limit=cfg.viz.memory_limit, gs_panel=use_gs)
+    viz = Visualizer(cfg=cfg.viz, gs_panel=use_gs)
     source = VideoSource(cfg.source, proc_width=cfg.proc_width, realtime=cfg.realtime)
     W, H = source.proc_width, source.proc_height
     K = default_intrinsics(W, H)
@@ -262,13 +274,14 @@ def main() -> None:
                     except Exception:
                         break
                     # GS는 live 좌표계에서 최적화 — 표시 시점에 전역으로 변환
-                    viz.log_gaussians(worldmap.to_global_points(gres.means),
-                                      gres.colors, gres.render)
+                    if cfg.viz.show_gaussians:
+                        viz.log_gaussians(worldmap.to_global_points(gres.means),
+                                          gres.colors, gres.render)
                     psnr = (f" psnr={gres.psnr:.1f}dB" if gres.psnr else "")
                     print(f"[gs] {gres.n_gaussians} gaussians "
                           f"{gres.runtime_s:.1f}s{psnr}")
             new_calib = _drain_backend_results(backend, worldmap, viz, calib,
-                                               vo, (W, H))
+                                               vo, (W, H), cfg.viz)
             if new_calib is not calib:
                 # 새 calib은 키프레임 시점의 frame_scale까지 흡수해 피팅된 값.
                 # frame_scale을 리셋하지 않으면 같은 보정이 이중 적용되어
@@ -281,7 +294,7 @@ def main() -> None:
             viz.log_frame(frame.bgr, depth, detections, vo.K)
             viz.log_camera(T_wc_global, vo.K, W, H)
             viz.log_calibration(calib.a, calib.b, frame_scale)
-            if pose.is_keyframe:
+            if pose.is_keyframe and cfg.viz.show_live_preview:
                 # 키프레임마다 현재 프레임 포인트클라우드 미리보기를 *전역 좌표*로
                 # 변환해 로깅 (카메라 좌표로 두면 다음 키프레임까지 카메라를 따라
                 # 움직여 지도와 어긋나 보인다)
@@ -320,7 +333,9 @@ def main() -> None:
                                    cfg.backend.voxel_size)
                     merge_into_session(saved_state, T, matches, worldmap,
                                        registry, frame.ts)
-                    viz.log_global_map(worldmap.points, worldmap.colors)
+                    if cfg.viz.show_map_points:
+                        map_points, map_colors = _map_points_for_viz(worldmap, cfg.viz)
+                        viz.log_global_map(map_points, map_colors)
                     print(f"[reloc] 이전 지도 정렬 성공: 매칭 {len(matches)}개, "
                           f"rms={rms:.3f}, scale={T[0]:.3f} → 병합 완료")
                     reloc_done = True
@@ -349,12 +364,14 @@ def main() -> None:
         while (time.monotonic() - idle_since < 8.0
                or time.monotonic() < gs_deadline):
             before = len(worldmap.points)
-            calib = _drain_backend_results(backend, worldmap, viz, calib, vo, (W, H))
+            calib = _drain_backend_results(backend, worldmap, viz, calib, vo,
+                                           (W, H), cfg.viz)
             if gs_backend is not None:
                 try:
                     gres = gs_backend.results.get_nowait()
-                    viz.log_gaussians(worldmap.to_global_points(gres.means),
-                                      gres.colors, gres.render)
+                    if cfg.viz.show_gaussians:
+                        viz.log_gaussians(worldmap.to_global_points(gres.means),
+                                          gres.colors, gres.render)
                     psnr = (f" psnr={gres.psnr:.1f}dB" if gres.psnr else "")
                     print(f"[gs] {gres.n_gaussians} gaussians "
                           f"{gres.runtime_s:.1f}s{psnr}")

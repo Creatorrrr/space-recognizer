@@ -120,6 +120,10 @@ class GraphCfg:
 class VizCfg:
     memory_limit: str = "4GB"
     point_subsample: int = 4
+    show_map_points: bool = True
+    show_live_preview: bool = True
+    show_gaussians: bool = True
+    map_recent_epochs: int = 0
 
 
 @dataclass

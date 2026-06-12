@@ -95,4 +95,8 @@ graph:
 
 viz:
   memory_limit: 4GB
+  show_map_points: true     # 전역 voxel 지도 (world/points)
+  show_live_preview: false  # 최신 키프레임 미리보기 — 가림 주범이라 기본 끔
+  show_gaussians: true      # GS 레이어 중심점 (world/gaussians)
+  map_recent_epochs: 0      # 0=전체, N>0=최근 N개 백엔드 윈도의 voxel만 표시
   point_subsample: 4   # depth→포인트클라우드 픽셀 서브샘플링

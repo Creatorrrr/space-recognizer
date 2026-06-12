@@ -1,4 +1,4 @@
-from spacerec.config import Config, DepthCfg
+from spacerec.config import Config, DepthCfg, VizCfg
 from spacerec.device import select_torch_device
 
 
@@ -45,6 +45,34 @@ def test_gaussian_cfg_defaults_off_and_loads_from_yaml(tmp_path):
     assert cfg.gaussian.period_s == 20
     assert cfg.gaussian.max_gaussians == 100_000
     assert cfg.gaussian.opt_steps == 150  # 미지정 필드는 기본값
+
+
+def test_viz_cfg_defaults_and_loads_from_yaml(tmp_path):
+    defaults = VizCfg()
+    assert defaults.show_map_points is True
+    assert defaults.show_live_preview is True
+    assert defaults.show_gaussians is True
+    assert defaults.map_recent_epochs == 0
+
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "viz:\n"
+        "  memory_limit: 2GB\n"
+        "  point_subsample: 8\n"
+        "  show_map_points: false\n"
+        "  show_live_preview: false\n"
+        "  show_gaussians: false\n"
+        "  map_recent_epochs: 3\n",
+        encoding="utf-8")
+
+    cfg = Config.load(path)
+
+    assert cfg.viz.memory_limit == "2GB"
+    assert cfg.viz.point_subsample == 8
+    assert cfg.viz.show_map_points is False
+    assert cfg.viz.show_live_preview is False
+    assert cfg.viz.show_gaussians is False
+    assert cfg.viz.map_recent_epochs == 3
 
 
 def test_select_torch_device_prefers_cuda(monkeypatch):
