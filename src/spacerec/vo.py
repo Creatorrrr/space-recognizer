@@ -76,6 +76,18 @@ class VisualOdometry:
     def set_intrinsics(self, K: np.ndarray) -> None:
         self.K = K.copy()
 
+    def apply_keyframe_correction(self, C: np.ndarray) -> None:
+        """방금 만든 키프레임의 pose에 SE3 보정 C를 좌측 합성한다.
+
+        바닥 anchoring용 — 키프레임 생성 직후에만 호출해야 한다 (특징점
+        3D는 키프레임 pose로 막 역투영된 상태라 같은 변환으로 일관 이동).
+        """
+        self.T_wc = C @ self.T_wc
+        if self.keyframe is not None:
+            self.keyframe.T_wc = C @ self.keyframe.T_wc
+        if self._pts3d is not None:
+            self._pts3d = self._pts3d @ C[:3, :3].T + C[:3, 3]
+
     def rescale(self, g: float) -> None:
         """live 좌표계 전체의 길이 단위를 g배로 — 스케일 서보용.
 

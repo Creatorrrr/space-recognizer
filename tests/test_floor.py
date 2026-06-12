@@ -102,3 +102,68 @@ def test_gravity_align_rotation_is_identity_for_already_aligned_normal():
     R = gravity_align_rotation(np.array([0.0, -1.0, 0.0]))
 
     np.testing.assert_allclose(R, np.eye(3), atol=1e-12)
+
+
+def test_floor_anchor_correction_restores_tilt_and_height():
+    import pytest
+
+    from spacerec.floor import floor_anchor_correction
+
+    cam = np.array([1.0, 0.3, -2.0])   # 카메라가 0.3 가라앉음 (기준 바닥 y=1.4)
+    tilt = np.radians(4.0)
+    n_world = np.array([0.0, -np.cos(tilt), -np.sin(tilt)])
+    # 측정 바닥 y = 0.3 + 1.4 = 1.7 (가라앉은 만큼 바닥도 내려간 계단식 drift)
+    C = floor_anchor_correction(n_world, cam, height=1.4, y_floor_ref=1.4,
+                                beta_rot=0.5, beta_y=0.5, max_dy=0.08)
+    assert C is not None
+    moved = C[:3, :3] @ cam + C[:3, 3]
+    # 회전의 고정점은 카메라 위치 — x/z는 불변, y는 -dy만 이동
+    np.testing.assert_allclose(moved[[0, 2]], cam[[0, 2]], atol=1e-9)
+    # 높이 오차 0.3 → β=0.5면 0.15지만 max_dy=0.08 클램프 → 0.08 들림
+    assert moved[1] == pytest.approx(cam[1] - 0.08)
+    # 기울기는 부분 복원
+    n_after = C[:3, :3] @ n_world
+    tilt_after = np.arccos(np.clip(n_after @ [0, -1, 0.0], -1, 1))
+    assert tilt_after < tilt
+
+
+def test_floor_anchor_correction_gates():
+    from spacerec.floor import floor_anchor_correction
+
+    cam = np.zeros(3)
+    flat = np.array([0.0, -1.0, 0.0])
+    # 기준에서 0.4 초과 차이 = 책상면 등 → 기각
+    assert floor_anchor_correction(flat, cam, height=1.0,
+                                   y_floor_ref=1.6) is None
+    # 기울기 과대(>20도) = 오인 측정 → 기각
+    big = np.radians(30.0)
+    n_big = np.array([0.0, -np.cos(big), -np.sin(big)])
+    assert floor_anchor_correction(n_big, cam, height=1.0,
+                                   y_floor_ref=1.0) is None
+
+
+def test_vo_apply_keyframe_correction_transforms_state_consistently():
+    import cv2
+
+    from spacerec.config import VoCfg
+    from spacerec.vo import VisualOdometry
+
+    vo = VisualOdometry(default_intrinsics(128, 96), VoCfg())
+    small = np.random.default_rng(0).integers(0, 255, (12, 16)).astype(np.uint8)
+    gray = cv2.resize(small, (128, 96), interpolation=cv2.INTER_NEAREST)
+    vo.process(gray, np.full((96, 128), 2.0, np.float32), 0.0, None)
+    assert vo._pts3d is not None
+
+    n = np.array([0.0, -0.99, -0.14])
+    C = np.eye(4)
+    C[:3, :3] = gravity_align_rotation(n / np.linalg.norm(n))
+    C[:3, 3] = [0.1, -0.05, 0.0]
+    pts_before = vo._pts3d.copy()
+    T_before = vo.T_wc.copy()
+
+    vo.apply_keyframe_correction(C)
+
+    np.testing.assert_allclose(vo.T_wc, C @ T_before, atol=1e-12)
+    np.testing.assert_allclose(vo.keyframe.T_wc, C @ T_before, atol=1e-12)
+    np.testing.assert_allclose(vo._pts3d,
+                               pts_before @ C[:3, :3].T + C[:3, 3], atol=1e-12)

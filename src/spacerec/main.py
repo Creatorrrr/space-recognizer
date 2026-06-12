@@ -20,7 +20,8 @@ from .capture import VideoSource
 from .config import Config, VizCfg
 from .depth import DepthEstimator
 from .detect import Detection, ObjectDetector
-from .floor import estimate_floor, gravity_align_rotation
+from .floor import (estimate_floor, floor_anchor_correction,
+                    gravity_align_rotation)
 from .geometry import sim3_apply, sim3_inverse
 from .graph import build_graph
 from .objects import ObjectRegistry, localize_objects
@@ -43,6 +44,7 @@ def _drain_backend_results(backend: ReconstructionBackend, worldmap: GlobalMap,
                            vo: VisualOdometry, frame_wh: tuple[int, int],
                            viz_cfg: VizCfg,
                            loop_state: dict[str, bool] | None = None,
+                           scale_state: dict | None = None,
                            ) -> DepthCalibration:
     while True:
         try:
@@ -71,6 +73,9 @@ def _drain_backend_results(backend: ReconstructionBackend, worldmap: GlobalMap,
                 g = res.servo_gain_g
                 vo.rescale(g)
                 worldmap.rescale_live(g)
+                if (scale_state is not None
+                        and scale_state.get("floor_y_ref") is not None):
+                    scale_state["floor_y_ref"] *= g  # 기준 높이도 live 단위
                 calib = DepthCalibration(a=calib.a * g, b=calib.b * g,
                                          inlier_frac=calib.inlier_frac)
         if res.meters_per_unit is not None:
@@ -194,6 +199,9 @@ def main() -> None:
         bh = int(round(H * bres / W / 2) * 2)
     kf_counter = 0
     floor_align_attempted = False
+    # 바닥 anchoring 기준 높이 — 스케일 서보가 live 단위를 바꾸면 함께
+    # 리스케일해야 하므로 드레인 함수와 공유하는 가변 홀더에 둔다
+    scale_state: dict = {"floor_y_ref": None}
 
     # 모델 첫 호출은 커널 컴파일로 수 초가 걸린다 (YOLOE ~3s 실측). 실시간
     # 페이싱이 시작되기 전에 더미 프레임으로 전부 워밍업해 두지 않으면
@@ -236,6 +244,8 @@ def main() -> None:
                 if floor is not None:
                     R0 = gravity_align_rotation(floor[0])
                     vo.T_wc[:3, :3] = R0
+                    # 카메라(원점) 기준 바닥 높이가 전역 기준 바닥이 된다
+                    scale_state["floor_y_ref"] = -floor[1]
                     angle = np.degrees(np.arccos(np.clip((np.trace(R0) - 1.0) / 2.0,
                                                          -1.0, 1.0)))
                     print(f"[floor] gravity align: rotation {angle:.1f} deg "
@@ -264,6 +274,24 @@ def main() -> None:
                                                 0.5, 2.0))
 
             if pose.is_keyframe:
+                # ---- 바닥 anchoring (drift의 근본 대응): 키프레임마다 그
+                # 프레임 depth의 바닥을 측정해 pose의 기울기·높이를 절대
+                # 기준으로 부분 복원 — mono depth 바닥 편향이 PnP 병진에
+                # 주입돼 수평 보행에서 카메라가 가라앉던 문제를 키프레임
+                # 단위로 리셋한다 (백엔드 자세/높이 서보는 백스톱으로 유지)
+                if cfg.vo.floor_anchor:
+                    fl = estimate_floor(depth, vo.K, stride=8, iters=120)
+                    if fl is not None:
+                        n_world = vo.T_wc[:3, :3] @ fl[0]
+                        if scale_state["floor_y_ref"] is None:
+                            scale_state["floor_y_ref"] = (
+                                float(vo.T_wc[1, 3]) - fl[1])
+                        C = floor_anchor_correction(
+                            n_world, vo.T_wc[:3, 3], -fl[1],
+                            scale_state["floor_y_ref"])
+                        if C is not None:
+                            vo.apply_keyframe_correction(C)
+                            pose.T_wc = vo.T_wc.copy()
                 small = cv2.resize(frame.bgr, (bw, bh), interpolation=cv2.INTER_AREA)
                 Kb = vo.K.copy()           # VO 고정 K를 백엔드 입력 해상도로
                 Kb[0] *= bw / W
@@ -301,7 +329,8 @@ def main() -> None:
                     print(f"[gs] {gres.n_gaussians} gaussians "
                           f"{gres.runtime_s:.1f}s{psnr}")
             new_calib = _drain_backend_results(backend, worldmap, viz, calib,
-                                               vo, (W, H), cfg.viz)
+                                               vo, (W, H), cfg.viz,
+                                               scale_state=scale_state)
             if new_calib is not calib:
                 # 새 calib은 키프레임 시점의 frame_scale까지 흡수해 피팅된 값.
                 # frame_scale을 리셋하지 않으면 같은 보정이 이중 적용되어
@@ -389,7 +418,8 @@ def main() -> None:
             before = len(worldmap.points)
             loop_state = {"converging": False}
             calib = _drain_backend_results(backend, worldmap, viz, calib, vo,
-                                           (W, H), cfg.viz, loop_state)
+                                           (W, H), cfg.viz, loop_state,
+                                           scale_state=scale_state)
             now = time.monotonic()
             if loop_state["converging"]:
                 idle_since = now

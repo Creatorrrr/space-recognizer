@@ -87,6 +87,55 @@ def estimate_floor_from_points(points: np.ndarray, *,
     return normal, d, inlier_frac
 
 
+def floor_anchor_correction(normal_world: np.ndarray, cam_pos: np.ndarray,
+                            height: float, y_floor_ref: float, *,
+                            beta_rot: float = 0.5, beta_y: float = 0.5,
+                            max_rot_rad: float = 0.035, max_dy: float = 0.08,
+                            max_tilt_rad: float = 0.35,
+                            max_y_err: float = 0.4) -> np.ndarray | None:
+    """키프레임 바닥 측정으로 pose를 절대 기준에 재정렬하는 SE3 보정 (4x4).
+
+    VO drift의 근본 대응: mono depth의 바닥 편향이 PnP 병진에 주입되어
+    카메라가 수평 보행에서 계단식으로 가라앉는다 — 키프레임마다 그 프레임
+    depth의 바닥(법선·높이)을 측정해 (a) 기울기를 중력(-Y)으로, (b) 바닥
+    높이를 최초 기준으로 부분(β) 복원하면 drift가 키프레임 단위로 리셋된다.
+
+    normal_world: 세계 좌표 바닥 법선(위쪽), cam_pos: 카메라 위치,
+    height: 카메라-바닥 거리(депth 측정), y_floor_ref: 기준 바닥 y.
+    게이트 미달(기울기 과대=오인 측정, 높이 차 과대=책상면)이면 None.
+    """
+    n = np.asarray(normal_world, dtype=np.float64)
+    n_norm = np.linalg.norm(n)
+    if n_norm < 1e-12:
+        return None
+    n = n / n_norm
+    target = _WORLD_UP
+    tilt = float(np.arccos(np.clip(n @ target, -1.0, 1.0)))
+    if tilt > max_tilt_rad:
+        return None
+
+    y_floor_meas = float(cam_pos[1]) + float(height)
+    dy_err = y_floor_meas - y_floor_ref
+    if abs(dy_err) > max_y_err:
+        return None
+
+    R_c = np.eye(3)
+    if tilt > 1e-6:
+        axis = np.cross(n, target)
+        axis_norm = np.linalg.norm(axis)
+        if axis_norm > 1e-12:
+            step = min(beta_rot * tilt, max_rot_rad)
+            R_c = _axis_angle(axis / axis_norm, step)
+    dy = float(np.clip(beta_y * dy_err, -max_dy, max_dy))
+
+    C = np.eye(4)
+    C[:3, :3] = R_c
+    # 회전은 카메라 위치를 고정점으로, 높이는 -dy만큼 복원
+    C[:3, 3] = cam_pos - R_c @ cam_pos
+    C[1, 3] -= dy
+    return C
+
+
 def gravity_align_rotation(normal_cam: np.ndarray) -> np.ndarray:
     """Return R such that R @ normal_cam == [0, -1, 0]."""
     normal = np.asarray(normal_cam, dtype=np.float64)

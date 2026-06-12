@@ -43,6 +43,10 @@ class VoCfg:
     keyframe_min_flow_px: float = 40.0
     min_inlier_ratio: float = 0.5
     gravity_align: bool = False
+    # 키프레임마다 그 프레임 depth의 바닥으로 pose 기울기·높이를 절대
+    # 기준에 부분 복원 — mono depth 바닥 편향의 병진 주입(가라앉음 drift)을
+    # 키프레임 단위로 리셋한다 (gravity_align과 함께 사용 권장)
+    floor_anchor: bool = False
 
 
 @dataclass
