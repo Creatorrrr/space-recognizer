@@ -25,45 +25,54 @@ def estimate_floor(depth: np.ndarray, K: np.ndarray,
     if not np.isfinite(threshold) or threshold <= 0.0:
         return None
 
-    rng = np.random.default_rng(rng_seed)
     min_up_dot = float(np.cos(np.radians(60.0)))
-    best_mask: np.ndarray | None = None
-    best_count = 0
-
-    for _ in range(iters):
-        sample_idx = rng.choice(len(points), size=3, replace=False)
-        p0, p1, p2 = points[sample_idx]
-        normal = np.cross(p1 - p0, p2 - p0)
-        norm = np.linalg.norm(normal)
-        if norm < 1e-8:
-            continue
-        normal = normal / norm
-        d = float(normal @ p0)
-        normal, d = _orient_up(normal, d)
-        if float(normal @ _WORLD_UP) < min_up_dot:
-            continue
-        if -d <= 1e-6:
-            continue
-
-        mask = np.abs(points @ normal - d) < threshold
-        count = int(mask.sum())
-        if count > best_count:
-            best_count = count
-            best_mask = mask
-
-    if best_mask is None:
+    result = _ransac_floor(points, threshold, iters, rng_seed, min_up_dot)
+    if result is None:
         return None
-
-    normal, d = _refit_plane(points[best_mask])
-    normal, d = _orient_up(normal, d)
-    if float(normal @ _WORLD_UP) < min_up_dot or -d <= 1e-6:
+    normal, d, inlier_frac = result
+    if -d <= 1e-6:
         return None
-
-    inliers = np.abs(points @ normal - d) < threshold
-    inlier_frac = float(inliers.mean())
     if inlier_frac < 0.25:
         return None
 
+    return normal, d, inlier_frac
+
+
+def estimate_floor_from_points(points: np.ndarray, *,
+                               max_tilt_deg: float = 30.0,
+                               iters: int = 200, rng_seed: int = 0
+                               ) -> tuple[np.ndarray, float, float] | None:
+    """Estimate a floor plane from global-frame points.
+
+    Returns (normal, d, inlier_frac) for dot(normal, point) = d. The normal is
+    oriented toward global up (-Y), and planes farther than max_tilt_deg from
+    -Y are rejected.
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        return None
+    valid = np.isfinite(pts).all(axis=1)
+    pts = pts[valid]
+    if len(pts) < 2000:
+        return None
+    if not np.isfinite(max_tilt_deg) or max_tilt_deg <= 0.0:
+        return None
+
+    centroid = pts.mean(axis=0)
+    spread = float(np.median(np.linalg.norm(pts - centroid, axis=1)))
+    if not np.isfinite(spread) or spread <= 1e-9:
+        spread = float(np.median(np.linalg.norm(pts, axis=1)))
+    threshold = 0.02 * spread
+    if not np.isfinite(threshold) or threshold <= 0.0:
+        return None
+
+    min_up_dot = float(np.cos(np.radians(max_tilt_deg)))
+    result = _ransac_floor(pts, threshold, iters, rng_seed, min_up_dot)
+    if result is None:
+        return None
+    normal, d, inlier_frac = result
+    if inlier_frac < 0.2:
+        return None
     return normal, d, inlier_frac
 
 
@@ -118,6 +127,51 @@ def _sample_points(depth: np.ndarray, K: np.ndarray,
     x = (u - K[0, 2]) / K[0, 0] * z_valid
     y = (v - K[1, 2]) / K[1, 1] * z_valid
     return np.stack([x, y, z_valid], axis=1), z_valid
+
+
+def _ransac_floor(points: np.ndarray, threshold: float, iters: int,
+                  rng_seed: int, min_up_dot: float
+                  ) -> tuple[np.ndarray, float, float] | None:
+    if len(points) < 3 or iters <= 0:
+        return None
+    if not np.isfinite(threshold) or threshold <= 0.0:
+        return None
+    if not np.isfinite(min_up_dot):
+        return None
+
+    rng = np.random.default_rng(rng_seed)
+    best_mask: np.ndarray | None = None
+    best_count = 0
+
+    for _ in range(iters):
+        sample_idx = rng.choice(len(points), size=3, replace=False)
+        p0, p1, p2 = points[sample_idx]
+        normal = np.cross(p1 - p0, p2 - p0)
+        norm = np.linalg.norm(normal)
+        if norm < 1e-8:
+            continue
+        normal = normal / norm
+        d = float(normal @ p0)
+        normal, d = _orient_up(normal, d)
+        if float(normal @ _WORLD_UP) < min_up_dot:
+            continue
+
+        mask = np.abs(points @ normal - d) < threshold
+        count = int(mask.sum())
+        if count > best_count:
+            best_count = count
+            best_mask = mask
+
+    if best_mask is None or best_count < 3:
+        return None
+
+    normal, d = _refit_plane(points[best_mask])
+    normal, d = _orient_up(normal, d)
+    if float(normal @ _WORLD_UP) < min_up_dot:
+        return None
+
+    inliers = np.abs(points @ normal - d) < threshold
+    return normal, d, float(inliers.mean())
 
 
 def _refit_plane(points: np.ndarray) -> tuple[np.ndarray, float]:

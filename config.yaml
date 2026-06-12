@@ -52,6 +52,7 @@ backend:
   metric_anchor: true   # DA3METRIC-LARGE로 미터 단위 추정 (윈도당 +0.3~1s)
   scale_servo: true     # metric 앵커로 라이브 스케일 drift를 저주기 보정
                         # (calib a가 1~2분에 0.8→0.1로 붕괴하던 문제의 근본 대응)
+  attitude_servo: true  # 재구성 바닥 평면으로 VO pitch/roll drift를 저주기 보정
   conf_percentile: 30.0 # 멀티뷰 conf 하위 컷 (모델 변형 교체 시 재튜닝 대상)
   # VO pose를 DA3 입력 조건으로 주는 pose-conditioned 추론. 실측 결과 본
   # 데이터에서 기하를 왜곡해(커버리지 60%→10~25%, docs/benchmarks.md Tier 2)

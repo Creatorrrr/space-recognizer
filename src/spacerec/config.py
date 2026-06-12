@@ -64,6 +64,9 @@ class BackendCfg:
     # 곱해 복귀시킨다. mono depth 정규화 drift로 1~2분에 걸쳐 live 스케일이
     # 수 배 붕괴하던 문제의 근본 대응 (metric_anchor 필요).
     scale_servo: bool = False
+    # Periodic floor attitude servo. Uses the reconstructed global point cloud
+    # to gently reduce VO pitch/roll drift without changing scale.
+    attitude_servo: bool = False
 
 
 @dataclass

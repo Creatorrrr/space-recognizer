@@ -24,10 +24,15 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from . import floor as floor_mod
 from .calib import DepthCalibration, fit_affine_depth
 from .config import BackendCfg
 from .geometry import (SIM3_IDENTITY, Sim3, sim3_apply, sim3_compose,
                        sim3_interp, sim3_inverse, sim3_on_pose, umeyama_sim3)
+
+
+_ATT_STEP_RAD = float(np.radians(2.0))
+_ATT_DEADBAND_RAD = float(np.radians(1.0))
 
 
 @dataclass
@@ -366,6 +371,18 @@ class _Worker:
 
         # ---- 루프 클로저: 재방문 감지 → pose graph → epoch별 지도 보정 ----
         corrections, loop_log, corr_newest = self._close_loops(new_kfs)
+        if corrections is None and getattr(self.cfg, "attitude_servo", False):
+            anchor_pose = self.kf_global_poses.get(newest.kf_id)
+            if anchor_pose is not None:
+                C = self._attitude_correction(points, anchor_pose[:3, 3])
+                if C is not None:
+                    corrections = {e: C for e in self._epoch_kfs}
+                    for k, pose in list(self.kf_global_poses.items()):
+                        self.kf_global_poses[k] = sim3_on_pose(C, pose)
+                    corr_newest = C
+                    loop_log = (
+                        f"attitude theta={self._last_attitude_deg:.1f}deg "
+                        f"inl={self._last_attitude_inlier_frac:.2f}")
         if corrections is not None:
             # live→global 갱신은 재피팅이 아니라 *합성*으로: pose graph가
             # 최신 노드를 얼마나 움직였는지(corr_newest)가 곧 현재 시점의
@@ -390,6 +407,41 @@ class _Worker:
             epoch=epoch, loop_corrections=corrections, loop_log=loop_log,
             servo_gain_g=servo_g,
             loop_converging=self._has_pending_loop_residual())
+
+    def _attitude_correction(self, points: np.ndarray,
+                             anchor: np.ndarray) -> Sim3 | None:
+        """Return a small rotation correction that moves the floor normal to -Y."""
+        self._last_attitude_deg = 0.0
+        self._last_attitude_inlier_frac = 0.0
+        result = floor_mod.estimate_floor_from_points(points)
+        if result is None:
+            return None
+
+        normal, _, inlier_frac = result
+        target = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+        normal = np.asarray(normal, dtype=np.float64)
+        normal_norm = np.linalg.norm(normal)
+        if normal_norm < 1e-12:
+            return None
+        normal = normal / normal_norm
+
+        dot = float(np.clip(normal @ target, -1.0, 1.0))
+        angle = float(np.arccos(dot))
+        self._last_attitude_deg = float(np.degrees(angle))
+        self._last_attitude_inlier_frac = float(inlier_frac)
+        if angle <= _ATT_DEADBAND_RAD:
+            return None
+
+        axis = np.cross(normal, target)
+        axis_norm = np.linalg.norm(axis)
+        if axis_norm < 1e-12:
+            return None
+        R_c = floor_mod._axis_angle(axis / axis_norm,
+                                    min(angle, _ATT_STEP_RAD))
+        anchor = np.asarray(anchor, dtype=np.float64)
+        if anchor.shape != (3,) or not np.isfinite(anchor).all():
+            return None
+        return 1.0, R_c, anchor - R_c @ anchor
 
     # ------------------------------------------------------------------
     # 루프 클로저 (docs/upgrade-plan.md Tier 4)

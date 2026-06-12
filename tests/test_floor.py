@@ -1,6 +1,7 @@
 import numpy as np
 
-from spacerec.floor import estimate_floor, gravity_align_rotation
+from spacerec.floor import (estimate_floor, estimate_floor_from_points,
+                            gravity_align_rotation)
 from spacerec.vo import default_intrinsics
 
 
@@ -28,6 +29,14 @@ def _angle_deg(a, b):
     return np.degrees(np.arccos(np.clip(float(a @ b), -1.0, 1.0)))
 
 
+def _floor_points(normal, d=-1.0, n=4000, seed=0):
+    rng = np.random.default_rng(seed)
+    x = rng.uniform(-2.0, 2.0, n)
+    z = rng.uniform(0.5, 4.0, n)
+    y = (d - normal[0] * x - normal[2] * z) / normal[1]
+    return np.stack([x, y, z], axis=1)
+
+
 def test_estimate_floor_recovers_tilted_floor_normal():
     depth, K, expected_normal = _floor_depth()
     rng = np.random.default_rng(4)
@@ -42,6 +51,30 @@ def test_estimate_floor_recovers_tilted_floor_normal():
     assert _angle_deg(normal, expected_normal) < 1.0
     assert normal @ np.array([0.0, -1.0, 0.0]) > 0.0
     assert inlier_frac >= 0.5
+
+
+def test_estimate_floor_from_points_recovers_floor_with_outliers():
+    tilt = np.radians(12.0)
+    normal = np.array([0.0, -np.cos(tilt), -np.sin(tilt)])
+    points = _floor_points(normal, n=5000, seed=1)
+    rng = np.random.default_rng(2)
+    outliers = rng.uniform([-3.0, -1.0, 0.0], [3.0, 3.0, 5.0], (1000, 3))
+    points = np.concatenate([points, outliers])
+
+    result = estimate_floor_from_points(points, rng_seed=3)
+
+    assert result is not None
+    got_normal, _, inlier_frac = result
+    assert _angle_deg(got_normal, normal) < 1.0
+    assert inlier_frac > 0.7
+
+
+def test_estimate_floor_from_points_rejects_tilt_past_gate():
+    tilt = np.radians(45.0)
+    normal = np.array([0.0, -np.cos(tilt), -np.sin(tilt)])
+    points = _floor_points(normal, n=4000, seed=4)
+
+    assert estimate_floor_from_points(points, rng_seed=5) is None
 
 
 def test_estimate_floor_rejects_invalid_or_nonplanar_depth():

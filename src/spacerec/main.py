@@ -55,11 +55,12 @@ def _drain_backend_results(backend: ReconstructionBackend, worldmap: GlobalMap,
                       origins=res.view_origins, view_idx=res.point_view_idx,
                       epoch=res.epoch)
         if res.loop_corrections:
-            # 루프 클로저: 과거 epoch들의 voxel을 보정된 pose에 맞춰 이동
+            # 지도 보정(루프 클로저/자세 서보): 과거 epoch voxel을 보정된
+            # pose에 맞춰 이동하고 궤적도 다시 그린다
             worldmap.apply_corrections(res.loop_corrections)
             viz.log_trajectory_correction(res.kf_global_poses, res.kf_ts or {})
-            print(f"[loop] 루프 클로저 수락 — {res.loop_log} "
-                  f"(지도 {len(res.loop_corrections)} epoch 보정)")
+            print(f"[loop] 지도 보정 수락 — {res.loop_log} "
+                  f"({len(res.loop_corrections)} epoch 보정)")
         worldmap.set_correction_target(res.T_global_live)
         if res.calib.inlier_frac > 0.3:
             calib = res.calib

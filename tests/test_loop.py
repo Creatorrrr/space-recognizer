@@ -49,6 +49,20 @@ def _se3(R, t):
     return T
 
 
+def _global_floor_points(normal, d=-1.0, n=4000, seed=0):
+    rng = np.random.default_rng(seed)
+    x = rng.uniform(-2.0, 2.0, n)
+    z = rng.uniform(0.5, 4.0, n)
+    y = (d - normal[0] * x - normal[2] * z) / normal[1]
+    return np.stack([x, y, z], axis=1)
+
+
+def _angle_rad(a, b):
+    a = a / np.linalg.norm(a)
+    b = b / np.linalg.norm(b)
+    return np.arccos(np.clip(float(a @ b), -1.0, 1.0))
+
+
 def test_edge_residual_is_zero_for_matching_relative_pose():
     P_i = _se3(np.eye(3), np.zeros(3))
     P_j = _se3(np.eye(3), np.array([1.0, 0.0, 0.0]))
@@ -303,6 +317,38 @@ def test_worker_has_pending_loop_residual_checks_persisted_edges_only():
     worker.loop_cfg = SimpleNamespace(persist_edges=True)
     worker.detector = None
     assert worker._has_pending_loop_residual() is False
+
+
+def test_worker_attitude_correction_clamps_rotation_and_keeps_anchor():
+    from spacerec.backend import _ATT_STEP_RAD, _Worker
+
+    worker = _Worker.__new__(_Worker)
+    target = np.array([0.0, -1.0, 0.0])
+    tilt = np.radians(5.0)
+    normal = np.array([0.0, -np.cos(tilt), -np.sin(tilt)])
+    points = _global_floor_points(normal, seed=8)
+    anchor = np.array([0.4, 1.2, -0.3])
+
+    C = worker._attitude_correction(points, anchor)
+
+    assert C is not None
+    assert C[0] == pytest.approx(1.0)
+    np.testing.assert_allclose(sim3_apply(C, anchor[None])[0], anchor, atol=1e-9)
+    assert Rotation.from_matrix(C[1]).magnitude() == pytest.approx(_ATT_STEP_RAD)
+    before = _angle_rad(normal, target)
+    after = _angle_rad(C[1] @ normal, target)
+    assert before - after == pytest.approx(_ATT_STEP_RAD, abs=1e-4)
+
+
+def test_worker_attitude_correction_ignores_deadband_tilt():
+    from spacerec.backend import _ATT_DEADBAND_RAD, _Worker
+
+    worker = _Worker.__new__(_Worker)
+    tilt = _ATT_DEADBAND_RAD * 0.5
+    normal = np.array([0.0, -np.cos(tilt), -np.sin(tilt)])
+    points = _global_floor_points(normal, seed=9)
+
+    assert worker._attitude_correction(points, np.zeros(3)) is None
 
 
 def test_pose_graph_noop_without_loop_edges():

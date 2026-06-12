@@ -1,4 +1,4 @@
-from spacerec.config import Config, DepthCfg, VizCfg, VoCfg
+from spacerec.config import BackendCfg, Config, DepthCfg, VizCfg, VoCfg
 from spacerec.device import select_torch_device
 
 
@@ -84,6 +84,17 @@ def test_vo_gravity_align_defaults_off_and_loads_from_yaml(tmp_path):
     cfg = Config.load(path)
 
     assert cfg.vo.gravity_align is True
+
+
+def test_backend_attitude_servo_defaults_off_and_loads_from_yaml(tmp_path):
+    assert BackendCfg().attitude_servo is False
+
+    path = tmp_path / "config.yaml"
+    path.write_text("backend:\n  attitude_servo: true\n", encoding="utf-8")
+
+    cfg = Config.load(path)
+
+    assert cfg.backend.attitude_servo is True
 
 
 def test_select_torch_device_prefers_cuda(monkeypatch):
