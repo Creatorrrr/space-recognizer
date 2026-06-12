@@ -61,6 +61,7 @@ backend:
 # VO drift를 pose graph로 보정. objects.appearance 필요 (DINOv2 공유).
 loop:
   enabled: true
+  persist_edges: true
   sim_thresh: 0.62   # 키프레임 임베딩 cos 유사도 후보 임계값
   min_gap_s: 10      # 이보다 가까운 시점끼리는 루프로 안 봄
   min_inliers: 15    # ORB+depth 3D-3D RANSAC inlier 하한

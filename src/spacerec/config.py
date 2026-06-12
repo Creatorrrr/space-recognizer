@@ -74,6 +74,7 @@ class LoopCfg:
     objects.appearance가 켜져 있어야 동작한다 (임베더 공유).
     """
     enabled: bool = False
+    persist_edges: bool = True
     sim_thresh: float = 0.62    # 임베딩 cos 유사도 후보 임계값
     min_gap_s: float = 10.0     # 이보다 가까운 시점끼리는 루프로 안 봄
     min_inliers: int = 15       # 3D-3D RANSAC inlier 하한 (기각 게이트)

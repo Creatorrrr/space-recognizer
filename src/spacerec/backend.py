@@ -182,6 +182,7 @@ class _Worker:
         self._epoch_kfs: dict[int, list[int]] = {}   # epoch -> 그 윈도의 kf ids
         # 루프 검증용 키프레임 저장: id -> (ts, gray u8, depth f16, K)
         self._kf_store: dict[int, tuple] = {}
+        self._loop_edges: dict[tuple[int, int], tuple[Sim3, float]] = {}
 
     def run(self, in_q: mp.Queue, out_q: mp.Queue) -> None:
         last_run = time.monotonic()
@@ -392,11 +393,33 @@ class _Worker:
     # 루프 클로저 (docs/upgrade-plan.md Tier 4)
     # ------------------------------------------------------------------
     _MAX_GRAPH_NODES = 400
+    _MAX_LOOP_EDGES = 50
+    _RESIDUAL_THRESH = 0.05
     # 윈도당 보정 상한 — 초과분은 부분 적용(λ<1)하고 다음 윈도의 루프
     # 재검출로 반복 수렴시킨다. drift가 극단으로 누적된 뒤 한 번에 당기면
     # (실측 |t|=4.7, scale 3.1) 지도·객체가 출렁이고 병합이 과격해진다.
     _MAX_STEP_T = 0.5            # 병진 (live 단위)
     _MAX_STEP_LOGS = 0.405       # 스케일 (=log 1.5)
+
+    def _remember_loop_edge(self, old_id: int, new_id: int, T_ab: Sim3,
+                            weight: float) -> None:
+        key = (old_id, new_id)
+        prev = self._loop_edges.get(key)
+        if prev is None or weight >= prev[1]:
+            if prev is not None:
+                self._loop_edges.pop(key)
+            self._loop_edges[key] = (T_ab, weight)
+        while len(self._loop_edges) > self._MAX_LOOP_EDGES:
+            # 증거가 가장 약한(감쇠된) 엣지부터 버린다
+            weakest = min(self._loop_edges, key=lambda k: self._loop_edges[k][1])
+            self._loop_edges.pop(weakest)
+
+    def _decay_loop_edges(self, keys: list[tuple[int, int]]) -> None:
+        for key in keys:
+            if key not in self._loop_edges:
+                continue
+            T_ab, weight = self._loop_edges[key]
+            self._loop_edges[key] = (T_ab, max(0.3, weight * 0.9))
 
     def _close_loops(self, new_kfs: list[BackendKeyframe]
                      ) -> tuple[dict[int, Sim3] | None, str, Sim3]:
@@ -408,10 +431,11 @@ class _Worker:
         """
         if self.detector is None:
             return None, "", SIM3_IDENTITY
-        from .loop import (match_3d3d, optimize_pose_graph, sequential_edges,
-                           sim3_from_matches)
+        from .loop import (edge_residual, match_3d3d, optimize_pose_graph,
+                           sequential_edges, sim3_from_matches)
 
         lcfg = self.loop_cfg
+        persist_edges = bool(getattr(lcfg, "persist_edges", True))
         accepted = []
         for kf in new_kfs:
             if kf.emb is None or kf.K is None or kf.raw_depth is None:
@@ -433,8 +457,13 @@ class _Worker:
                 if res is not None and (res[1].mean()
                                         >= lcfg.min_inlier_frac):
                     T_ab, mask = res
-                    accepted.append((old_id, kf.kf_id, T_ab,
-                                     int(mask.sum()), sim))
+                    inl = int(mask.sum())
+                    weight = min(1.5, inl / 50.0)
+                    accepted.append((old_id, kf.kf_id, T_ab, inl, sim,
+                                     weight))
+                    if persist_edges:
+                        self._remember_loop_edge(old_id, kf.kf_id, T_ab,
+                                                 weight)
                 else:
                     print(f"[loop] 후보 기각 kf{old_id}->kf{kf.kf_id} "
                           f"(sim={sim:.2f}, matches={dg.get('n', 0)}, "
@@ -446,12 +475,38 @@ class _Worker:
             while len(self._kf_store) > lcfg.max_kf_store:
                 self._kf_store.pop(next(iter(self._kf_store)))
 
-        if not accepted or len(self.kf_global_poses) < 8:
+        if persist_edges:
+            active_loop_edges = [
+                (old_id, new_id, T_ab, weight)
+                for (old_id, new_id), (T_ab, weight) in self._loop_edges.items()
+                if old_id in self.kf_global_poses
+                and new_id in self.kf_global_poses
+            ]
+        else:
+            active_loop_edges = [
+                (old_id, new_id, T_ab, weight)
+                for old_id, new_id, T_ab, _, _, weight in accepted
+            ]
+
+        residuals = [
+            edge_residual(self.kf_global_poses[old_id],
+                          self.kf_global_poses[new_id], T_ab)
+            for old_id, new_id, T_ab, _ in active_loop_edges
+        ]
+        max_residual = max(residuals, default=0.0)
+        replay_persisted = (
+            persist_edges
+            and bool(active_loop_edges)
+            and max_residual > self._RESIDUAL_THRESH
+        )
+
+        if ((not accepted and not replay_persisted)
+                or len(self.kf_global_poses) < 8):
             return None, "", SIM3_IDENTITY
 
         # ---- pose graph 노드 선정 (장시간 세션은 솎아냄) ----
         all_ids = sorted(self.kf_global_poses)
-        must = {i for loop in accepted for i in loop[:2]}
+        must = {i for edge in active_loop_edges for i in edge[:2]}
         if len(all_ids) > self._MAX_GRAPH_NODES:
             stride = int(np.ceil(len(all_ids) / self._MAX_GRAPH_NODES))
             node_ids = sorted(set(all_ids[::stride]) | must | {all_ids[-1]})
@@ -461,10 +516,11 @@ class _Worker:
         poses = [self.kf_global_poses[k] for k in node_ids]
 
         edges = sequential_edges(poses)
-        for old_id, new_id, T_ab, inl, _ in accepted:
+        used_loop_keys: list[tuple[int, int]] = []
+        for old_id, new_id, T_ab, weight in active_loop_edges:
             if old_id in idx and new_id in idx:
-                edges.append((idx[old_id], idx[new_id], T_ab,
-                              min(1.5, inl / 50.0)))
+                edges.append((idx[old_id], idx[new_id], T_ab, weight))
+                used_loop_keys.append((old_id, new_id))
         corrected = optimize_pose_graph(poses, edges)
 
         # 노드별 보정 Sim3 (corrected ∘ old⁻¹); 비노드 kf는 최근접 노드 보정 적용
@@ -482,12 +538,15 @@ class _Worker:
         partial = ""
         if lam < 1.0:
             node_corr = [sim3_interp(SIM3_IDENTITY, C, lam) for C in node_corr]
-            partial = f" | 부분 적용 λ={lam:.2f}"
+            partial = f"부분 적용 λ={lam:.2f}"
         node_arr = np.array(node_ids)
         for k in all_ids:
             j = int(np.argmin(np.abs(node_arr - k)))
             self.kf_global_poses[k] = sim3_on_pose(node_corr[j],
                                                    self.kf_global_poses[k])
+
+        if persist_edges and used_loop_keys:
+            self._decay_loop_edges(used_loop_keys)
 
         # epoch별 지도 보정: 각 윈도의 최신 kf에 대응하는 노드 보정 사용
         corrections: dict[int, Sim3] = {}
@@ -496,10 +555,19 @@ class _Worker:
             corrections[e] = node_corr[j]
 
         mag = max(np.linalg.norm(c[2]) for c in node_corr)
-        log = "; ".join(f"kf{o}↔kf{nn} inl={i} sim={s_:.2f}"
-                        for o, nn, _, i, s_ in accepted)
-        j_newest = int(np.argmin(np.abs(node_arr - new_kfs[-1].kf_id)))
-        return (corrections, f"{log} | max|t|={mag:.3f}{partial}",
+        log_parts = []
+        if accepted:
+            log_parts.append("; ".join(
+                f"kf{o}↔kf{nn} inl={i} sim={s_:.2f}"
+                for o, nn, _, i, s_, _ in accepted))
+        if persist_edges and active_loop_edges:
+            log_parts.append(f"persist r={max_residual:.3f}")
+        log_parts.append(f"max|t|={mag:.3f}")
+        if partial:
+            log_parts.append(partial)
+        newest_id = new_kfs[-1].kf_id if new_kfs else all_ids[-1]
+        j_newest = int(np.argmin(np.abs(node_arr - newest_id)))
+        return (corrections, " | ".join(log_parts),
                 node_corr[j_newest])
 
 

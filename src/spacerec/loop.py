@@ -175,6 +175,21 @@ def _sim3_log(T: Sim3) -> np.ndarray:
                            [np.log(max(s, 1e-12))]])
 
 
+def edge_residual(P_i: np.ndarray, P_j: np.ndarray, Z_ij: Sim3) -> float:
+    """Pose-graph edge residual norm for cam-to-world SE3 nodes.
+
+    P_i and P_j are cam-to-world 4x4 poses. Z_ij maps j-camera coordinates
+    into i-camera coordinates. The residual is
+    ||log(inv(Z_ij) * inv(P_i) * P_j)|| over rotation, translation, and log
+    scale.
+    """
+    A: Sim3 = (1.0, P_i[:3, :3], P_i[:3, 3])
+    B: Sim3 = (1.0, P_j[:3, :3], P_j[:3, 3])
+    pred = sim3_compose(sim3_inverse(A), B)
+    err = sim3_compose(sim3_inverse(Z_ij), pred)
+    return float(np.linalg.norm(_sim3_log(err)))
+
+
 def optimize_pose_graph(poses: list[np.ndarray],
                         edges: list[tuple[int, int, Sim3, object]],
                         max_nfev: int = 60) -> list[Sim3]:

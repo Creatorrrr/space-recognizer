@@ -1,10 +1,12 @@
 """루프 클로저 수학 코어: 3D-3D RANSAC Sim3, Sim3 pose graph 최적화."""
 
 import numpy as np
+import pytest
 from scipy.spatial.transform import Rotation
 
-from spacerec.geometry import sim3_apply, sim3_compose, sim3_inverse
-from spacerec.loop import (LoopDetector, optimize_pose_graph,
+from spacerec.geometry import (SIM3_IDENTITY, sim3_apply, sim3_compose,
+                               sim3_interp, sim3_inverse, sim3_on_pose)
+from spacerec.loop import (LoopDetector, edge_residual, optimize_pose_graph,
                            sequential_edges, sim3_from_matches)
 
 
@@ -45,6 +47,22 @@ def _se3(R, t):
     T = np.eye(4)
     T[:3, :3], T[:3, 3] = R, t
     return T
+
+
+def test_edge_residual_is_zero_for_matching_relative_pose():
+    P_i = _se3(np.eye(3), np.zeros(3))
+    P_j = _se3(np.eye(3), np.array([1.0, 0.0, 0.0]))
+    Z_ij = (1.0, np.eye(3), np.array([1.0, 0.0, 0.0]))
+
+    assert edge_residual(P_i, P_j, Z_ij) < 1e-9
+
+
+def test_edge_residual_grows_for_inconsistent_relative_pose():
+    P_i = _se3(np.eye(3), np.zeros(3))
+    P_j = _se3(np.eye(3), np.array([1.1, 0.0, 0.0]))
+    Z_ij = (1.0, np.eye(3), np.array([1.0, 0.0, 0.0]))
+
+    assert edge_residual(P_i, P_j, Z_ij) > 0.09
 
 
 def test_pose_graph_corrects_square_loop_drift():
@@ -93,6 +111,78 @@ def test_pose_graph_corrects_square_loop_drift():
     # 스케일 보정이 1 근처의 합리적 범위
     scales = [c[0] for c in corrected]
     assert all(0.7 < s < 1.3 for s in scales)
+
+
+def test_pose_graph_partial_replay_converges_loop_residual():
+    """Repeated partial loop corrections should keep reducing stored-edge error."""
+    rng = np.random.default_rng(3)
+    n = 21
+    gt = [np.eye(4)]
+    for step in (np.array([0.2, 0, 0]), np.array([0, 0, 0.2]),
+                 np.array([-0.2, 0, 0]), np.array([0, 0, -0.2])):
+        for _ in range(5):
+            T = gt[-1].copy()
+            T[:3, 3] = T[:3, 3] + step
+            gt.append(T)
+    gt = gt[:n]
+
+    yaw_bias = Rotation.from_rotvec([0, 0.012, 0]).as_matrix()
+    poses = [gt[0]]
+    for k in range(1, n):
+        rel = np.linalg.inv(gt[k - 1]) @ gt[k]
+        noise_R = Rotation.from_rotvec(rng.normal(0, 0.004, 3)).as_matrix()
+        rel = rel.copy()
+        rel[:3, :3] = yaw_bias @ noise_R @ rel[:3, :3]
+        rel[:3, 3] = rel[:3, 3] * 1.04 + rng.normal(0, 0.002, 3)
+        poses.append(poses[-1] @ rel)
+
+    A = (1.0, gt[0][:3, :3], gt[0][:3, 3])
+    B = (1.0, gt[-1][:3, :3], gt[-1][:3, 3])
+    Z_loop = sim3_compose(sim3_inverse(A), B)
+    assert edge_residual(poses[0], poses[-1], Z_loop) > 0.05
+
+    for _ in range(8):
+        corrected = optimize_pose_graph(
+            poses, sequential_edges(poses) + [(0, n - 1, Z_loop, 1.0)])
+        node_corr = [
+            sim3_compose(
+                C, sim3_inverse((1.0, P[:3, :3], P[:3, 3])))
+            for C, P in zip(corrected, poses)
+        ]
+        partial = [sim3_interp(SIM3_IDENTITY, C, 0.3) for C in node_corr]
+        poses = [sim3_on_pose(C, P) for C, P in zip(partial, poses)]
+
+    assert edge_residual(poses[0], poses[-1], Z_loop) < 0.05
+
+
+def test_worker_replays_persisted_loop_edge_without_new_acceptance():
+    from types import SimpleNamespace
+
+    from spacerec.backend import _Worker
+
+    worker = _Worker.__new__(_Worker)
+    worker.detector = object()
+    worker.loop_cfg = SimpleNamespace(persist_edges=True)
+    Z_loop = (1.0, np.eye(3), np.zeros(3))
+    worker._loop_edges = {(0, 7): (Z_loop, 1.0)}
+    worker.kf_global_poses = {
+        k: _se3(np.eye(3), np.array([0.1 * k, 0.0, 0.0]))
+        for k in range(8)
+    }
+    worker._epoch_kfs = {0: list(range(8))}
+
+    before = edge_residual(worker.kf_global_poses[0],
+                           worker.kf_global_poses[7], Z_loop)
+    corrections, log, corr_newest = worker._close_loops([])
+
+    assert corrections is not None
+    assert 0 in corrections
+    assert np.linalg.norm(corr_newest[2]) > 0
+    assert "persist r=" in log
+    assert worker._loop_edges[(0, 7)][1] == pytest.approx(0.9)
+    after = edge_residual(worker.kf_global_poses[0],
+                          worker.kf_global_poses[7], Z_loop)
+    assert after < before
 
 
 def test_pose_graph_noop_without_loop_edges():
