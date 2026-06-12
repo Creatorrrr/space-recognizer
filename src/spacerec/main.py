@@ -41,13 +41,16 @@ def _map_points_for_viz(worldmap: GlobalMap, cfg: VizCfg,
 def _drain_backend_results(backend: ReconstructionBackend, worldmap: GlobalMap,
                            viz: Visualizer, calib: DepthCalibration,
                            vo: VisualOdometry, frame_wh: tuple[int, int],
-                           viz_cfg: VizCfg
+                           viz_cfg: VizCfg,
+                           loop_state: dict[str, bool] | None = None,
                            ) -> DepthCalibration:
     while True:
         try:
             res = backend.results.get_nowait()
         except Exception:
             return calib
+        if loop_state is not None and res.loop_converging:
+            loop_state["converging"] = True
         worldmap.fuse(res.points, res.colors,
                       origins=res.view_origins, view_idx=res.point_view_idx,
                       epoch=res.epoch)
@@ -377,11 +380,23 @@ def main() -> None:
         idle_since = time.monotonic()
         gs_deadline = time.monotonic() + (cfg.gaussian.period_s + 5.0
                                           if gs_backend is not None else 0.0)
+        loop_wait_until = 0.0
+        loop_wait_extended = False
         while (time.monotonic() - idle_since < 8.0
-               or time.monotonic() < gs_deadline):
+               or time.monotonic() < gs_deadline
+               or time.monotonic() < loop_wait_until):
             before = len(worldmap.points)
+            loop_state = {"converging": False}
             calib = _drain_backend_results(backend, worldmap, viz, calib, vo,
-                                           (W, H), cfg.viz)
+                                           (W, H), cfg.viz, loop_state)
+            now = time.monotonic()
+            if loop_state["converging"]:
+                idle_since = now
+                if not loop_wait_extended:
+                    loop_wait_until = now + 30.0
+                    loop_wait_extended = True
+                    print("[loop] residual still converging; "
+                          "extending final drain up to 30s")
             if gs_backend is not None:
                 try:
                     gres = gs_backend.results.get_nowait()

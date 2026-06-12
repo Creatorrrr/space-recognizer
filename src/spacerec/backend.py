@@ -68,6 +68,7 @@ class BackendResult:
     # 루프 클로저가 수락된 경우: epoch별 지도 보정 Sim3 + 로그 문자열
     loop_corrections: dict[int, Sim3] | None = None
     loop_log: str = ""
+    loop_converging: bool = False
 
 
 def robust_sim3(src_poses: list[np.ndarray], dst_poses: list[np.ndarray]) -> Sim3:
@@ -387,7 +388,8 @@ class _Worker:
             pose_conditioned=pose_inputs is not None,
             win_alpha=alpha, win_beta=beta,
             epoch=epoch, loop_corrections=corrections, loop_log=loop_log,
-            servo_gain_g=servo_g)
+            servo_gain_g=servo_g,
+            loop_converging=self._has_pending_loop_residual())
 
     # ------------------------------------------------------------------
     # 루프 클로저 (docs/upgrade-plan.md Tier 4)
@@ -395,11 +397,17 @@ class _Worker:
     _MAX_GRAPH_NODES = 400
     _MAX_LOOP_EDGES = 50
     _RESIDUAL_THRESH = 0.05
+    _SNAP_INLIERS = 150
     # 윈도당 보정 상한 — 초과분은 부분 적용(λ<1)하고 다음 윈도의 루프
     # 재검출로 반복 수렴시킨다. drift가 극단으로 누적된 뒤 한 번에 당기면
     # (실측 |t|=4.7, scale 3.1) 지도·객체가 출렁이고 병합이 과격해진다.
     _MAX_STEP_T = 0.5            # 병진 (live 단위)
     _MAX_STEP_LOGS = 0.405       # 스케일 (=log 1.5)
+
+    @classmethod
+    def _step_limit(cls, snap: bool) -> tuple[float, float]:
+        factor = 3.0 if snap else 1.0
+        return cls._MAX_STEP_T * factor, cls._MAX_STEP_LOGS * factor
 
     def _remember_loop_edge(self, old_id: int, new_id: int, T_ab: Sim3,
                             weight: float) -> None:
@@ -420,6 +428,27 @@ class _Worker:
                 continue
             T_ab, weight = self._loop_edges[key]
             self._loop_edges[key] = (T_ab, max(0.3, weight * 0.9))
+
+    def _has_pending_loop_residual(self) -> bool:
+        if self.detector is None:
+            return False
+        if not bool(getattr(self.loop_cfg, "persist_edges", True)):
+            return False
+        if not self._loop_edges:
+            return False
+
+        from .loop import edge_residual
+
+        for (old_id, new_id), (T_ab, _) in self._loop_edges.items():
+            if old_id not in self.kf_global_poses:
+                continue
+            if new_id not in self.kf_global_poses:
+                continue
+            residual = edge_residual(self.kf_global_poses[old_id],
+                                     self.kf_global_poses[new_id], T_ab)
+            if residual > self._RESIDUAL_THRESH:
+                return True
+        return False
 
     def _close_loops(self, new_kfs: list[BackendKeyframe]
                      ) -> tuple[dict[int, Sim3] | None, str, Sim3]:
@@ -499,6 +528,8 @@ class _Worker:
             and bool(active_loop_edges)
             and max_residual > self._RESIDUAL_THRESH
         )
+        snap = any(inl >= self._SNAP_INLIERS
+                   for _, _, _, inl, _, _ in accepted)
 
         if ((not accepted and not replay_persisted)
                 or len(self.kf_global_poses) < 8):
@@ -533,8 +564,9 @@ class _Worker:
         # ---- 대형 보정은 부분 적용 (점진 수렴) ----
         mag_t = max(np.linalg.norm(c[2]) for c in node_corr)
         mag_s = max(abs(np.log(max(c[0], 1e-12))) for c in node_corr)
-        lam = min(1.0, self._MAX_STEP_T / max(mag_t, 1e-9),
-                  self._MAX_STEP_LOGS / max(mag_s, 1e-9))
+        max_step_t, max_step_logs = self._step_limit(snap)
+        lam = min(1.0, max_step_t / max(mag_t, 1e-9),
+                  max_step_logs / max(mag_s, 1e-9))
         partial = ""
         if lam < 1.0:
             node_corr = [sim3_interp(SIM3_IDENTITY, C, lam) for C in node_corr]
@@ -562,6 +594,8 @@ class _Worker:
                 for o, nn, _, i, s_, _ in accepted))
         if persist_edges and active_loop_edges:
             log_parts.append(f"persist r={max_residual:.3f}")
+        if snap:
+            log_parts.append(f"snap inl>={self._SNAP_INLIERS}")
         log_parts.append(f"max|t|={mag:.3f}")
         if partial:
             log_parts.append(partial)

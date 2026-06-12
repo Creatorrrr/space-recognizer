@@ -185,6 +185,126 @@ def test_worker_replays_persisted_loop_edge_without_new_acceptance():
     assert after < before
 
 
+def test_worker_snap_step_limit_is_three_times_normal_limit():
+    from spacerec.backend import _Worker
+
+    assert _Worker._SNAP_INLIERS == 150
+    assert _Worker._step_limit(False) == (
+        _Worker._MAX_STEP_T,
+        _Worker._MAX_STEP_LOGS,
+    )
+    assert _Worker._step_limit(True) == (
+        _Worker._MAX_STEP_T * 3.0,
+        _Worker._MAX_STEP_LOGS * 3.0,
+    )
+
+
+def test_worker_snap_loop_uses_relaxed_step_and_logs_snap(monkeypatch):
+    from types import SimpleNamespace
+
+    import spacerec.loop as loop_mod
+    from spacerec.backend import BackendKeyframe, _Worker
+
+    worker = _Worker.__new__(_Worker)
+
+    class Detector:
+        def query(self, ts, emb):
+            return 0, 0.99
+
+        def add(self, kf_id, ts, emb):
+            pass
+
+    worker.detector = Detector()
+    worker.loop_cfg = SimpleNamespace(
+        persist_edges=True,
+        inlier_dist=0.05,
+        min_inliers=15,
+        min_inlier_frac=0.45,
+        max_kf_store=600,
+    )
+    worker._loop_edges = {}
+    worker.kf_global_poses = {
+        k: _se3(np.eye(3), np.zeros(3))
+        for k in range(8)
+    }
+    worker._epoch_kfs = {0: list(range(8))}
+    worker._kf_store = {
+        0: (
+            0.0,
+            np.zeros((2, 2), np.uint8),
+            np.ones((2, 2), np.float16),
+            np.eye(3),
+        )
+    }
+
+    def fake_match_3d3d(*args, **kwargs):
+        pts = np.zeros((200, 3), np.float32)
+        return pts, pts
+
+    def fake_sim3_from_matches(*args, **kwargs):
+        mask = np.zeros(200, dtype=bool)
+        mask[:_Worker._SNAP_INLIERS] = True
+        return (1.0, np.eye(3), np.zeros(3)), mask
+
+    def fake_optimize_pose_graph(poses, edges):
+        out = [(1.0, np.eye(3), np.zeros(3))]
+        out.extend(
+            (1.0, np.eye(3), np.array([2.0, 0.0, 0.0]))
+            for _ in poses[1:]
+        )
+        return out
+
+    monkeypatch.setattr(loop_mod, "match_3d3d", fake_match_3d3d)
+    monkeypatch.setattr(loop_mod, "sim3_from_matches", fake_sim3_from_matches)
+    monkeypatch.setattr(loop_mod, "optimize_pose_graph", fake_optimize_pose_graph)
+
+    kf = BackendKeyframe(
+        kf_id=7,
+        ts=20.0,
+        rgb=np.zeros((2, 2, 3), np.uint8),
+        T_wc_live=np.eye(4),
+        raw_depth=np.ones((2, 2), np.float32),
+        dyn_mask=None,
+        K=np.eye(3),
+        emb=np.array([1.0], dtype=np.float32),
+    )
+
+    corrections, log, corr_newest = worker._close_loops([kf])
+
+    assert corrections is not None
+    assert corr_newest[2][0] == pytest.approx(_Worker._MAX_STEP_T * 3.0)
+    assert "snap" in log
+
+
+def test_worker_has_pending_loop_residual_checks_persisted_edges_only():
+    from types import SimpleNamespace
+
+    from spacerec.backend import _Worker
+
+    worker = _Worker.__new__(_Worker)
+    worker.detector = object()
+    worker.loop_cfg = SimpleNamespace(persist_edges=True)
+    Z_loop = (1.0, np.eye(3), np.zeros(3))
+    worker._loop_edges = {(0, 7): (Z_loop, 1.0)}
+    worker.kf_global_poses = {
+        k: _se3(np.eye(3), np.array([0.1 * k, 0.0, 0.0]))
+        for k in range(8)
+    }
+
+    assert worker._has_pending_loop_residual() is True
+
+    worker.kf_global_poses[7] = _se3(np.eye(3), np.zeros(3))
+    assert worker._has_pending_loop_residual() is False
+
+    worker.kf_global_poses[7] = _se3(np.eye(3), np.array([0.7, 0.0, 0.0]))
+    worker.loop_cfg = SimpleNamespace(persist_edges=False)
+    assert worker._has_pending_loop_residual() is False
+
+    worker.loop_cfg = SimpleNamespace(persist_edges=True)
+    worker.detector = None
+    assert worker._has_pending_loop_residual() is False
+
+
 def test_pose_graph_noop_without_loop_edges():
     poses = [_se3(np.eye(3), np.array([0.1 * k, 0, 0])) for k in range(5)]
     corrected = optimize_pose_graph(poses, sequential_edges(poses))

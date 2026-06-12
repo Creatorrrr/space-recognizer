@@ -83,6 +83,7 @@ def test_backend_result_kf_ts_defaults_to_none():
     )
 
     assert res.kf_ts is None
+    assert res.loop_converging is False
 
 
 def test_robust_sim3_clamps_degenerate_scale():
