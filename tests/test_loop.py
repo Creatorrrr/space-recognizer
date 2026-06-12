@@ -193,10 +193,12 @@ def test_worker_replays_persisted_loop_edge_without_new_acceptance():
     assert 0 in corrections
     assert np.linalg.norm(corr_newest[2]) > 0
     assert "persist r=" in log
-    assert worker._loop_edges[(0, 7)][1] == pytest.approx(0.9)
     after = edge_residual(worker.kf_global_poses[0],
                           worker.kf_global_poses[7], Z_loop)
     assert after < before
+    # 감쇠는 수렴(잔차 <= 0.05) 후에만 — 보정 진행 중에는 weight 유지
+    expected_w = 0.9 if after <= 0.05 else 1.0
+    assert worker._loop_edges[(0, 7)][1] == pytest.approx(expected_w)
 
 
 def test_worker_snap_step_limit_is_three_times_normal_limit():
@@ -329,9 +331,10 @@ def test_worker_attitude_correction_clamps_rotation_and_keeps_anchor():
     points = _global_floor_points(normal, seed=8)
     anchor = np.array([0.4, 1.2, -0.3])
 
-    C = worker._attitude_correction(points, anchor)
+    C, dy = worker._attitude_correction(points, anchor)
 
     assert C is not None
+    assert dy == 0.0  # 첫 측정은 높이 기준만 설정
     assert C[0] == pytest.approx(1.0)
     np.testing.assert_allclose(sim3_apply(C, anchor[None])[0], anchor, atol=1e-9)
     assert Rotation.from_matrix(C[1]).magnitude() == pytest.approx(_ATT_STEP_RAD)
@@ -348,7 +351,24 @@ def test_worker_attitude_correction_ignores_deadband_tilt():
     normal = np.array([0.0, -np.cos(tilt), -np.sin(tilt)])
     points = _global_floor_points(normal, seed=9)
 
-    assert worker._attitude_correction(points, np.zeros(3)) is None
+    C, dy = worker._attitude_correction(points, np.zeros(3))
+    assert C is None and dy == 0.0
+
+
+def test_worker_height_servo_clamps_floor_offset():
+    from spacerec.backend import _ATT_STEP_Y, _Worker
+
+    worker = _Worker.__new__(_Worker)
+    flat = np.array([0.0, -1.0, 0.0])
+    # 첫 윈도: 바닥 y=1.0이 기준이 된다
+    pts_ref = _global_floor_points(flat, d=-1.0, seed=10)
+    C, dy = worker._attitude_correction(pts_ref, np.zeros(3))
+    assert dy == 0.0
+    # 다음 윈도: 바닥이 0.3 낮게(y=1.3) 들어옴 → dy는 +0.15로 클램프
+    pts_low = _global_floor_points(flat, d=-1.3, seed=11)
+    C, dy = worker._attitude_correction(pts_low, np.zeros(3))
+    assert dy == pytest.approx(_ATT_STEP_Y)
+    assert C is None  # 평평하므로 회전 보정은 없음
 
 
 def test_pose_graph_noop_without_loop_edges():

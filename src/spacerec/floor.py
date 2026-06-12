@@ -58,11 +58,22 @@ def estimate_floor_from_points(points: np.ndarray, *,
     if not np.isfinite(max_tilt_deg) or max_tilt_deg <= 0.0:
         return None
 
+    # 바닥 후보는 높이 하위 구간만 — 사무실 점군은 책상/벽/모니터가
+    # 대부분이라 전체에서 바닥 비중이 수 %에 불과해 RANSAC이 못 찾는다
+    # (office-loop 실측: 전체 inlier 3.4% → 하위 45%에서 22%). RDF는
+    # Y가 아래이므로 y가 큰 쪽이 낮은 점이다.
+    pts = pts[pts[:, 1] >= np.percentile(pts[:, 1], 55)]
+    if len(pts) < 500:
+        return None
+
     centroid = pts.mean(axis=0)
     spread = float(np.median(np.linalg.norm(pts - centroid, axis=1)))
     if not np.isfinite(spread) or spread <= 1e-9:
         spread = float(np.median(np.linalg.norm(pts, axis=1)))
-    threshold = 0.02 * spread
+    # 융합 점군의 바닥 표면 노이즈는 voxel·mono depth 오차가 합쳐져
+    # 단일 프레임 depth보다 훨씬 크다 — 0.02×spread(≈0.009)는 바닥점을
+    # 인라이어로 못 잡는다 (실측). 0.08×spread + 절대 바닥값 0.03 사용.
+    threshold = max(0.08 * spread, 0.03)
     if not np.isfinite(threshold) or threshold <= 0.0:
         return None
 
@@ -71,7 +82,7 @@ def estimate_floor_from_points(points: np.ndarray, *,
     if result is None:
         return None
     normal, d, inlier_frac = result
-    if inlier_frac < 0.2:
+    if inlier_frac < 0.15:
         return None
     return normal, d, inlier_frac
 

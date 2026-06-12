@@ -31,8 +31,22 @@ from .geometry import (SIM3_IDENTITY, Sim3, sim3_apply, sim3_compose,
                        sim3_interp, sim3_inverse, sim3_on_pose, umeyama_sim3)
 
 
-_ATT_STEP_RAD = float(np.radians(2.0))
+_ATT_STEP_RAD = float(np.radians(3.0))
 _ATT_DEADBAND_RAD = float(np.radians(1.0))
+# 측정 신뢰 게이트 — 서보가 매 윈도 잔차를 잡고 있다면 윈도당 실제 기울기는
+# 수 도 이내여야 한다. 갑자기 20°대 측정이 나오면 책상면/윈도 오정합을
+# 바닥으로 오인한 것 (office-loop 실측: θ=1.2° 직후 21.5°) — 불신 기각.
+_ATT_MAX_MEAS_RAD = float(np.radians(12.0))
+_ATT_MIN_INLIER_FRAC = 0.2
+# 바닥 높이 서보 — Y 침하의 주성분은 회전이 아니라 mono depth 바닥 편향이
+# VO 병진에 주입되어 "평평한 바닥이 윈도마다 조금씩 낮아지는" 계단식 drift
+# (office-loop 실측: 윈도 기울기 1~7°인데 Y가 +1.8까지 단조 침하). 첫
+# 윈도의 바닥 평면 높이를 기준으로 전역 Y를 되돌린다.
+_ATT_STEP_Y = 0.2            # 윈도당 높이 보정 상한 (live 단위)
+_ATT_DEADBAND_Y = 0.02       # 이 이하 높이 차는 무시
+_ATT_MAX_Y_MEAS = 0.45       # 기준 바닥에서 이보다 먼 평면은 바닥이 아니라
+                             # 책상면 등으로 보고 높이 측정을 기각 (책상
+                             # ≈0.3 live 단위 위 — 역방향 들썩임 방지)
 
 
 @dataclass
@@ -371,18 +385,45 @@ class _Worker:
 
         # ---- 루프 클로저: 재방문 감지 → pose graph → epoch별 지도 보정 ----
         corrections, loop_log, corr_newest = self._close_loops(new_kfs)
-        if corrections is None and getattr(self.cfg, "attitude_servo", False):
+        # ---- 자세 서보: 루프 보정과 *합성*해 매 윈도 실행한다. "루프가 없을
+        # 때만"으로 게이트하면 persist 재실행이 매 윈도 발화하는 구간에서
+        # 서보가 영구히 굶는다 (office-loop 실측: 0회 발화, 기울기 drift가
+        # y +1.7까지 누적) ----
+        if getattr(self.cfg, "attitude_servo", False):
             anchor_pose = self.kf_global_poses.get(newest.kf_id)
             if anchor_pose is not None:
-                C = self._attitude_correction(points, anchor_pose[:3, 3])
-                if C is not None:
-                    corrections = {e: C for e in self._epoch_kfs}
+                C_rot, dy = self._attitude_correction(points,
+                                                      anchor_pose[:3, 3])
+                if C_rot is not None:
+                    # 기울기는 세계 전체의 회전 — 전 epoch에 합성
+                    if corrections is None:
+                        corrections = {e: C_rot for e in self._epoch_kfs}
+                        corr_newest = C_rot
+                    else:
+                        corrections = {e: sim3_compose(C_rot, T)
+                                       for e, T in corrections.items()}
+                        corr_newest = sim3_compose(C_rot, corr_newest)
                     for k, pose in list(self.kf_global_poses.items()):
-                        self.kf_global_poses[k] = sim3_on_pose(C, pose)
-                    corr_newest = C
-                    loop_log = (
-                        f"attitude theta={self._last_attitude_deg:.1f}deg "
-                        f"inl={self._last_attitude_inlier_frac:.2f}")
+                        self.kf_global_poses[k] = sim3_on_pose(C_rot, pose)
+                if dy != 0.0:
+                    # 높이는 이번 윈도만 기준 바닥으로 정렬 — 과거 epoch은
+                    # 들어올 때 이미 정렬됐으므로 계단이 누적되지 않는다
+                    C_h: Sim3 = (1.0, np.eye(3), np.array([0.0, -dy, 0.0]))
+                    if corrections is None:
+                        corrections = {self._epoch: C_h}
+                        corr_newest = C_h
+                    else:
+                        corrections[self._epoch] = sim3_compose(
+                            C_h, corrections.get(self._epoch, SIM3_IDENTITY))
+                        corr_newest = sim3_compose(C_h, corr_newest)
+                    for kf in new_kfs:
+                        self.kf_global_poses[kf.kf_id] = sim3_on_pose(
+                            C_h, self.kf_global_poses[kf.kf_id])
+                if C_rot is not None or dy != 0.0:
+                    att = (f"자세 서보 θ={self._last_attitude_deg:.1f}° "
+                           f"dy={dy:+.2f} "
+                           f"inl={self._last_attitude_inlier_frac:.2f}")
+                    loop_log = f"{loop_log} | {att}" if loop_log else att
         if corrections is not None:
             # live→global 갱신은 재피팅이 아니라 *합성*으로: pose graph가
             # 최신 노드를 얼마나 움직였는지(corr_newest)가 곧 현재 시점의
@@ -410,38 +451,61 @@ class _Worker:
 
     def _attitude_correction(self, points: np.ndarray,
                              anchor: np.ndarray) -> Sim3 | None:
-        """Return a small rotation correction that moves the floor normal to -Y."""
+        """바닥 평면 기준 (회전 보정 Sim3 | None, 높이 오프셋 dy)를 측정한다.
+
+        회전(기울기)은 세계 전체가 기울어진 것이라 전 epoch에 적용해야 하고,
+        높이(dy)는 "이번 윈도가 기준 바닥보다 얼마나 낮게 들어왔나"라서
+        이번 epoch에만 적용해야 한다 (과거 epoch은 들어올 때 이미 보정됨 —
+        전체 이동은 계단을 못 펴고 기준 바닥까지 움직인다).
+        """
         self._last_attitude_deg = 0.0
         self._last_attitude_inlier_frac = 0.0
+        anchor = np.asarray(anchor, dtype=np.float64)
+        if anchor.shape != (3,) or not np.isfinite(anchor).all():
+            return None, 0.0
         result = floor_mod.estimate_floor_from_points(points)
         if result is None:
-            return None
+            return None, 0.0
 
-        normal, _, inlier_frac = result
+        normal, d, inlier_frac = result
         target = np.array([0.0, -1.0, 0.0], dtype=np.float64)
         normal = np.asarray(normal, dtype=np.float64)
         normal_norm = np.linalg.norm(normal)
         if normal_norm < 1e-12:
-            return None
+            return None, 0.0
         normal = normal / normal_norm
 
         dot = float(np.clip(normal @ target, -1.0, 1.0))
         angle = float(np.arccos(dot))
         self._last_attitude_deg = float(np.degrees(angle))
         self._last_attitude_inlier_frac = float(inlier_frac)
-        if angle <= _ATT_DEADBAND_RAD:
-            return None
+        # 측정 신뢰 게이트: 비정상적으로 큰 기울기/낮은 합의율은 오인 측정
+        if angle > _ATT_MAX_MEAS_RAD or inlier_frac < _ATT_MIN_INLIER_FRAC:
+            return None, 0.0
 
-        axis = np.cross(normal, target)
-        axis_norm = np.linalg.norm(axis)
-        if axis_norm < 1e-12:
-            return None
-        R_c = floor_mod._axis_angle(axis / axis_norm,
-                                    min(angle, _ATT_STEP_RAD))
-        anchor = np.asarray(anchor, dtype=np.float64)
-        if anchor.shape != (3,) or not np.isfinite(anchor).all():
-            return None
-        return 1.0, R_c, anchor - R_c @ anchor
+        # ---- 높이: 바닥 y(≈ -d)를 최초 기준에 묶는다 ----
+        floor_y = -float(d)
+        ref = getattr(self, "_floor_y_ref", None)
+        if ref is None:
+            self._floor_y_ref = floor_y
+            dy = 0.0
+        elif abs(floor_y - ref) > _ATT_MAX_Y_MEAS:
+            dy = 0.0  # 기준에서 너무 먼 평면 — 바닥 아님 (책상면 등)
+        else:
+            dy = float(np.clip(floor_y - ref, -_ATT_STEP_Y, _ATT_STEP_Y))
+        if abs(dy) < _ATT_DEADBAND_Y:
+            dy = 0.0
+
+        # ---- 기울기 ----
+        C_rot: Sim3 | None = None
+        if angle > _ATT_DEADBAND_RAD:
+            axis = np.cross(normal, target)
+            axis_norm = np.linalg.norm(axis)
+            if axis_norm > 1e-12:
+                R_c = floor_mod._axis_angle(axis / axis_norm,
+                                            min(angle, _ATT_STEP_RAD))
+                C_rot = (1.0, R_c, anchor - R_c @ anchor)
+        return C_rot, dy
 
     # ------------------------------------------------------------------
     # 루프 클로저 (docs/upgrade-plan.md Tier 4)
@@ -630,7 +694,18 @@ class _Worker:
                                                    self.kf_global_poses[k])
 
         if persist_edges and used_loop_keys:
-            self._decay_loop_edges(used_loop_keys)
+            # 감쇠는 *수렴한* 엣지에만 — 보정이 진행 중인 엣지를 약화시키면
+            # 순차 엣지 강성에 밀려 잔차 ~0.5에서 정체한다 (office-loop 실측:
+            # persist r 0.488→0.483로 18윈도 정체)
+            converged = [
+                key for key in used_loop_keys
+                if key in self._loop_edges
+                and edge_residual(self.kf_global_poses[key[0]],
+                                  self.kf_global_poses[key[1]],
+                                  self._loop_edges[key][0])
+                <= self._RESIDUAL_THRESH
+            ]
+            self._decay_loop_edges(converged)
 
         # epoch별 지도 보정: 각 윈도의 최신 kf에 대응하는 노드 보정 사용
         corrections: dict[int, Sim3] = {}
