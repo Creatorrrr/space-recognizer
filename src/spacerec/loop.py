@@ -90,6 +90,10 @@ def sim3_from_matches(pts_a: np.ndarray, pts_b: np.ndarray,
         diag.update(n=n, med_scale=float("nan"), best_inl=0)
     if n < max(4, min_inliers):
         return None
+    # 인라이어 임계값은 depth 비례 — mono depth의 3D 오차는 z에 비례해
+    # 커지므로 고정 임계값은 원거리 매칭을 부당하게 떨어뜨린다 (desk/office
+    # 실측: 인라이어가 문턱 직전 탈락). 근거리는 inlier_dist 바닥 유지.
+    thr = inlier_dist * np.maximum(1.0, np.abs(pts_a[:, 2]))
     rng = np.random.default_rng(rng_seed)
     best_mask = None
     scales = []
@@ -103,7 +107,7 @@ def sim3_from_matches(pts_a: np.ndarray, pts_b: np.ndarray,
         if not (0.2 < T[0] < 5.0):   # 비상식적 스케일은 기각
             continue
         d = np.linalg.norm(pts_a - (T[0] * pts_b @ T[1].T + T[2]), axis=1)
-        mask = d < inlier_dist
+        mask = d < thr
         if best_mask is None or mask.sum() > best_mask.sum():
             best_mask = mask
     if diag is not None and scales:
@@ -113,7 +117,7 @@ def sim3_from_matches(pts_a: np.ndarray, pts_b: np.ndarray,
         return None
     T = umeyama_sim3(pts_b[best_mask], pts_a[best_mask])
     d = np.linalg.norm(pts_a - (T[0] * pts_b @ T[1].T + T[2]), axis=1)
-    mask = d < inlier_dist
+    mask = d < thr
     if mask.sum() < min_inliers or not (0.2 < T[0] < 5.0):
         return None
     return T, mask
@@ -121,7 +125,7 @@ def sim3_from_matches(pts_a: np.ndarray, pts_b: np.ndarray,
 
 def match_3d3d(rgb_a: np.ndarray, depth_a: np.ndarray, K_a: np.ndarray,
                rgb_b: np.ndarray, depth_b: np.ndarray, K_b: np.ndarray,
-               max_features: int = 1200, ratio: float = 0.75
+               max_features: int = 2500, ratio: float = 0.75
                ) -> tuple[np.ndarray, np.ndarray]:
     """ORB 매칭 → 각 프레임의 depth로 카메라 좌표 3D 대응점 추출."""
     global _ORB

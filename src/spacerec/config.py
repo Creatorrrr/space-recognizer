@@ -58,6 +58,11 @@ class BackendCfg:
     # 출력 depth가 처음부터 라이브 pose 스케일로 정합되어 윈도 간 일관성이
     # 좋아진다. 베이스라인이 퇴화한 윈도는 자동으로 무조건화 폴백.
     pose_conditioned: bool = False
+    # metric 앵커를 표시용 환산을 넘어 라이브 스케일 안정장치로 사용:
+    # mpu(미터/단위)가 최초 기준에서 벗어나면 calib에 저주기·소이득으로
+    # 곱해 복귀시킨다. mono depth 정규화 drift로 1~2분에 걸쳐 live 스케일이
+    # 수 배 붕괴하던 문제의 근본 대응 (metric_anchor 필요).
+    scale_servo: bool = False
 
 
 @dataclass
@@ -71,8 +76,10 @@ class LoopCfg:
     enabled: bool = False
     sim_thresh: float = 0.62    # 임베딩 cos 유사도 후보 임계값
     min_gap_s: float = 10.0     # 이보다 가까운 시점끼리는 루프로 안 봄
-    min_inliers: int = 25       # 3D-3D RANSAC inlier 하한 (기각 게이트)
-    inlier_dist: float = 0.05   # inlier 거리 임계값 (장면 단위, ≈12cm@2.5m/unit)
+    min_inliers: int = 15       # 3D-3D RANSAC inlier 하한 (기각 게이트)
+    min_inlier_frac: float = 0.45  # 매칭 대비 inlier 합의율 하한 — 인라이어
+                                   # 수를 낮춘 만큼 합의율로 오탐을 막는다
+    inlier_dist: float = 0.05   # inlier 거리 바닥값 (depth 비례 확대됨)
     max_kf_store: int = 600     # 루프 탐색용 키프레임 저장 상한
 
 

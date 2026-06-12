@@ -48,6 +48,15 @@ def _drain_backend_results(backend: ReconstructionBackend, worldmap: GlobalMap,
         worldmap.set_correction_target(res.T_global_live)
         if res.calib.inlier_frac > 0.3:
             calib = res.calib
+            if res.servo_gain_g != 1.0:
+                # 스케일 서보: calib·VO 상태·T_global_live에 g를 일관 적용.
+                # calib만 키우면 frame_scale 피드백이 키프레임 3D(옛 스케일)
+                # 기준으로 1/g를 곱해 보정을 상쇄한다 (실측).
+                g = res.servo_gain_g
+                vo.rescale(g)
+                worldmap.rescale_live(g)
+                calib = DepthCalibration(a=calib.a * g, b=calib.b * g,
+                                         inlier_frac=calib.inlier_frac)
         if res.meters_per_unit is not None:
             # mpu는 live 스케일 기준 추정치 — 전역 좌표 거리에 쓰려면 현재
             # live→global 스케일로 환산해야 한다 (루프 클로저 후 s≠1 가능).

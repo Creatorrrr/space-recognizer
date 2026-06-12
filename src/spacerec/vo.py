@@ -76,6 +76,20 @@ class VisualOdometry:
     def set_intrinsics(self, K: np.ndarray) -> None:
         self.K = K.copy()
 
+    def rescale(self, g: float) -> None:
+        """live 좌표계 전체의 길이 단위를 g배로 — 스케일 서보용.
+
+        키프레임 3D 특징점·pose 병진·키프레임 depth를 함께 키워야 새 depth
+        스케일(calib×g)과 일관되고, frame_scale 피드백이 보정을 상쇄하지
+        않는다. 호출자는 T_global_live 쪽도 1/g로 보정해야 한다.
+        """
+        self.T_wc[:3, 3] *= g
+        if self._pts3d is not None:
+            self._pts3d *= g
+        if self.keyframe is not None:
+            self.keyframe.depth = self.keyframe.depth * g
+            self.keyframe.T_wc[:3, 3] *= g
+
     def process(self, gray: np.ndarray, depth: np.ndarray, ts: float,
                 exclude_mask: np.ndarray | None) -> PoseResult:
         if self.keyframe is None:

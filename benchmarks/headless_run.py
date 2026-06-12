@@ -49,6 +49,8 @@ def main() -> None:
     wm = GlobalMap(cfg.backend)
     be = ReconstructionBackend(cfg.backend, cfg.depth.backend_model_resolved,
                                dep.device, cfg.depth.backend_process_res_resolved,
+                               metric_model=(cfg.depth.metric_model
+                                             if cfg.backend.metric_anchor else None),
                                loop_cfg=cfg.loop if embedder else None)
     be.start()
     be.wait_ready()
@@ -83,12 +85,20 @@ def main() -> None:
             wm.set_correction_target(res.T_global_live)
             if res.calib.inlier_frac > 0.3:
                 calib = res.calib
+                if res.servo_gain_g != 1.0:  # main.py와 동일한 서보 적용
+                    g = res.servo_gain_g
+                    vo.rescale(g)
+                    wm.rescale_live(g)
+                    calib = DepthCalibration(a=calib.a * g, b=calib.b * g,
+                                             inlier_frac=calib.inlier_frac)
                 frame_scale = 1.0  # main.py와 동일: 이중 적용 방지
             # K는 첫 프레임에서 고정 — 도중에 바꾸면 지도 스케일이 갈라진다
             pc = (f" pose-cond α={res.win_alpha:.3f} β={res.win_beta:.3f}"
                   if res.pose_conditioned else "")
+            mpu = (f" 1unit={res.meters_per_unit:.2f}m"
+                   if res.meters_per_unit else "")
             print(f"[res] map={len(wm.points)} scale={res.T_global_live[0]:.3f} "
-                  f"a={calib.a:.3f} fx={vo.K[0, 0]:.0f}{pc}")
+                  f"a={calib.a:.3f} fx={vo.K[0, 0]:.0f}{mpu}{pc}")
 
     for i, frame in enumerate(src.frames()):
         if i % args.stride:
@@ -139,9 +149,10 @@ def main() -> None:
         drain()
         wm.step_correction()
         time.sleep(0.3)
-    be.stop()
+    # 결과 저장을 stop()보다 먼저 — 종료 경로에 문제가 생겨도 지도는 남긴다
     np.savez(args.out, pts=wm.points, cols=wm.colors, traj=np.array(traj))
     print("saved:", args.out, len(wm.points), "pts,", len(traj), "poses")
+    be.stop()
 
 
 if __name__ == "__main__":

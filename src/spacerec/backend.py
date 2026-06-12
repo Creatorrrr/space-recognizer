@@ -27,7 +27,7 @@ import numpy as np
 from .calib import DepthCalibration, fit_affine_depth
 from .config import BackendCfg
 from .geometry import (SIM3_IDENTITY, Sim3, sim3_apply, sim3_compose,
-                       sim3_inverse, sim3_on_pose, umeyama_sim3)
+                       sim3_interp, sim3_inverse, sim3_on_pose, umeyama_sim3)
 
 
 @dataclass
@@ -61,6 +61,9 @@ class BackendResult:
     win_alpha: float = 1.0          # 멀티뷰→라이브 스케일 정합 계수 (모니터링용:
     win_beta: float = 0.0           #  pose 조건화 시 항등에 수렴해야 정상)
     epoch: int = 0                  # 이번 윈도의 지도 epoch (voxel 출처 추적)
+    # 스케일 서보 이득 — main이 calib·VO 상태·T_global_live에 일관 적용해야
+    # 한다 (calib만 키우면 frame_scale 피드백이 1/g로 즉시 상쇄함, 실측)
+    servo_gain_g: float = 1.0
     # 루프 클로저가 수락된 경우: epoch별 지도 보정 Sim3 + 로그 문자열
     loop_corrections: dict[int, Sim3] | None = None
     loop_log: str = ""
@@ -91,6 +94,20 @@ def robust_sim3(src_poses: list[np.ndarray], dst_poses: list[np.ndarray]) -> Sim
     R = dst_poses[-1][:3, :3] @ src_poses[-1][:3, :3].T
     t = dst_c[-1] - s * R @ src_c[-1]
     return s, R, t
+
+
+def servo_gain(mpu: float, mpu_ref: float, k: float = 0.25,
+               step: float = 0.05) -> float:
+    """스케일 서보 이득: 이번 윈도에서 calib(a,b)에 곱할 보정 계수.
+
+    mpu가 기준보다 크다 = 라이브 단위가 미터로 더 비싸졌다 = 라이브 스케일이
+    수축했다 → g>1로 depth를 키워 복귀. 윈도당 ±step 비율로 클램프해 VO의
+    keyframe 체인이 점진 흡수할 수 있게 한다 (급격한 스케일 변화는 기존
+    지도/객체와 불연속을 만든다).
+    """
+    if mpu_ref <= 0 or mpu <= 0:
+        return 1.0
+    return float(np.clip((mpu / mpu_ref) ** k, 1.0 - step, 1.0 + step))
 
 
 def build_pose_inputs(window: list[BackendKeyframe],
@@ -147,6 +164,7 @@ class _Worker:
             self.metric_model = (DepthAnything3.from_pretrained(metric_model)
                                  .to(device).eval())
         self._meters_per_unit: float | None = None
+        self._mpu_ref: float | None = None   # 스케일 서보 기준 (최초 유효 mpu)
         self.kf_global_poses: dict[int, np.ndarray] = {}
         self._pending: list[BackendKeyframe] = []
         self._reconstructed: list[BackendKeyframe] = []
@@ -310,6 +328,7 @@ class _Worker:
 
         # ---- (선택) metric 앵커: 라이브 스케일 1단위 = 몇 미터인지 추정 ----
         # 지도/pose의 스케일은 건드리지 않고 표시용 환산 계수만 갱신한다.
+        servo_g = 1.0
         if self.metric_model is not None:
             metric = self.metric_model.inference(
                 [newest.rgb], process_res=self.process_res).depth[0]
@@ -319,6 +338,21 @@ class _Worker:
                 mpu = float(np.median(metric[valid] / d_live[valid]))
                 self._meters_per_unit = (mpu if self._meters_per_unit is None
                                          else 0.7 * self._meters_per_unit + 0.3 * mpu)
+                # ---- 스케일 서보: 라이브 스케일의 장기 drift를 metric 앵커로
+                # 묶는다 (calib a가 1~2분에 걸쳐 0.8→0.1로 붕괴하던 문제).
+                # 여기서는 이득 g만 계산해 결과로 보낸다 — 적용은 main이
+                # calib·VO 상태·T_global_live에 일관되게 수행 (분리 적용 시
+                # frame_scale 피드백이 상쇄함).
+                if self.cfg.scale_servo and calib.inlier_frac > 0.3:
+                    if self._mpu_ref is None:
+                        self._mpu_ref = self._meters_per_unit
+                    else:
+                        g = servo_gain(self._meters_per_unit, self._mpu_ref)
+                        if abs(g - 1.0) > 1e-3:
+                            servo_g = g
+                            # 라이브 depth가 g배 되면 다음 측정 mpu는 1/g배 —
+                            # EMA 추정치도 같이 당겨 서보 지연을 줄인다
+                            self._meters_per_unit /= g
 
         self._reconstructed.extend(new_kfs)
         # 윈도 중첩에 쓰일 최근 키프레임만 이미지를 유지 (메모리 해제)
@@ -346,12 +380,18 @@ class _Worker:
             window_ids=ids, runtime_s=time.monotonic() - t0,
             pose_conditioned=pose_inputs is not None,
             win_alpha=alpha, win_beta=beta,
-            epoch=epoch, loop_corrections=corrections, loop_log=loop_log)
+            epoch=epoch, loop_corrections=corrections, loop_log=loop_log,
+            servo_gain_g=servo_g)
 
     # ------------------------------------------------------------------
     # 루프 클로저 (docs/upgrade-plan.md Tier 4)
     # ------------------------------------------------------------------
     _MAX_GRAPH_NODES = 400
+    # 윈도당 보정 상한 — 초과분은 부분 적용(λ<1)하고 다음 윈도의 루프
+    # 재검출로 반복 수렴시킨다. drift가 극단으로 누적된 뒤 한 번에 당기면
+    # (실측 |t|=4.7, scale 3.1) 지도·객체가 출렁이고 병합이 과격해진다.
+    _MAX_STEP_T = 0.5            # 병진 (live 단위)
+    _MAX_STEP_LOGS = 0.405       # 스케일 (=log 1.5)
 
     def _close_loops(self, new_kfs: list[BackendKeyframe]
                      ) -> tuple[dict[int, Sim3] | None, str, Sim3]:
@@ -385,7 +425,8 @@ class _Worker:
                 dg: dict = {}
                 res = sim3_from_matches(pts_a, pts_b, lcfg.inlier_dist,
                                         min_inliers=lcfg.min_inliers, diag=dg)
-                if res is not None:
+                if res is not None and (res[1].mean()
+                                        >= lcfg.min_inlier_frac):
                     T_ab, mask = res
                     accepted.append((old_id, kf.kf_id, T_ab,
                                      int(mask.sum()), sim))
@@ -427,6 +468,16 @@ class _Worker:
             node_corr.append(sim3_compose(
                 corrected[idx[k]],
                 sim3_inverse((1.0, old[:3, :3], old[:3, 3]))))
+
+        # ---- 대형 보정은 부분 적용 (점진 수렴) ----
+        mag_t = max(np.linalg.norm(c[2]) for c in node_corr)
+        mag_s = max(abs(np.log(max(c[0], 1e-12))) for c in node_corr)
+        lam = min(1.0, self._MAX_STEP_T / max(mag_t, 1e-9),
+                  self._MAX_STEP_LOGS / max(mag_s, 1e-9))
+        partial = ""
+        if lam < 1.0:
+            node_corr = [sim3_interp(SIM3_IDENTITY, C, lam) for C in node_corr]
+            partial = f" | 부분 적용 λ={lam:.2f}"
         node_arr = np.array(node_ids)
         for k in all_ids:
             j = int(np.argmin(np.abs(node_arr - k)))
@@ -443,7 +494,8 @@ class _Worker:
         log = "; ".join(f"kf{o}↔kf{nn} inl={i} sim={s_:.2f}"
                         for o, nn, _, i, s_ in accepted)
         j_newest = int(np.argmin(np.abs(node_arr - new_kfs[-1].kf_id)))
-        return corrections, f"{log} | max|t|={mag:.3f}", node_corr[j_newest]
+        return (corrections, f"{log} | max|t|={mag:.3f}{partial}",
+                node_corr[j_newest])
 
 
 def _worker_main(cfg: BackendCfg, model_name: str, device: str,
@@ -493,15 +545,13 @@ class ReconstructionBackend:
 
 
 def _drain_and_close(*queues: mp.Queue) -> None:
-    """종료 행 방지: 큐에 남은 대형 항목(키프레임/결과 배열)이 feeder
-    스레드의 pipe 쓰기를 막으면 인터프리터 exit가 영원히 멈춘다 — 좀비
-    프로세스가 CUDA 컨텍스트(VRAM)를 계속 쥐는 사고로 실측됨. 남은 항목을
-    버리고 feeder join을 포기시킨다."""
+    """종료 행 방지: feeder 스레드 join을 포기시키고 큐를 닫는다.
+
+    큐에 남은 대형 항목이 exit 시 feeder join을 영원히 막아 좀비 프로세스가
+    CUDA 컨텍스트(VRAM)를 계속 쥐는 사고가 실측됨. 주의 — 잔여 항목을
+    get_nowait()로 비우려 하면 안 된다: Windows에서 죽은 자식이 쓰다 만
+    찢어진 메시지가 파이프에 있으면 poll()은 True인데 _recv_bytes()가
+    영원히 블록한다 (py-spy 스택으로 실측, 또 다른 행 경로)."""
     for q in queues:
-        try:
-            while True:
-                q.get_nowait()
-        except Exception:
-            pass
         q.cancel_join_thread()
         q.close()

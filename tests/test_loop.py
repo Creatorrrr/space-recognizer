@@ -128,6 +128,64 @@ def test_worldmap_apply_corrections_moves_only_target_epoch():
     assert wm._cnt.sum() == 1000
 
 
+def test_servo_gain_direction_and_clamp():
+    from spacerec.backend import servo_gain
+
+    # 기준과 같으면 보정 없음
+    assert servo_gain(2.0, 2.0) == 1.0
+    # mpu 상승(라이브 스케일 수축) → g > 1로 depth 확대
+    g = servo_gain(2.4, 2.0)
+    assert 1.0 < g <= 1.05
+    # mpu 하락 → g < 1
+    g = servo_gain(1.6, 2.0)
+    assert 0.95 <= g < 1.0
+    # 큰 drift도 윈도당 ±5%로 클램프 (점진 흡수)
+    assert servo_gain(6.0, 2.0) == 1.05
+    assert servo_gain(0.5, 2.0) == 0.95
+    # 비정상 입력은 항등
+    assert servo_gain(0.0, 2.0) == 1.0
+    assert servo_gain(2.0, 0.0) == 1.0
+
+
+def test_rescale_live_keeps_global_positions():
+    from spacerec.config import BackendCfg
+    from spacerec.worldmap import GlobalMap
+
+    wm = GlobalMap(BackendCfg())
+    R = Rotation.from_rotvec([0.1, 0.2, 0.3]).as_matrix()
+    wm.set_correction_target((1.4, R, np.array([0.5, -0.2, 1.0])))
+    for _ in range(100):
+        wm.step_correction()
+    p_live = np.array([[0.3, 0.1, 2.0], [1.0, -0.5, 0.7]])
+    before = wm.to_global_points(p_live)
+
+    g = 1.05
+    wm.rescale_live(g)
+    after = wm.to_global_points(p_live * g)  # live 길이가 g배가 된 같은 점
+    np.testing.assert_allclose(after, before, atol=1e-9)
+
+
+def test_vo_rescale_consistency():
+    from spacerec.config import VoCfg
+    from spacerec.vo import VisualOdometry, default_intrinsics
+
+    import cv2
+
+    vo = VisualOdometry(default_intrinsics(128, 96), VoCfg())
+    # 코너가 풍부한 패턴 (블록 노이즈를 NEAREST 확대 → 격자 모서리)
+    small = np.random.default_rng(0).integers(0, 255, (12, 16)).astype(np.uint8)
+    gray = cv2.resize(small, (128, 96), interpolation=cv2.INTER_NEAREST)
+    depth = np.full((96, 128), 2.0, np.float32)
+    vo.process(gray, depth, 0.0, None)  # 키프레임 생성
+    assert vo._pts3d is not None
+    pts_before = vo._pts3d.copy()
+
+    g = 1.05
+    vo.rescale(g)
+    np.testing.assert_allclose(vo._pts3d, pts_before * g, atol=1e-12)
+    np.testing.assert_allclose(vo.keyframe.depth, depth * g, atol=1e-6)
+
+
 def test_loop_detector_gap_and_threshold():
     det = LoopDetector(sim_thresh=0.6, min_gap_s=10.0)
     e1 = np.zeros(8)

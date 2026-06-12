@@ -193,6 +193,17 @@ class GlobalMap:
     def set_correction_target(self, T: Sim3) -> None:
         self._T_gl_target = T
 
+    def rescale_live(self, g: float) -> None:
+        """live 단위가 g배 커졌을 때 전역 좌표가 변하지 않도록 보상.
+
+        p_global = s·R·p_live + t 에서 p_live가 g배가 되므로 s를 1/g배.
+        current/target 모두 즉시 보정 — 서보는 소이득(±5%)이라 보간 불필요.
+        """
+        s, R, t = self._T_gl_current
+        self._T_gl_current = (s / g, R, t)
+        s, R, t = self._T_gl_target
+        self._T_gl_target = (s / g, R, t)
+
     def step_correction(self, alpha: float = 0.2) -> None:
         """Called once per live frame: ease toward the target so object/camera
         positions never teleport when the backend re-anchors the map."""

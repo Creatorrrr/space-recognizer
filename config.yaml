@@ -48,6 +48,8 @@ backend:
   voxel_size: 0.02     # 전역 지도 voxel (장면 스케일 단위)
   max_points: 2000000
   metric_anchor: true   # DA3METRIC-LARGE로 미터 단위 추정 (윈도당 +0.3~1s)
+  scale_servo: true     # metric 앵커로 라이브 스케일 drift를 저주기 보정
+                        # (calib a가 1~2분에 0.8→0.1로 붕괴하던 문제의 근본 대응)
   conf_percentile: 30.0 # 멀티뷰 conf 하위 컷 (모델 변형 교체 시 재튜닝 대상)
   # VO pose를 DA3 입력 조건으로 주는 pose-conditioned 추론. 실측 결과 본
   # 데이터에서 기하를 왜곡해(커버리지 60%→10~25%, docs/benchmarks.md Tier 2)
@@ -61,8 +63,9 @@ loop:
   enabled: true
   sim_thresh: 0.62   # 키프레임 임베딩 cos 유사도 후보 임계값
   min_gap_s: 10      # 이보다 가까운 시점끼리는 루프로 안 봄
-  min_inliers: 25    # ORB+depth 3D-3D RANSAC inlier 하한 (오탐 기각)
-  inlier_dist: 0.05  # inlier 거리 임계값 (장면 단위)
+  min_inliers: 15    # ORB+depth 3D-3D RANSAC inlier 하한
+  min_inlier_frac: 0.45  # 매칭 대비 인라이어 합의율 하한 (오탐 방벽)
+  inlier_dist: 0.05  # inlier 거리 바닥값 (depth 비례 확대)
   max_kf_store: 600  # 루프 탐색용 키프레임 저장 상한 (~170MB RAM)
 
 # Gaussian Splatting 품질 레이어 (CUDA 전용 — docs/upgrade-plan.md Tier 3).
