@@ -53,6 +53,7 @@ def _drain_backend_results(backend: ReconstructionBackend, worldmap: GlobalMap,
         if res.loop_corrections:
             # 루프 클로저: 과거 epoch들의 voxel을 보정된 pose에 맞춰 이동
             worldmap.apply_corrections(res.loop_corrections)
+            viz.log_trajectory_correction(res.kf_global_poses, res.kf_ts or {})
             print(f"[loop] 루프 클로저 수락 — {res.loop_log} "
                   f"(지도 {len(res.loop_corrections)} epoch 보정)")
         worldmap.set_correction_target(res.T_global_live)

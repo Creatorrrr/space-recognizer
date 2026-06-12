@@ -83,6 +83,24 @@ class Visualizer:
                 [np.array(self._trajectory, dtype=np.float32)],
                 colors=[[120, 180, 255, 255]], radii=0.004))
 
+    def log_trajectory_correction(self, kf_poses: dict[int, np.ndarray],
+                                  kf_ts: dict[int, float]) -> None:
+        if not kf_poses:
+            return
+        if kf_ts:
+            ordered_ids = sorted(
+                kf_poses,
+                key=lambda kf_id: (kf_ts.get(kf_id, float("inf")), kf_id),
+            )
+        else:
+            ordered_ids = sorted(kf_poses)
+        self._trajectory = [kf_poses[kf_id][:3, 3].copy()
+                            for kf_id in ordered_ids]
+        if len(self._trajectory) >= 2:
+            rr.log("world/trajectory", rr.LineStrips3D(
+                [np.array(self._trajectory, dtype=np.float32)],
+                colors=[[120, 180, 255, 255]], radii=0.004))
+
     def log_live_points(self, points_world: np.ndarray, colors: np.ndarray) -> None:
         """Latest-keyframe preview cloud, already in *global* coordinates.
 

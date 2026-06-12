@@ -50,6 +50,7 @@ class BackendResult:
     T_global_live: Sim3
     calib: DepthCalibration
     kf_global_poses: dict[int, np.ndarray]
+    kf_ts: dict[int, float] | None = None
     intrinsics: np.ndarray | None = None  # DA3 추정 K (process 해상도 기준)
     depth_size: tuple[int, int] = (0, 0)  # (w, h) of the K's reference image
     meters_per_unit: float | None = None  # metric 앵커 환산 계수 (표시용)
@@ -166,6 +167,7 @@ class _Worker:
         self._meters_per_unit: float | None = None
         self._mpu_ref: float | None = None   # 스케일 서보 기준 (최초 유효 mpu)
         self.kf_global_poses: dict[int, np.ndarray] = {}
+        self._kf_ts: dict[int, float] = {}
         self._pending: list[BackendKeyframe] = []
         self._reconstructed: list[BackendKeyframe] = []
         # ---- 루프 클로저 상태 (loop_cfg가 있을 때만) ----
@@ -222,6 +224,8 @@ class _Worker:
         window = old_kfs + new_kfs
         ids = [kf.kf_id for kf in window]
         self._epoch_kfs[self._epoch] = ids
+        for kf in window:
+            self._kf_ts[kf.kf_id] = kf.ts
 
         # ---- pose-conditioned 추론 (옵션): VO pose/K를 입력 조건으로 주면
         # 출력 depth가 입력 pose 스케일로 정합되어 나온다 (패키지가 내부에서
@@ -374,6 +378,7 @@ class _Worker:
         return BackendResult(
             points=points, colors=colors, T_global_live=T_gl, calib=calib,
             kf_global_poses=dict(self.kf_global_poses),
+            kf_ts=dict(self._kf_ts),
             intrinsics=np.median(pred.intrinsics, axis=0),
             depth_size=(dw, dh), meters_per_unit=self._meters_per_unit,
             view_origins=view_origins, point_view_idx=point_view_idx,

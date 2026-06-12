@@ -3,7 +3,9 @@
 import numpy as np
 import pytest
 
-from spacerec.backend import BackendKeyframe, build_pose_inputs
+from spacerec.backend import BackendKeyframe, BackendResult, build_pose_inputs
+from spacerec.calib import DepthCalibration
+from spacerec.geometry import SIM3_IDENTITY
 
 
 def _kf(kf_id: int, pos, K=None, rot=None) -> BackendKeyframe:
@@ -69,6 +71,18 @@ def test_too_few_views_falls_back():
 def test_spread_gate(spread_scale, expected):
     window = [_kf(i, [0.05 * i * spread_scale, 0, 0], K=K) for i in range(6)]
     assert (build_pose_inputs(window) is not None) is expected
+
+
+def test_backend_result_kf_ts_defaults_to_none():
+    res = BackendResult(
+        points=np.empty((0, 3), dtype=np.float32),
+        colors=np.empty((0, 3), dtype=np.uint8),
+        T_global_live=SIM3_IDENTITY,
+        calib=DepthCalibration(),
+        kf_global_poses={},
+    )
+
+    assert res.kf_ts is None
 
 
 def test_robust_sim3_clamps_degenerate_scale():
