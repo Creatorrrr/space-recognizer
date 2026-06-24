@@ -22,10 +22,12 @@ import spacerec  # noqa: F401
 from spacerec.backend import BackendKeyframe, _Worker
 from spacerec.config import Config
 from spacerec.device import configure_torch_runtime, select_torch_device
+from spacerec.directfusion import DirectFusionBackend, DirectFusionKeyframe
 from spacerec.imu import estimate_camera_rotation, should_accept_backend_keyframe
 from spacerec.objects import ObjectRegistry, localize_objects
 from spacerec.replay import RecordedOakSource, _nearest
 from spacerec.vo import VisualOdometry
+from spacerec.worldmap import GlobalMap
 
 
 class MetricTimer:
@@ -149,7 +151,8 @@ def _run_backend_window(
 
 def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
                 backend: bool, imu_enabled: bool | None = None,
-                backend_metric_anchor: bool = False) -> dict:
+                backend_metric_anchor: bool = False,
+                direct_fusion: bool = False) -> dict:
     src = RecordedOakSource(
         path,
         proc_width=cfg.proc_width,
@@ -181,8 +184,23 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
     tracked = []
     classes = Counter()
     keyframes: list[BackendKeyframe] = []
+    direct_keyframes = 0
+    direct_backend = DirectFusionBackend(cfg.fusion, cfg.capture) if direct_fusion else None
+    direct_map = GlobalMap(cfg.backend) if direct_fusion else None
     payload_missing = _payload_missing(src)
     pair_count, pair_median_ms, pair_max_ms = _pairing_stats(src)
+
+    def drain_direct() -> None:
+        if direct_backend is None or direct_map is None:
+            return
+        while True:
+            try:
+                res = direct_backend.results.get_nowait()
+            except Exception:
+                return
+            direct_map.fuse(res.points, res.colors,
+                            origins=res.view_origins, view_idx=res.point_view_idx)
+
     try:
         for frame in src.frames():
             if stats["frames"] >= frames:
@@ -293,6 +311,21 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
                         interpolation=cv2.INTER_NEAREST).astype(bool),
                     calib_ab=(1.0, 0.0),
                 ))
+            if (direct_backend is not None and pose.is_keyframe
+                    and accept_backend_keyframe and frame.depth_m is not None):
+                dyn = _dynamic_mask(detections, gray.shape, set(cfg.detect.dynamic_classes))
+                direct_backend.add_keyframe(DirectFusionKeyframe(
+                    kf_id=direct_keyframes,
+                    ts=frame.ts,
+                    bgr=frame.bgr.copy(),
+                    depth_m=frame.depth_m.copy(),
+                    K=vo.K.copy(),
+                    T_wc=pose.T_wc.copy(),
+                    dyn_mask=None if dyn is None else dyn.copy(),
+                    depth_conf=None if frame.depth_conf is None else frame.depth_conf.copy(),
+                ))
+                direct_keyframes += 1
+                drain_direct()
             if pose.is_keyframe and accept_backend_keyframe:
                 last_backend_keyframe_ts = frame.ts
             stats["lost"] += int(pose.lost)
@@ -308,6 +341,7 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
                 stats["object_observations"] += len(obs)
                 registry.update(obs, frame.ts)
     finally:
+        drain_direct()
         src.release()
     backend_metrics = (_run_backend_window(
         cfg, keyframes, metric_anchor=backend_metric_anchor) if backend else {
@@ -348,6 +382,8 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
         "backend_cuda_memory": backend_metrics["backend_cuda_memory"],
         "timings": _summarize_timings(timings),
         "cuda_memory": _cuda_memory_snapshot(),
+        "direct_keyframes": direct_keyframes,
+        "direct_points": 0 if direct_map is None else len(direct_map.points),
         "top_classes": classes.most_common(6),
     }
 
@@ -363,6 +399,8 @@ def main() -> None:
                     help="run one direct DA3 backend window and report point count")
     ap.add_argument("--backend-metric-anchor", action="store_true",
                     help="include the optional DA3METRIC anchor in the direct backend window")
+    ap.add_argument("--direct-fusion", action="store_true",
+                    help="run OAK metric-depth direct fusion and report map point count")
     ap.add_argument("--imu", action="store_true",
                     help="enable gyro-derived VO rotation priors for this run")
     ap.add_argument("--compare-imu", action="store_true",
@@ -394,7 +432,8 @@ def main() -> None:
         for imu_enabled in modes:
             result = run_session(Path(session), cfg, args.frames, args.full_models,
                                  args.backend, imu_enabled=imu_enabled,
-                                 backend_metric_anchor=args.backend_metric_anchor)
+                                 backend_metric_anchor=args.backend_metric_anchor,
+                                 direct_fusion=args.direct_fusion)
             results.append(result)
             print(
                 "REPLAY_SMOKE "
@@ -420,6 +459,8 @@ def main() -> None:
                 f"backend_keyframes={result['backend_keyframes']} "
                 f"backend_points={result['backend_points']} "
                 f"backend_runtime_s={result['backend_runtime_s']:.2f} "
+                f"direct_keyframes={result['direct_keyframes']} "
+                f"direct_points={result['direct_points']} "
                 f"top_classes={result['top_classes']}"
             )
     if args.metrics_out:

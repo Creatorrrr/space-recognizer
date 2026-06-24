@@ -1,6 +1,7 @@
 # spacerec 기본 설정
 source: sources/sample_720p.mp4  # 파일 경로 또는 웹캠 인덱스(정수)
 realtime: true        # true면 파일도 벽시계 기준으로 프레임 드롭 (웹캠 에뮬레이션)
+runtime_profile: null # null/quality 또는 realtime
 proc_width: 1280      # 처리 해상도 (가로)
 
 compute:
@@ -41,6 +42,7 @@ detect:
   # 고정 클래스로 돌리려면 model을 yolo26s-seg.pt로 바꾸고 vocabulary를 비울 것.
   model: models/yoloe-26s-seg.pt
   conf: 0.35
+  every_n_frames: 1  # realtime profile은 5로 올려 YOLOE tail latency를 줄임
   # 정적 지도에서 항상 제외할 클래스 (움직일 가능성 높음)
   dynamic_classes: [person, cat, dog, bird]
   # 인식할 어휘 (자유롭게 추가/삭제 가능 — 텍스트 임베딩은 시작 시 1회 계산)
@@ -71,6 +73,8 @@ imu:
   keyframe_max_delay_s: 1.0
 
 backend:
+  enabled: true
+  live_apply: true     # false면 backend 결과를 live loop 중 적용하지 않고 종료/idle 때 반영
   period_s: 5.0
   window_size: 12      # 멀티뷰 윈도 키프레임 수
   overlap: 6           # 직전 윈도와 중첩 키프레임 수
@@ -79,6 +83,17 @@ backend:
   metric_anchor: true   # DA3METRIC-LARGE로 미터 단위 추정 (윈도당 +0.3~1s)
   metric_anchor_every_n_windows: 1
   metric_anchor_process_res: null
+
+fusion:
+  mode: auto             # auto: OAK metric depth는 direct, 일반 영상은 backend(DA3)
+  direct_point_subsample: 4
+  direct_mesh_window_size: 6
+  direct_mesh_overlap: 2
+  direct_mesh_downsample: 1
+  direct_edge_filter: true
+  direct_edge_rel_thresh: 0.06
+  direct_mask_dilate_px: 2
+  require_aligned_depth: true
 
 mesh:
   enabled: false
@@ -103,6 +118,8 @@ objects:
   merge_radius: 0.5    # 연관 게이트 상한 (기본은 물체 크기에 비례)
   dynamic_var_thresh: 0.3
   appearance: true     # DINOv2 외형 임베딩으로 재등장 물체를 같은 노드에 복원
+  appearance_keyframes_only: false
+  appearance_every_n_frames: 1
   app_weight: 0.6
   app_gate: 0.4        # cos 유사도가 이보다 낮으면 같은 물체로 보지 않음
   absence_limit: 12    # 시야 안·비가림인데 미검출이 이만큼 누적되면 노드 제거
@@ -114,3 +131,11 @@ graph:
 viz:
   memory_limit: 4GB
   point_subsample: 4   # depth→포인트클라우드 픽셀 서브샘플링
+  frame_every: 1
+  depth_every: 1
+  objects_every: 1
+  trajectory_every: 1
+  trajectory_max_points: 0
+  global_map_every: 1
+  global_map_max_points: 0
+  jpeg_quality: 75

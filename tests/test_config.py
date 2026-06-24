@@ -1,6 +1,6 @@
-from spacerec.config import Config
 import torch
 
+from spacerec.config import Config, apply_runtime_profile
 from spacerec.device import autocast_context, configure_torch_runtime, select_torch_device
 
 
@@ -42,6 +42,11 @@ capture:
   replay_pair_tolerance_ms: 12
 depth:
   oak_fill_missing: false
+detect:
+  every_n_frames: 2
+backend:
+  enabled: false
+  live_apply: false
 mesh:
   enabled: true
   voxel_size: 0.04
@@ -64,6 +69,20 @@ imu:
   max_rotation_deg: 25.0
   keyframe_blur_omega_rad_s: 1.8
   keyframe_max_delay_s: 0.7
+objects:
+  appearance: true
+  appearance_keyframes_only: true
+  appearance_every_n_frames: 3
+viz:
+  point_subsample: 6
+  frame_every: 2
+  depth_every: 3
+  objects_every: 4
+  trajectory_every: 5
+  trajectory_max_points: 200
+  global_map_every: 2
+  global_map_max_points: 10000
+  jpeg_quality: 55
 """,
         encoding="utf-8",
     )
@@ -78,6 +97,9 @@ imu:
     assert cfg.capture.replay_depth_mode == "resize"
     assert cfg.capture.replay_pair_tolerance_ms == 12
     assert cfg.depth.oak_fill_missing is False
+    assert cfg.detect.every_n_frames == 2
+    assert cfg.backend.enabled is False
+    assert cfg.backend.live_apply is False
     assert cfg.mesh.enabled is True
     assert cfg.mesh.voxel_size == 0.04
     assert cfg.mesh.trunc_margin == 0.16
@@ -98,6 +120,84 @@ imu:
     assert cfg.imu.max_rotation_deg == 25.0
     assert cfg.imu.keyframe_blur_omega_rad_s == 1.8
     assert cfg.imu.keyframe_max_delay_s == 0.7
+    assert cfg.objects.appearance is True
+    assert cfg.objects.appearance_keyframes_only is True
+    assert cfg.objects.appearance_every_n_frames == 3
+    assert cfg.viz.point_subsample == 6
+    assert cfg.viz.frame_every == 2
+    assert cfg.viz.depth_every == 3
+    assert cfg.viz.objects_every == 4
+    assert cfg.viz.trajectory_every == 5
+    assert cfg.viz.trajectory_max_points == 200
+    assert cfg.viz.global_map_every == 2
+    assert cfg.viz.global_map_max_points == 10000
+    assert cfg.viz.jpeg_quality == 55
+
+
+def test_load_reads_fusion_config(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+fusion:
+  mode: direct
+  direct_point_subsample: 3
+  direct_mesh_window_size: 5
+  direct_mesh_overlap: 2
+  direct_mesh_downsample: 2
+  direct_edge_filter: false
+  direct_edge_rel_thresh: 0.08
+  direct_mask_dilate_px: 1
+  require_aligned_depth: false
+""",
+        encoding="utf-8",
+    )
+
+    cfg = Config.load(path)
+
+    assert cfg.fusion.mode == "direct"
+    assert cfg.fusion.direct_point_subsample == 3
+    assert cfg.fusion.direct_mesh_window_size == 5
+    assert cfg.fusion.direct_mesh_overlap == 2
+    assert cfg.fusion.direct_mesh_downsample == 2
+    assert cfg.fusion.direct_edge_filter is False
+    assert cfg.fusion.direct_edge_rel_thresh == 0.08
+    assert cfg.fusion.direct_mask_dilate_px == 1
+    assert cfg.fusion.require_aligned_depth is False
+
+
+def test_fusion_config_defaults_preserve_backend_mode():
+    cfg = Config()
+
+    assert cfg.fusion.mode == "backend"
+    assert cfg.fusion.direct_point_subsample >= 1
+    assert cfg.fusion.direct_mesh_window_size >= 2
+    assert cfg.fusion.direct_mesh_overlap < cfg.fusion.direct_mesh_window_size
+    assert cfg.fusion.require_aligned_depth is True
+
+
+def test_realtime_runtime_profile_applies_tail_latency_overrides():
+    cfg = Config()
+    cfg.depth.oak_fill_missing = True
+    cfg.backend.metric_anchor = True
+    cfg.mesh.enabled = True
+    cfg.objects.appearance = True
+
+    apply_runtime_profile(cfg, "realtime")
+
+    assert cfg.depth.oak_fill_missing is False
+    assert cfg.backend.enabled is False
+    assert cfg.backend.metric_anchor is False
+    assert cfg.backend.live_apply is False
+    assert cfg.detect.every_n_frames >= 5
+    assert cfg.backend.period_s >= 10.0
+    assert cfg.backend.window_size <= 8
+    assert cfg.backend.overlap <= cfg.backend.window_size // 2
+    assert cfg.mesh.enabled is False
+    assert cfg.objects.appearance is False
+    assert cfg.viz.point_subsample >= 8
+    assert cfg.viz.frame_every >= 2
+    assert cfg.viz.depth_every >= 2
+    assert cfg.viz.global_map_max_points <= 150000
 
 
 def test_select_torch_device_prefers_cuda(monkeypatch):

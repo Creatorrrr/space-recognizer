@@ -3,6 +3,7 @@
 
 Examples:
   .venv/bin/python benchmarks/mesh_smoke.py sources/session_... --frames 120
+  .venv/bin/python benchmarks/mesh_smoke.py sources/session_... --frames 120 --fusion direct
   .venv/bin/python benchmarks/mesh_smoke.py sources/session_* --frames 60 --out-dir artifacts/mesh
 """
 
@@ -129,6 +130,8 @@ def main() -> None:
     parser.add_argument("--mesh-width", type=int, default=160)
     parser.add_argument("--proc-width", type=int, default=640)
     parser.add_argument("--out-dir", default="artifacts/mesh")
+    parser.add_argument("--fusion", choices=["direct"], default="direct",
+                        help="accepted for parity with spacerec.main; mesh_smoke always uses OAK RGB-D direct fusion")
     args = parser.parse_args()
 
     cfg = Config.load(args.config)
