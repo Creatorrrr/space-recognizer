@@ -20,6 +20,7 @@ from .capture import VideoSource
 from .config import Config
 from .depth import DepthEstimator, fuse_metric_depth
 from .detect import Detection, ObjectDetector
+from .device import select_torch_device
 from .geometry import sim3_apply, sim3_inverse
 from .graph import build_graph
 from .imu import estimate_camera_rotation, should_accept_backend_keyframe
@@ -112,6 +113,11 @@ def dynamic_mask(detections: list[Detection], shape: tuple[int, int],
     return mask
 
 
+def _needs_live_depth_estimator(cfg: Config, source_has_metric_depth: bool) -> bool:
+    """Return whether the live loop needs per-frame DA3 depth inference."""
+    return (not source_has_metric_depth) or bool(cfg.depth.oak_fill_missing)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="spacerec")
     parser.add_argument("--config", default="config.yaml")
@@ -139,23 +145,28 @@ def main() -> None:
     if args.no_realtime:
         cfg.realtime = False
 
+    source = _source_from_config(cfg)
+    source_has_metric_depth = bool(getattr(source, "has_metric_depth", False))
+    W, H = source.proc_width, source.proc_height
+    source_K = getattr(source, "K", None)
+
     print("loading models...")
     detector = ObjectDetector(cfg.detect.model, conf=cfg.detect.conf,
                               vocabulary=cfg.detect.vocabulary)
-    depth_est = DepthEstimator(cfg.depth.model, process_res=cfg.depth.process_res)
+    torch_device = select_torch_device(None)
+    needs_live_depth = _needs_live_depth_estimator(cfg, source_has_metric_depth)
+    depth_est = (DepthEstimator(cfg.depth.model, process_res=cfg.depth.process_res,
+                                device=torch_device)
+                 if needs_live_depth else None)
     embedder = None
     if cfg.objects.appearance:
         from .appearance import AppearanceEmbedder
-        embedder = AppearanceEmbedder(depth_est.device)
+        embedder = AppearanceEmbedder(torch_device)
     viz = Visualizer(memory_limit=cfg.viz.memory_limit)
-    source = _source_from_config(cfg)
-    source_has_metric_depth = bool(getattr(source, "has_metric_depth", False))
     if source_has_metric_depth:
         viz.meters_per_unit = 1.0
     if getattr(source, "metadata", None):
         print(f"source metadata: {source.metadata if not isinstance(source.metadata, dict) else source.metadata.get('device', source.metadata)}")
-    W, H = source.proc_width, source.proc_height
-    source_K = getattr(source, "K", None)
     K = source_K if source_K is not None else default_intrinsics(W, H)
     vo = VisualOdometry(K, cfg.vo)
     R_cam_imu = getattr(source, "R_cam_imu", None)
@@ -168,7 +179,7 @@ def main() -> None:
     if not cfg.realtime:
         cfg.backend.period_s = 0.0
     backend = ReconstructionBackend(cfg.backend, cfg.depth.model,
-                                    depth_est.device, cfg.depth.process_res,
+                                    torch_device, cfg.depth.process_res,
                                     metric_model=cfg.depth.metric_model)
     backend.start()
     print("waiting for backend process...")
@@ -178,7 +189,7 @@ def main() -> None:
     # DA3의 프레임별 intrinsics 추정은 출렁임이 크다(fx 740~1015 관측).
     # 처음 K_WARMUP 프레임 동안 표본을 모아 중앙값으로 확정한 뒤 VO를 시작해야
     # 실행 도중 K가 바뀌며 지도 스케일이 갈라지는 일이 없다.
-    K_WARMUP = 0 if source_K is not None else 10
+    K_WARMUP = 0 if source_K is not None or depth_est is None else 10
     K_samples: list[np.ndarray] = []
     registry = ObjectRegistry(cfg.objects)
 
@@ -211,7 +222,7 @@ def main() -> None:
     print("warming up models...")
     dummy = np.zeros((H, W, 3), np.uint8)
     detector.track(dummy)
-    if not source_has_metric_depth or cfg.depth.oak_fill_missing:
+    if depth_est is not None:
         depth_est.infer(dummy)
     if embedder is not None:
         embedder.warmup()
@@ -232,8 +243,11 @@ def main() -> None:
             raw_depth = None
             has_metric_depth = frame.depth_m is not None
             if has_metric_depth:
-                fallback = (depth_est.infer(frame.bgr)
-                            if cfg.depth.oak_fill_missing else None)
+                fallback = None
+                if cfg.depth.oak_fill_missing:
+                    if depth_est is None:
+                        raise RuntimeError("oak_fill_missing requires live depth estimator")
+                    fallback = depth_est.infer(frame.bgr)
                 depth, oak_calib, _ = fuse_metric_depth(
                     frame.depth_m, fallback, frame.depth_m > 0,
                     min_depth_m=cfg.capture.oak_depth_min_m,
@@ -244,9 +258,13 @@ def main() -> None:
                 calib = oak_calib
                 frame_scale = 1.0
             else:
+                if depth_est is None:
+                    raise RuntimeError("non-metric source requires live depth estimator")
                 raw_depth = depth_est.infer(frame.bgr)
 
             if K_WARMUP and len(K_samples) < K_WARMUP:
+                if depth_est is None:
+                    raise RuntimeError("intrinsics warmup requires live depth estimator")
                 if depth_est.last_K is not None:
                     K_samples.append(depth_est.last_K)
                 if len(K_samples) == K_WARMUP:

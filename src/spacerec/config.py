@@ -13,7 +13,7 @@ class DepthCfg:
     model: str = "depth-anything/DA3-SMALL"
     process_res: int = 504
     metric_model: str = "depth-anything/DA3METRIC-LARGE"
-    oak_fill_missing: bool = True
+    oak_fill_missing: bool = False
     oak_fill_min_valid: int = 500
 
 

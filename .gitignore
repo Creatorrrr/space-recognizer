@@ -19,3 +19,8 @@ models/
 *.npz
 *.log
 runs/
+artifacts/
+
+# 로컬 도구/IDE 산출물
+.codex-analysis/
+.idea/

@@ -47,7 +47,8 @@ YOLOE-26s-seg + MobileCLIP2 텍스트 인코더 0.3GB, DINOv2-small)가 자동
 - 웹캠 모드는 터미널 앱에 macOS 카메라 권한이 필요합니다
   (시스템 설정 → 개인정보 보호 및 보안 → 카메라).
 - OAK-D-Lite 모드는 DepthAI가 RGB와 RGB에 정합된 미터 단위 stereo depth를
-  가져오고, stereo가 비는 픽셀만 DA3로 metric 보정해 채웁니다. USB 상태가
+  가져옵니다. 기본값은 stereo depth만 쓰며, `depth.oak_fill_missing: true`로
+  켜면 stereo가 비는 픽셀만 DA3로 metric 보정해 채웁니다. USB 상태가
   `HIGH`면 USB 2.0 연결이므로 USB 3 케이블/포트를 먼저 확인하세요.
   IMU가 노출되는 장치에서는 accel/gyro도 함께 읽고, `imu.enabled: true`일 때
   gyro 적분 회전을 LK 초기 flow와 PnP 초기값으로 넘깁니다. 현재 녹화 세션
@@ -55,7 +56,8 @@ YOLOE-26s-seg + MobileCLIP2 텍스트 인코더 0.3GB, DINOv2-small)가 자동
 - OAK 녹화 세션 디렉터리(`metadata.json`, `events.jsonl`, `streams/`)도
   `--source`로 바로 재생할 수 있습니다. `capture.replay_depth_mode` 기본값
   `calibrated`는 녹화된 stereo depth를 RGB 카메라 좌표계로 재투영하고,
-  부족한 픽셀은 기존 OAK depth 보정 경로처럼 DA3 fallback으로 채웁니다.
+  낮은 해상도 구멍을 작은 z-buffer splat으로 보강합니다. DA3 fallback
+  hole-fill은 `depth.oak_fill_missing: true`일 때만 추가로 동작합니다.
   빠른 포맷 확인만 필요하면 `resize`로 바꿔 단순 리사이즈 smoke를 돌릴 수
   있습니다.
 - 영상 파일 모드는 기본적으로 **웹캠처럼 벽시계 기준으로 프레임을 드롭**하며
@@ -92,7 +94,7 @@ YOLOE-26s-seg + MobileCLIP2 텍스트 인코더 0.3GB, DINOv2-small)가 자동
 [실시간 계층 — 매 프레임, MPS]
   YOLOE-26s-seg + ByteTrack → 객체 mask/추적 (config의 vocabulary로 어휘 지정)
   DINOv2-small 외형 임베딩  → 재등장 물체 re-ID
-  OAK stereo depth(선택)   → 미터 단위 depth, DA3-Small은 hole-fill 보조
+  OAK stereo depth(선택)   → 미터 단위 depth, DA3-Small hole-fill은 opt-in
   DA3-Small mono depth     → 웹캠/영상 기본 depth → 객체 3D 위치
   LK 광학흐름 + PnP RANSAC → 카메라 pose (옵션: gyro rotation prior)
 
@@ -135,7 +137,8 @@ DA3-small pose 헤드의 병진 과소추정, 커뮤니티 래퍼 결함 등)이
 ## 알려진 한계 / 다음 단계
 
 - 처리율은 백엔드 추론과 GPU를 공유하는 동안 약 2.5~4 FPS (목표 5~10 FPS의 하한).
-  `backend.metric_anchor: false`로 끄면 다소 빨라집니다.
+  `depth.oak_fill_missing: false`가 기본이며, 추가로 `backend.metric_anchor: false`로
+  끄면 다소 빨라집니다.
 - 전역 좌표계는 라이브 VO 궤적을 따르므로 장시간 사용 시 drift가 누적됩니다.
   (DA3-small의 pose 헤드가 병진을 과소추정해 독립적 drift 보정원으로 쓸 수 없음 —
   루프 클로저는 향후 과제)

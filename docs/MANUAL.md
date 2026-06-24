@@ -90,7 +90,8 @@ uv pip install -p .venv -e ".[oak]"
 - 콘솔 metadata의 USB 속도가 `HIGH`면 USB 2.0 연결입니다. OAK-D-Lite는 USB 3
   연결이 가능하므로 케이블/허브/포트를 먼저 바꾸는 것이 FPS와 depth 안정성에
   가장 큽니다.
-- OAK 모드는 RGB에 정합된 미터 단위 stereo depth를 우선 사용하고, stereo가
+- OAK 모드는 RGB에 정합된 미터 단위 stereo depth를 우선 사용합니다.
+  기본값은 stereo depth만 쓰며, `depth.oak_fill_missing: true`로 켜면 stereo가
   비는 픽셀만 DA3를 OAK depth에 affine 정합해 채웁니다.
 - IMU가 노출되는 OAK-D-Lite에서는 accel/gyro stream도 읽습니다.
   `imu.enabled: true`로 켜면 gyro 적분 회전을 LK 초기 flow와 PnP 초기값으로
@@ -117,8 +118,8 @@ OAK-D-Lite 입력을 디렉터리로 녹화해 둔 세션도 입력으로 사용
 
 - 기본 `capture.replay_depth_mode: calibrated`는 녹화된 stereo depth를
   RGB 카메라 intrinsics/extrinsics로 재투영한 뒤 낮은 해상도 때문에 생기는
-  구멍을 작은 z-buffer splat으로 보강합니다. 이후 기존 OAK 경로와 동일하게
-  DA3 fallback을 metric fit해 빈 픽셀을 채웁니다.
+  구멍을 작은 z-buffer splat으로 보강합니다. 이후 DA3 fallback hole-fill은
+  `depth.oak_fill_missing: true`일 때만 추가로 동작합니다.
 - `capture.replay_depth_mode: resize`는 depth를 RGB 해상도로 단순 nearest
   resize합니다. 빠른 포맷 smoke에는 유용하지만 RGB/depth 좌표계가 다를 수
   있어 정밀 3D 검증용 기본값은 아닙니다.
@@ -309,6 +310,9 @@ capture:
   replay_depth_mode: calibrated   # recorded OAK: calibrated 또는 resize
   replay_pair_tolerance_ms: 20.0  # RGB-depth nearest pairing 허용 오차
 
+depth:
+  oak_fill_missing: false         # true면 OAK stereo 구멍만 DA3로 metric 보정
+
 detect:
   conf: 0.35                      # 검출 신뢰도 임계값. 오검출 많으면 ↑ (0.45)
   dynamic_classes: [person, ...]  # 항상 '움직임'으로 간주해 지도에서 제외할 클래스
@@ -367,7 +371,7 @@ graph:
 
 | 증상 | 처방 |
 |---|---|
-| FPS가 너무 낮다 | `backend.metric_anchor: false` → `proc_width: 960` → `backend.window_size: 8` |
+| FPS가 너무 낮다 | `depth.oak_fill_missing: false` 확인 → `backend.metric_anchor: false` → `proc_width: 960` → `backend.window_size: 8` |
 | 지도가 듬성듬성하다 | `backend.voxel_size: 0.02`, `viz.point_subsample: 2` |
 | mesh가 너무 무겁다 | `mesh.voxel_size: 0.07`, `mesh.max_active_submaps: 16`, smoke `--frames` 축소 |
 | mesh가 거칠다 | recorded OAK replay 사용, `mesh.voxel_size: 0.03`, 더 느린 카메라 이동 |

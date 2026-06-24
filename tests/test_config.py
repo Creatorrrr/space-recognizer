@@ -16,6 +16,16 @@ def test_load_reads_utf8_config_comments(tmp_path):
     assert cfg.realtime is False
 
 
+def test_repository_default_disables_oak_depth_hole_fill():
+    cfg = Config.load("config.yaml")
+
+    assert cfg.depth.oak_fill_missing is False
+
+
+def test_dataclass_default_disables_oak_depth_hole_fill():
+    assert Config().depth.oak_fill_missing is False
+
+
 def test_load_reads_oak_capture_config(tmp_path):
     path = tmp_path / "config.yaml"
     path.write_text(

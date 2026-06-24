@@ -25,7 +25,7 @@ capture:
 depth:
   model: depth-anything/DA3-SMALL  # HF model id (공식 depth-anything-3 패키지)
   process_res: 504
-  oak_fill_missing: true           # OAK stereo 빈 픽셀을 DA3로 metric 보정해 채움
+  oak_fill_missing: false          # true면 OAK stereo 빈 픽셀을 DA3로 metric 보정해 채움
   oak_fill_min_valid: 500
 
 detect:
