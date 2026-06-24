@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from .device import select_torch_device
+from .device import autocast_context, configure_torch_runtime
 
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], np.float32)
@@ -18,18 +18,20 @@ _INPUT = 224  # 14의 배수 (DINOv2 patch 14)
 
 
 class AppearanceEmbedder:
-    def __init__(self, device: str | None = None):
-        self.device = select_torch_device(device)
+    def __init__(self, device: str | None = None, precision: str = "fp32"):
+        self.device = configure_torch_runtime(device)
+        self.precision = precision
         self.model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
         self.model = self.model.to(self.device).eval()
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def warmup(self) -> None:
         """첫 추론의 커널 컴파일을 미리 치러 실시간 루프의 지연을 막는다."""
         dummy = torch.zeros(1, 3, _INPUT, _INPUT, device=self.device)
-        self.model(dummy)
+        with autocast_context(self.device, self.precision):
+            self.model(dummy)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def embed(self, bgr: np.ndarray, observations: list) -> None:
         """각 Observation의 crop을 배치로 임베딩해 obs.emb에 채운다 (L2 정규화)."""
         if not observations:
@@ -54,7 +56,9 @@ class AppearanceEmbedder:
             crops.append((crop - _IMAGENET_MEAN) / _IMAGENET_STD)
 
         batch = torch.from_numpy(np.stack(crops).transpose(0, 3, 1, 2)).to(self.device)
-        feats = self.model(batch).float().cpu().numpy()  # (N, 384) CLS tokens
+        with autocast_context(self.device, self.precision):
+            feats_t = self.model(batch)
+        feats = feats_t.float().cpu().numpy()  # (N, 384) CLS tokens
         feats /= np.linalg.norm(feats, axis=1, keepdims=True) + 1e-9
         for obs, f in zip(observations, feats):
             obs.emb = f

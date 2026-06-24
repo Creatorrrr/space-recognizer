@@ -8,21 +8,74 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
+import time
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
 
 import spacerec  # noqa: F401
 from spacerec.backend import BackendKeyframe, _Worker
 from spacerec.config import Config
-from spacerec.device import select_torch_device
+from spacerec.device import configure_torch_runtime, select_torch_device
 from spacerec.imu import estimate_camera_rotation, should_accept_backend_keyframe
 from spacerec.objects import ObjectRegistry, localize_objects
 from spacerec.replay import RecordedOakSource, _nearest
 from spacerec.vo import VisualOdometry
+
+
+class MetricTimer:
+    def __init__(self, timings: dict, name: str):
+        self.timings = timings
+        self.name = name
+        self.t0 = 0.0
+
+    def __enter__(self):
+        self.t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        entry = self.timings.setdefault(self.name, {"count": 0, "total_ms": 0.0})
+        entry["count"] += 1
+        entry["total_ms"] += (time.perf_counter() - self.t0) * 1000.0
+        return False
+
+
+def _summarize_timings(timings: dict) -> dict:
+    summary = {}
+    for name, entry in sorted(timings.items()):
+        count = int(entry.get("count", 0))
+        total_ms = float(entry.get("total_ms", 0.0))
+        summary[f"{name}_count"] = count
+        summary[f"{name}_total_ms"] = total_ms
+        summary[f"{name}_avg_ms"] = total_ms / count if count else 0.0
+    return summary
+
+
+def _cuda_memory_snapshot() -> dict:
+    if not torch.cuda.is_available():
+        return {"available": False}
+    return {
+        "available": True,
+        "device": torch.cuda.get_device_name(0),
+        "max_allocated": int(torch.cuda.max_memory_allocated()),
+        "max_reserved": int(torch.cuda.max_memory_reserved()),
+    }
+
+
+def _apply_runtime_overrides(cfg: Config, args) -> None:
+    if getattr(args, "precision", None):
+        cfg.compute.precision = args.precision
+    if getattr(args, "no_tf32", False):
+        cfg.compute.tf32 = False
+    if getattr(args, "metric_anchor_every_n_windows", None) is not None:
+        cfg.backend.metric_anchor_every_n_windows = int(args.metric_anchor_every_n_windows)
+    if getattr(args, "metric_anchor_process_res", None) is not None:
+        cfg.backend.metric_anchor_process_res = int(args.metric_anchor_process_res)
 
 
 def _dynamic_mask(detections, shape, dynamic_classes):
@@ -54,24 +107,49 @@ def _payload_missing(src: RecordedOakSource) -> int:
     return missing
 
 
-def _run_backend_window(cfg: Config, keyframes: list[BackendKeyframe]) -> int:
+def _run_backend_window(
+    cfg: Config,
+    keyframes: list[BackendKeyframe],
+    *,
+    metric_anchor: bool = False,
+) -> dict:
     if not keyframes:
-        return 0
+        return {
+            "backend_points": 0,
+            "backend_runtime_s": 0.0,
+            "backend_timings_ms": {},
+            "backend_cuda_memory": _cuda_memory_snapshot(),
+        }
     bcfg = replace(
         cfg.backend,
         window_size=max(1, len(keyframes)),
         overlap=0,
-        metric_anchor=False,
+        metric_anchor=bool(metric_anchor),
     )
+    metric_model = cfg.depth.metric_model if metric_anchor else None
     worker = _Worker(bcfg, cfg.depth.model, select_torch_device(None),
-                     min(cfg.depth.process_res, 252), metric_model=None)
+                     min(cfg.depth.process_res, 252), metric_model=metric_model,
+                     precision=cfg.compute.precision)
     worker._pending.extend(keyframes)
     result = worker._run_window()
-    return 0 if result is None else int(len(result.points))
+    if result is None:
+        return {
+            "backend_points": 0,
+            "backend_runtime_s": 0.0,
+            "backend_timings_ms": {},
+            "backend_cuda_memory": _cuda_memory_snapshot(),
+        }
+    return {
+        "backend_points": int(len(result.points)),
+        "backend_runtime_s": float(result.runtime_s),
+        "backend_timings_ms": dict(result.timings_ms),
+        "backend_cuda_memory": dict(result.cuda_memory),
+    }
 
 
 def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
-                backend: bool, imu_enabled: bool | None = None) -> dict:
+                backend: bool, imu_enabled: bool | None = None,
+                backend_metric_anchor: bool = False) -> dict:
     src = RecordedOakSource(
         path,
         proc_width=cfg.proc_width,
@@ -97,6 +175,7 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
     imu_keyframe_ts: float | None = None
     last_backend_keyframe_ts: float | None = None
     stats = Counter()
+    timings = {}
     valid_fracs = []
     inliers = []
     tracked = []
@@ -116,7 +195,10 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
             gray = frame.gray_track
             if gray is None:
                 gray = cv2.cvtColor(frame.bgr, cv2.COLOR_BGR2GRAY)
-            detections = detector.track(frame.bgr) if detector is not None else []
+            detections = []
+            if detector is not None:
+                with MetricTimer(timings, "detect_track"):
+                    detections = detector.track(frame.bgr)
             for det in detections:
                 classes[det.cls_name] += 1
             imu_samples = list(frame.imu_samples or [])
@@ -163,15 +245,16 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
                 omega_norm = delta_prior.omega_norm
             elif since_prior is not None:
                 omega_norm = since_prior.omega_norm
-            pose = vo.process(
-                gray,
-                frame.depth_m if frame.depth_m is not None else np.ones(gray.shape, np.float32),
-                frame.ts,
-                _dynamic_mask(detections, gray.shape, set(cfg.detect.dynamic_classes)),
-                R_delta_prev=None if delta_prior is None else delta_prior.R,
-                R_since_keyframe=None if since_prior is None else since_prior.R,
-                omega_norm=omega_norm,
-            )
+            with MetricTimer(timings, "vo_process"):
+                pose = vo.process(
+                    gray,
+                    frame.depth_m if frame.depth_m is not None else np.ones(gray.shape, np.float32),
+                    frame.ts,
+                    _dynamic_mask(detections, gray.shape, set(cfg.detect.dynamic_classes)),
+                    R_delta_prev=None if delta_prior is None else delta_prior.R,
+                    R_since_keyframe=None if since_prior is None else since_prior.R,
+                    omega_norm=omega_norm,
+                )
             if pose.is_keyframe:
                 imu_since_keyframe = []
                 imu_keyframe_ts = frame.ts
@@ -218,14 +301,21 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
                 tracked.append(float(pose.n_tracked))
                 inliers.append(float(pose.inlier_ratio))
             if detections and registry is not None and frame.depth_m is not None:
-                obs = localize_objects(detections, frame.depth_m, vo.K, pose.T_wc,
-                                       frame.depth_conf)
+                with MetricTimer(timings, "object_localize"):
+                    obs = localize_objects(detections, frame.depth_m, vo.K, pose.T_wc,
+                                           frame.depth_conf)
                 stats["detections"] += len(detections)
                 stats["object_observations"] += len(obs)
                 registry.update(obs, frame.ts)
     finally:
         src.release()
-    backend_points = _run_backend_window(cfg, keyframes) if backend else 0
+    backend_metrics = (_run_backend_window(
+        cfg, keyframes, metric_anchor=backend_metric_anchor) if backend else {
+        "backend_points": 0,
+        "backend_runtime_s": 0.0,
+        "backend_timings_ms": {},
+        "backend_cuda_memory": _cuda_memory_snapshot(),
+    })
 
     return {
         "session": path.name,
@@ -252,7 +342,12 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
         "imu_blur_skipped_kf": stats["imu_blur_skipped_kf"],
         "imu_blur_forced_kf": stats["imu_blur_forced_kf"],
         "backend_keyframes": len(keyframes),
-        "backend_points": backend_points,
+        "backend_points": backend_metrics["backend_points"],
+        "backend_runtime_s": backend_metrics["backend_runtime_s"],
+        "backend_timings_ms": backend_metrics["backend_timings_ms"],
+        "backend_cuda_memory": backend_metrics["backend_cuda_memory"],
+        "timings": _summarize_timings(timings),
+        "cuda_memory": _cuda_memory_snapshot(),
         "top_classes": classes.most_common(6),
     }
 
@@ -266,18 +361,41 @@ def main() -> None:
                     help="load YOLOE and report detections/object observations")
     ap.add_argument("--backend", action="store_true",
                     help="run one direct DA3 backend window and report point count")
+    ap.add_argument("--backend-metric-anchor", action="store_true",
+                    help="include the optional DA3METRIC anchor in the direct backend window")
     ap.add_argument("--imu", action="store_true",
                     help="enable gyro-derived VO rotation priors for this run")
     ap.add_argument("--compare-imu", action="store_true",
                     help="run each session twice: visual-only, then IMU-assisted")
+    ap.add_argument("--metrics-out",
+                    help="write replay metrics JSON for before/after CUDA comparisons")
+    ap.add_argument("--precision", choices=["fp32", "bf16"],
+                    help="override compute.precision for this run")
+    ap.add_argument("--metric-anchor-every-n-windows", type=int,
+                    help="override backend.metric_anchor_every_n_windows for this run")
+    ap.add_argument("--metric-anchor-process-res", type=int,
+                    help="override backend.metric_anchor_process_res for this run")
+    ap.add_argument("--no-tf32", action="store_true",
+                    help="disable CUDA TF32 runtime switches for this run")
     args = ap.parse_args()
 
     cfg = Config.load(args.config)
+    _apply_runtime_overrides(cfg, args)
+    configure_torch_runtime(
+        None,
+        tf32=cfg.compute.tf32,
+        cudnn_benchmark=cfg.compute.cudnn_benchmark,
+    )
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    results = []
     for session in args.sessions:
         modes = (False, True) if args.compare_imu else (bool(args.imu or cfg.imu.enabled),)
         for imu_enabled in modes:
             result = run_session(Path(session), cfg, args.frames, args.full_models,
-                                 args.backend, imu_enabled=imu_enabled)
+                                 args.backend, imu_enabled=imu_enabled,
+                                 backend_metric_anchor=args.backend_metric_anchor)
+            results.append(result)
             print(
                 "REPLAY_SMOKE "
                 f"session={result['session']} imu={result['imu']} "
@@ -301,8 +419,20 @@ def main() -> None:
                 f"objects={result['objects']} "
                 f"backend_keyframes={result['backend_keyframes']} "
                 f"backend_points={result['backend_points']} "
+                f"backend_runtime_s={result['backend_runtime_s']:.2f} "
                 f"top_classes={result['top_classes']}"
             )
+    if args.metrics_out:
+        path = Path(args.metrics_out)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "config": {
+                "compute": cfg.compute.__dict__,
+                "backend": cfg.backend.__dict__,
+                "depth": cfg.depth.__dict__,
+            },
+            "results": results,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":

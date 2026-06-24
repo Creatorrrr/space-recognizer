@@ -30,13 +30,14 @@ def main() -> None:
     cfg = Config.load()
     det = ObjectDetector(cfg.detect.model, conf=cfg.detect.conf,
                          vocabulary=cfg.detect.vocabulary)
-    dep = DepthEstimator(cfg.depth.model)
+    dep = DepthEstimator(cfg.depth.model, precision=cfg.compute.precision)
     src = VideoSource(cfg.source, proc_width=cfg.proc_width, realtime=False)
     W, H = src.proc_width, src.proc_height
     vo = VisualOdometry(default_intrinsics(W, H), cfg.vo)
     wm = GlobalMap(cfg.backend)
     be = ReconstructionBackend(cfg.backend, cfg.depth.model, dep.device,
-                               cfg.depth.process_res)
+                               cfg.depth.process_res,
+                               precision=cfg.compute.precision)
     be.start()
     be.wait_ready()
     calib = DepthCalibration()

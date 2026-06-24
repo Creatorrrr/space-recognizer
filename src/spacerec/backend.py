@@ -23,9 +23,11 @@ from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
+import torch
 
 from .calib import DepthCalibration, fit_affine_depth
 from .config import BackendCfg
+from .device import autocast_context, configure_torch_runtime
 from .geometry import SIM3_IDENTITY, Sim3, sim3_apply, sim3_on_pose, umeyama_sim3
 
 
@@ -60,6 +62,8 @@ class BackendResult:
     anchor_kf_id: int | None = None
     window_ids: list[int] = field(default_factory=list)
     runtime_s: float = 0.0
+    timings_ms: dict[str, float] = field(default_factory=dict)
+    cuda_memory: dict[str, int | str | bool] = field(default_factory=dict)
 
 
 def robust_sim3(src_poses: list[np.ndarray], dst_poses: list[np.ndarray]) -> Sim3:
@@ -90,17 +94,21 @@ class _Worker:
     """Backend state + window processing. Lives entirely in the child process."""
 
     def __init__(self, cfg: BackendCfg, model_name: str, device: str,
-                 process_res: int, metric_model: str | None = None):
+                 process_res: int, metric_model: str | None = None,
+                 precision: str = "fp32"):
         from depth_anything_3.api import DepthAnything3
 
         self.cfg = cfg
         self.process_res = process_res
-        self.model = DepthAnything3.from_pretrained(model_name).to(device).eval()
+        self.device = configure_torch_runtime(device)
+        self.precision = precision
+        self.model = DepthAnything3.from_pretrained(model_name).to(self.device).eval()
         self.metric_model = None
         if cfg.metric_anchor and metric_model:
             self.metric_model = (DepthAnything3.from_pretrained(metric_model)
-                                 .to(device).eval())
+                                 .to(self.device).eval())
         self._meters_per_unit: float | None = None
+        self._windows_run = 0
         self.kf_global_poses: dict[int, np.ndarray] = {}
         self._pending: list[BackendKeyframe] = []
         self._reconstructed: list[BackendKeyframe] = []
@@ -134,15 +142,22 @@ class _Worker:
 
     def _run_window(self) -> BackendResult | None:
         t0 = time.monotonic()
+        timings: dict[str, float] = {}
+        self._windows_run = int(getattr(self, "_windows_run", 0)) + 1
         n_new = self.cfg.window_size - self.cfg.overlap
         new_kfs = self._pending[:n_new]
         self._pending = self._pending[n_new:]
-        old_kfs = self._reconstructed[-self.cfg.overlap:]
+        old_kfs = self._reconstructed[-self.cfg.overlap:] if self.cfg.overlap else []
         window = old_kfs + new_kfs
         ids = [kf.kf_id for kf in window]
 
-        pred = self.model.inference([kf.rgb for kf in window],
-                                    process_res=self.process_res)
+        t = time.perf_counter()
+        with torch.inference_mode():
+            with autocast_context(getattr(self, "device", "cpu"),
+                                  getattr(self, "precision", "fp32")):
+                pred = self.model.inference([kf.rgb for kf in window],
+                                            process_res=self.process_res)
+        timings["da3_window_ms"] = (time.perf_counter() - t) * 1000.0
         V, dh, dw = pred.depth.shape
 
         # 윈도 pose는 라이브 VO pose를 그대로 사용한다. DA3-small의 pose 헤드는
@@ -241,15 +256,39 @@ class _Worker:
 
         # ---- (선택) metric 앵커: 라이브 스케일 1단위 = 몇 미터인지 추정 ----
         # 지도/pose의 스케일은 건드리지 않고 표시용 환산 계수만 갱신한다.
-        if self.metric_model is not None:
-            metric = self.metric_model.inference(
-                [newest.rgb], process_res=self.process_res).depth[0]
+        every_n = max(1, int(getattr(self.cfg, "metric_anchor_every_n_windows", 1)))
+        run_metric_anchor = (
+            self.metric_model is not None
+            and (self._windows_run == 1 or (self._windows_run - 1) % every_n == 0)
+        )
+        if run_metric_anchor:
+            metric_res = getattr(self.cfg, "metric_anchor_process_res", None) or self.process_res
+            t = time.perf_counter()
+            with torch.inference_mode():
+                with autocast_context(getattr(self, "device", "cpu"),
+                                      getattr(self, "precision", "fp32")):
+                    metric = self.metric_model.inference(
+                        [newest.rgb], process_res=metric_res).depth[0]
+            timings["metric_anchor_ms"] = (time.perf_counter() - t) * 1000.0
             d_live = alpha * pred.depth[-1] + beta
+            if metric.shape != d_live.shape:
+                metric = cv2.resize(metric.astype(np.float32), (dw, dh),
+                                    interpolation=cv2.INTER_LINEAR)
             valid = static_valid(V - 1, newest) & (d_live > 1e-6) & (metric > 1e-6)
             if valid.sum() > 500:
                 mpu = float(np.median(metric[valid] / d_live[valid]))
                 self._meters_per_unit = (mpu if self._meters_per_unit is None
                                          else 0.7 * self._meters_per_unit + 0.3 * mpu)
+        else:
+            timings["metric_anchor_ms"] = 0.0
+
+        cuda_memory: dict[str, int | str | bool] = {"available": torch.cuda.is_available()}
+        if getattr(self, "device", "cpu") == "cuda" and torch.cuda.is_available():
+            cuda_memory.update({
+                "device": torch.cuda.get_device_name(0),
+                "max_allocated": int(torch.cuda.max_memory_allocated()),
+                "max_reserved": int(torch.cuda.max_memory_reserved()),
+            })
 
         self._reconstructed.extend(new_kfs)
         # 윈도 중첩에 쓰일 최근 키프레임만 이미지를 유지 (메모리 해제)
@@ -267,15 +306,16 @@ class _Worker:
             view_poses=np.stack(mesh_poses) if mesh_poses else None,
             view_intrinsics=np.stack(mesh_intrinsics) if mesh_intrinsics else None,
             anchor_kf_id=ids[0] if ids else None,
-            window_ids=ids, runtime_s=time.monotonic() - t0)
+            window_ids=ids, runtime_s=time.monotonic() - t0,
+            timings_ms=timings, cuda_memory=cuda_memory)
 
 
 def _worker_main(cfg: BackendCfg, model_name: str, device: str,
                  process_res: int, metric_model: str | None,
-                 in_q: mp.Queue, out_q: mp.Queue) -> None:
+                 in_q: mp.Queue, out_q: mp.Queue, precision: str = "fp32") -> None:
     import spacerec  # noqa: F401  (env vars in the child process)
 
-    worker = _Worker(cfg, model_name, device, process_res, metric_model)
+    worker = _Worker(cfg, model_name, device, process_res, metric_model, precision)
     out_q.put("ready")
     worker.run(in_q, out_q)
 
@@ -284,14 +324,15 @@ class ReconstructionBackend:
     """Main-process handle: feeds keyframes to / reads results from the child."""
 
     def __init__(self, cfg: BackendCfg, model_name: str, device: str,
-                 process_res: int = 504, metric_model: str | None = None):
+                 process_res: int = 504, metric_model: str | None = None,
+                 precision: str = "fp32"):
         ctx = mp.get_context("spawn")
         self._in_q: mp.Queue = ctx.Queue()
         self.results: mp.Queue = ctx.Queue()
         self._proc = ctx.Process(
             target=_worker_main,
             args=(cfg, model_name, device, process_res, metric_model,
-                  self._in_q, self.results),
+                  self._in_q, self.results, precision),
             daemon=True)
 
     def start(self) -> None:

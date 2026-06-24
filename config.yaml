@@ -3,6 +3,11 @@ source: sources/sample_720p.mp4  # 파일 경로 또는 웹캠 인덱스(정수)
 realtime: true        # true면 파일도 벽시계 기준으로 프레임 드롭 (웹캠 에뮬레이션)
 proc_width: 1280      # 처리 해상도 (가로)
 
+compute:
+  precision: fp32     # fp32 or CUDA-only bf16 opt-in
+  tf32: true          # CUDA matmul/conv TF32 fast path on RTX GPUs
+  cudnn_benchmark: true
+
 capture:
   source_kind: video  # video 또는 oak. --source oak로도 전환 가능
   oak_rgb_width: 1280
@@ -57,7 +62,7 @@ vo:
   min_inlier_ratio: 0.5
 
 imu:
-  enabled: false          # true면 gyro-derived LK/PnP rotation prior 사용
+  enabled: true          # true면 gyro-derived LK/PnP rotation prior 사용
   use_lk_prior: true
   use_pnp_prior: true
   min_rotation_samples: 2
@@ -72,9 +77,11 @@ backend:
   voxel_size: 0.03     # 전역 지도 voxel (장면 스케일 단위)
   max_points: 800000
   metric_anchor: true   # DA3METRIC-LARGE로 미터 단위 추정 (윈도당 +0.3~1s)
+  metric_anchor_every_n_windows: 1
+  metric_anchor_process_res: null
 
 mesh:
-  enabled: true
+  enabled: false
   voxel_size: 0.05      # TSDF mesh voxel size
   trunc_margin: 0.15    # 보통 voxel_size의 3배
   depth_trunc_m: 8.0

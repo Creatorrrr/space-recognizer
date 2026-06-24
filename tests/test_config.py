@@ -1,5 +1,7 @@
 from spacerec.config import Config
-from spacerec.device import select_torch_device
+import torch
+
+from spacerec.device import autocast_context, configure_torch_runtime, select_torch_device
 
 
 def test_load_reads_utf8_config_comments(tmp_path):
@@ -116,3 +118,62 @@ def test_select_torch_device_honors_explicit_device(monkeypatch):
     monkeypatch.setattr("torch.cuda.is_available", lambda: True)
 
     assert select_torch_device("cpu") == "cpu"
+
+
+def test_load_reads_compute_and_metric_anchor_knobs(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+compute:
+  precision: bf16
+  tf32: true
+  cudnn_benchmark: false
+backend:
+  metric_anchor: true
+  metric_anchor_every_n_windows: 3
+  metric_anchor_process_res: 196
+""",
+        encoding="utf-8",
+    )
+
+    cfg = Config.load(path)
+
+    assert cfg.compute.precision == "bf16"
+    assert cfg.compute.tf32 is True
+    assert cfg.compute.cudnn_benchmark is False
+    assert cfg.backend.metric_anchor is True
+    assert cfg.backend.metric_anchor_every_n_windows == 3
+    assert cfg.backend.metric_anchor_process_res == 196
+
+
+def test_configure_torch_runtime_enables_cuda_tf32(monkeypatch):
+    monkeypatch.setattr("spacerec.device.select_torch_device", lambda device=None: "cuda")
+
+    configure_torch_runtime(tf32=True, cudnn_benchmark=True)
+
+    assert torch.backends.cuda.matmul.allow_tf32 is True
+    assert torch.backends.cudnn.allow_tf32 is True
+    assert torch.backends.cudnn.benchmark is True
+
+
+def test_autocast_context_uses_bfloat16_on_cuda(monkeypatch):
+    seen = {}
+
+    class _Ctx:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_autocast(device_type, dtype):
+        seen["device_type"] = device_type
+        seen["dtype"] = dtype
+        return _Ctx()
+
+    monkeypatch.setattr(torch, "autocast", fake_autocast)
+
+    with autocast_context("cuda", "bf16"):
+        pass
+
+    assert seen == {"device_type": "cuda", "dtype": torch.bfloat16}

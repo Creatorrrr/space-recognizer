@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 import torch
 
-from .device import select_torch_device
+from .device import configure_torch_runtime
 
 
 @dataclass
@@ -30,7 +30,7 @@ class Detection:
 class ObjectDetector:
     def __init__(self, model_path: str, conf: float = 0.35, device: str | None = None,
                  vocabulary: list[str] | None = None):
-        self.device = select_torch_device(device)
+        self.device = configure_torch_runtime(device)
         if vocabulary:
             from ultralytics import YOLOE
 

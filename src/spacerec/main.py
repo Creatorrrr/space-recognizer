@@ -20,7 +20,7 @@ from .capture import VideoSource
 from .config import Config
 from .depth import DepthEstimator, fuse_metric_depth
 from .detect import Detection, ObjectDetector
-from .device import select_torch_device
+from .device import configure_torch_runtime
 from .geometry import sim3_apply, sim3_inverse
 from .graph import build_graph
 from .imu import estimate_camera_rotation, should_accept_backend_keyframe
@@ -153,15 +153,20 @@ def main() -> None:
     print("loading models...")
     detector = ObjectDetector(cfg.detect.model, conf=cfg.detect.conf,
                               vocabulary=cfg.detect.vocabulary)
-    torch_device = select_torch_device(None)
+    torch_device = configure_torch_runtime(
+        None,
+        tf32=cfg.compute.tf32,
+        cudnn_benchmark=cfg.compute.cudnn_benchmark,
+    )
     needs_live_depth = _needs_live_depth_estimator(cfg, source_has_metric_depth)
     depth_est = (DepthEstimator(cfg.depth.model, process_res=cfg.depth.process_res,
-                                device=torch_device)
+                                device=torch_device,
+                                precision=cfg.compute.precision)
                  if needs_live_depth else None)
     embedder = None
     if cfg.objects.appearance:
         from .appearance import AppearanceEmbedder
-        embedder = AppearanceEmbedder(torch_device)
+        embedder = AppearanceEmbedder(torch_device, precision=cfg.compute.precision)
     viz = Visualizer(memory_limit=cfg.viz.memory_limit)
     if source_has_metric_depth:
         viz.meters_per_unit = 1.0
@@ -180,7 +185,8 @@ def main() -> None:
         cfg.backend.period_s = 0.0
     backend = ReconstructionBackend(cfg.backend, cfg.depth.model,
                                     torch_device, cfg.depth.process_res,
-                                    metric_model=cfg.depth.metric_model)
+                                    metric_model=cfg.depth.metric_model,
+                                    precision=cfg.compute.precision)
     backend.start()
     print("waiting for backend process...")
     backend.wait_ready()

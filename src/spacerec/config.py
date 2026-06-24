@@ -18,6 +18,13 @@ class DepthCfg:
 
 
 @dataclass
+class ComputeCfg:
+    precision: str = "fp32"  # "fp32" or CUDA-only "bf16".
+    tf32: bool = True
+    cudnn_benchmark: bool = True
+
+
+@dataclass
 class CaptureCfg:
     source_kind: str = "video"  # "video" or "oak"
     oak_rgb_width: int = 1280
@@ -74,6 +81,8 @@ class BackendCfg:
     voxel_size: float = 0.03
     max_points: int = 800_000
     metric_anchor: bool = False  # DA3METRIC로 미터 단위 추정 (느림, 선택)
+    metric_anchor_every_n_windows: int = 1
+    metric_anchor_process_res: int | None = None
 
 
 @dataclass
@@ -124,6 +133,7 @@ class Config:
     source: str | int = 0
     realtime: bool = True
     proc_width: int = 1280
+    compute: ComputeCfg = field(default_factory=ComputeCfg)
     capture: CaptureCfg = field(default_factory=CaptureCfg)
     depth: DepthCfg = field(default_factory=DepthCfg)
     detect: DetectCfg = field(default_factory=DetectCfg)
@@ -139,7 +149,7 @@ class Config:
     def load(cls, path: str | Path = "config.yaml") -> "Config":
         raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
         sections = {
-            "capture": CaptureCfg, "depth": DepthCfg, "detect": DetectCfg,
+            "compute": ComputeCfg, "capture": CaptureCfg, "depth": DepthCfg, "detect": DetectCfg,
             "vo": VoCfg, "imu": ImuCfg, "backend": BackendCfg, "mesh": MeshCfg,
             "objects": ObjectsCfg, "graph": GraphCfg, "viz": VizCfg,
         }

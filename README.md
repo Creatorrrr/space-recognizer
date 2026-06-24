@@ -159,3 +159,8 @@ DA3-small pose 헤드의 병진 과소추정, 커뮤니티 래퍼 결함 등)이
   완전히 다른 각도로만 촬영하면 정렬에 실패할 수 있음 (데이터는 보존됨).
 - 10~12초 샘플 영상 3종(거실·침실·주방)으로 개발·검증됨 — 1~3분짜리 실내
   촬영 영상으로 장시간 영속성/재등장 검증 권장.
+
+## Windows CUDA
+
+For RTX/Windows CUDA setup, verification commands, and current CUDA bottleneck
+classification, see [docs/cuda_windows.md](docs/cuda_windows.md).
