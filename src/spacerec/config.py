@@ -42,6 +42,7 @@ class CaptureCfg:
 class DetectCfg:
     model: str = "models/yoloe-11s-seg.pt"
     conf: float = 0.35
+    every_n_frames: int = 1
     dynamic_classes: list[str] = field(default_factory=lambda: ["person"])
     # 비어 있지 않으면 YOLOE 오픈 보캐뷸러리 모드로 동작
     vocabulary: list[str] = field(default_factory=list)
@@ -68,6 +69,8 @@ class ImuCfg:
 
 @dataclass
 class BackendCfg:
+    enabled: bool = True
+    live_apply: bool = True
     period_s: float = 5.0
     window_size: int = 12
     overlap: int = 6
@@ -102,6 +105,8 @@ class ObjectsCfg:
     merge_radius: float = 0.5      # 연관 게이트의 상한 (크기 비례 게이트가 기본)
     dynamic_var_thresh: float = 0.3
     appearance: bool = True        # DINOv2 외형 임베딩 re-ID 사용
+    appearance_keyframes_only: bool = False
+    appearance_every_n_frames: int = 1
     app_weight: float = 0.6        # 매칭 비용에서 외형 항의 가중치
     app_gate: float = 0.4          # 이보다 낮은 cos 유사도면 같은 물체로 안 봄
     absence_limit: int = 12        # '보여야 하는데 안 보임' 누적 시 노드 제거
@@ -117,12 +122,21 @@ class GraphCfg:
 class VizCfg:
     memory_limit: str = "4GB"
     point_subsample: int = 4
+    frame_every: int = 1
+    depth_every: int = 1
+    objects_every: int = 1
+    trajectory_every: int = 1
+    trajectory_max_points: int = 0
+    global_map_every: int = 1
+    global_map_max_points: int = 0
+    jpeg_quality: int = 75
 
 
 @dataclass
 class Config:
     source: str | int = 0
     realtime: bool = True
+    runtime_profile: str | None = None
     proc_width: int = 1280
     capture: CaptureCfg = field(default_factory=CaptureCfg)
     depth: DepthCfg = field(default_factory=DepthCfg)
@@ -150,3 +164,47 @@ class Config:
             else:
                 kwargs[key] = value
         return cls(**kwargs)
+
+
+def apply_runtime_profile(cfg: Config, profile: str | None) -> None:
+    """Apply runtime-oriented config overrides in-place.
+
+    Profiles are intentionally conservative overlays: explicit CLI/config values
+    still load first, then the profile picks safer live defaults for tail latency.
+    """
+    if not profile or profile == "quality":
+        return
+    if profile != "realtime":
+        raise ValueError(f"unknown runtime profile: {profile}")
+
+    cfg.depth.oak_fill_missing = False
+    cfg.backend.enabled = False
+    cfg.backend.metric_anchor = False
+    cfg.backend.live_apply = False
+    cfg.backend.period_s = max(float(cfg.backend.period_s), 10.0)
+    cfg.backend.window_size = max(2, min(int(cfg.backend.window_size), 8))
+    cfg.backend.overlap = min(
+        int(cfg.backend.overlap),
+        max(1, cfg.backend.window_size // 2),
+        cfg.backend.window_size - 1,
+    )
+    cfg.mesh.enabled = False
+    cfg.detect.every_n_frames = max(int(cfg.detect.every_n_frames), 5)
+    cfg.objects.appearance = False
+    cfg.objects.appearance_keyframes_only = True
+    cfg.objects.appearance_every_n_frames = max(int(cfg.objects.appearance_every_n_frames), 1)
+    cfg.viz.point_subsample = max(int(cfg.viz.point_subsample), 8)
+    cfg.viz.frame_every = max(int(cfg.viz.frame_every), 2)
+    cfg.viz.depth_every = max(int(cfg.viz.depth_every), 2)
+    cfg.viz.objects_every = max(int(cfg.viz.objects_every), 2)
+    cfg.viz.trajectory_every = max(int(cfg.viz.trajectory_every), 5)
+    cfg.viz.trajectory_max_points = (
+        500 if int(cfg.viz.trajectory_max_points) <= 0
+        else min(int(cfg.viz.trajectory_max_points), 500)
+    )
+    cfg.viz.global_map_every = max(int(cfg.viz.global_map_every), 2)
+    cfg.viz.global_map_max_points = (
+        150_000 if int(cfg.viz.global_map_max_points) <= 0
+        else min(int(cfg.viz.global_map_max_points), 150_000)
+    )
+    cfg.viz.jpeg_quality = min(int(cfg.viz.jpeg_quality), 60)

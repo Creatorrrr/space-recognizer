@@ -36,8 +36,11 @@ uv pip install -p .venv -e ".[oak]"       # OAK-D-Lite를 쓸 때만 필요
 
 # 옵션
 #   --max-seconds 8     : 앞 8초만 처리
+#   --max-frames 120    : 앞 120프레임만 처리
 #   --no-realtime       : 벽시계 페이싱 없이 모든 프레임 처리 (오프라인 분석)
 #   --profile           : 단계별 처리 시간 출력
+#   --perf-log out.csv  : 프레임별 stage timing CSV 저장
+#   --runtime-profile realtime : OAK metric replay용 저지연 프로파일 적용
 ```
 
 첫 실행 시 모델 가중치(총 약 2.2GB: DA3-SMALL 0.3GB, DA3METRIC-LARGE 1.4GB,
@@ -71,6 +74,39 @@ YOLOE-26s-seg + MobileCLIP2 텍스트 인코더 0.3GB, DINOv2-small)가 자동
   proxy, normal agreement, recency score로 선택된 canonical surface만 `.ply`와
   기본 Rerun mesh에 남깁니다. 원본 submap을 export하려면 `mesh.render_mode: raw`,
   Rerun에서 canonical과 raw를 함께 보려면 `both`를 사용하세요.
+
+### 끊김 진단과 realtime 프로파일
+
+OAK-D-Lite 녹화 replay에서 Rerun이 주기적으로 멈칫하면 평균 FPS보다
+`loop_total` p95/p99/max를 먼저 확인하세요. 아래 명령은 프레임별 병목을 CSV로
+남기고, 100ms를 넘긴 프레임은 `[stutter]` 로그로 가장 큰 stage를 출력합니다.
+
+```bash
+.venv/bin/python -m spacerec.main \
+  --source sources/session_20260624_054529_194430108151D05A00 \
+  --perf-log artifacts/perf/live.csv --profile
+```
+
+실시간 체감이 더 중요할 때는 live 중 backend 재구성을 끄고, YOLOE 검출 cadence,
+mesh, DINOv2 appearance, Rerun 대용량 로그를 줄이는 realtime overlay를 적용할 수
+있습니다. 정밀 map/mesh 산출은 기본 quality 설정이나 `--no-realtime` 오프라인
+실행으로 다시 돌리는 것을 권장합니다.
+
+```bash
+.venv/bin/python -m spacerec.main \
+  --source sources/session_20260624_054529_194430108151D05A00 \
+  --runtime-profile realtime \
+  --perf-log artifacts/perf/realtime.csv --profile
+```
+
+원인 분리는 벤치마크 매트릭스로 실행합니다. `--headless`는 Rerun을 끄고 계산
+상한선을 보며, 실제 Rerun 체감은 `--headless` 없이 재측정하세요.
+
+```bash
+.venv/bin/python benchmarks/perf_matrix.py \
+  sources/session_20260624_054529_194430108151D05A00 \
+  --frames 120 --out-dir artifacts/perf/matrix --headless
+```
 
 ## Rerun 뷰어 보는 법
 
@@ -129,6 +165,7 @@ DA3-small pose 헤드의 병진 과소추정, 커뮤니티 래퍼 결함 등)이
 .venv/bin/python benchmarks/bench_models.py   # 모델 속도 벤치마크
 .venv/bin/python benchmarks/headless_run.py   # 헤드리스 전체 파이프라인 → /tmp/map.npz
 .venv/bin/python benchmarks/oak_smoke.py      # OAK USB/K/depth stream 확인
+.venv/bin/python benchmarks/perf_matrix.py sources/session_20260624_054529_194430108151D05A00 --frames 120 --headless
 .venv/bin/python benchmarks/replay_smoke.py sources/session_20260624_054320_194430108151D05A00 --frames 60 --full-models
 .venv/bin/python benchmarks/replay_smoke.py sources/session_20260624_054320_194430108151D05A00 sources/session_20260624_055321_194430108151D05A00 --frames 120 --compare-imu
 .venv/bin/python benchmarks/mesh_smoke.py sources/session_20260624_054320_194430108151D05A00 --frames 120

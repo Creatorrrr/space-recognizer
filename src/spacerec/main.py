@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import queue
 import time
 from pathlib import Path
 
@@ -17,7 +18,7 @@ import numpy as np
 from .backend import BackendKeyframe, ReconstructionBackend
 from .calib import DepthCalibration
 from .capture import VideoSource
-from .config import Config
+from .config import Config, apply_runtime_profile
 from .depth import DepthEstimator, fuse_metric_depth
 from .detect import Detection, ObjectDetector
 from .device import select_torch_device
@@ -26,7 +27,8 @@ from .graph import build_graph
 from .imu import estimate_camera_rotation, should_accept_backend_keyframe
 from .mesh import MeshMap
 from .objects import ObjectRegistry, localize_objects
-from .viz import Visualizer
+from .perf import PerfRecorder, add_ms
+from .viz import NullVisualizer, Visualizer
 from .vo import VisualOdometry, default_intrinsics
 from .worldmap import GlobalMap
 
@@ -53,6 +55,25 @@ def _source_from_config(cfg: Config):
                        realtime=cfg.realtime)
 
 
+class _NoopBackend:
+    """Backend-compatible stub for upper-bound latency measurements."""
+
+    def __init__(self):
+        self.results = queue.Queue()
+
+    def start(self) -> None:
+        pass
+
+    def wait_ready(self) -> None:
+        pass
+
+    def add_keyframe(self, keyframe: BackendKeyframe) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+
 def _log_meshmap_update(viz: Visualizer, meshmap: MeshMap) -> None:
     changed = meshmap.changed_submaps()
     removed = meshmap.removed_submaps()
@@ -67,40 +88,82 @@ def _log_meshmap_update(viz: Visualizer, meshmap: MeshMap) -> None:
         viz.log_canonical_mesh(meshmap.canonical_mesh())
 
 
+def _apply_backend_result(res, worldmap: GlobalMap, viz: Visualizer,
+                          calib: DepthCalibration, apply_calib: bool = True,
+                          meshmap: MeshMap | None = None,
+                          perf_metrics: dict[str, float] | None = None,
+                          log_prefix: str = "backend") -> DepthCalibration:
+    t = time.perf_counter()
+    worldmap.fuse(res.points, res.colors,
+                  origins=res.view_origins, view_idx=res.point_view_idx)
+    if perf_metrics is not None:
+        add_ms(perf_metrics, "worldmap_fuse_ms", t)
+    worldmap.set_correction_target(res.T_global_live)
+    if meshmap is not None and getattr(res, "view_depths", None) is not None:
+        t = time.perf_counter()
+        try:
+            meshmap.integrate_backend_result(res)
+            _log_meshmap_update(viz, meshmap)
+        except Exception as exc:
+            print(f"[mesh] TSDF integration skipped: {exc}")
+        if perf_metrics is not None:
+            add_ms(perf_metrics, "mesh_ms", t)
+    if apply_calib and res.calib.inlier_frac > 0.3:
+        calib = res.calib
+    if res.meters_per_unit is not None:
+        viz.meters_per_unit = res.meters_per_unit
+    # 주의: 여기서 vo.set_intrinsics()를 호출하면 안 된다. 실행 도중 K가
+    # 바뀌면 VO 병진/키프레임 3D의 스케일이 전환 시점 전후로 달라져,
+    # 기존 지도 위에 다른 크기의 공간이 겹쳐 그려진다 (8초 시점에 공간이
+    # 갑자기 커지던 버그). K는 시작 시 첫 프레임의 DA3 추정으로 고정한다.
+    t = time.perf_counter()
+    viz.log_global_map(worldmap.points, worldmap.colors)
+    if perf_metrics is not None:
+        add_ms(perf_metrics, "log_global_map_ms", t)
+    mpu = f" 1unit={res.meters_per_unit:.2f}m" if res.meters_per_unit else ""
+    print(f"[{log_prefix}] window={len(res.window_ids)}kf "
+          f"{res.runtime_s:.1f}s map={len(worldmap.points)}pts "
+          f"calib a={calib.a:.3f} b={calib.b:.3f} "
+          f"scale={res.T_global_live[0]:.3f}{mpu}")
+    return calib
+
+
+def _collect_backend_results(backend: ReconstructionBackend, out: list) -> int:
+    n_results = 0
+    while True:
+        try:
+            out.append(backend.results.get_nowait())
+            n_results += 1
+        except Exception:
+            return n_results
+
+
 def _drain_backend_results(backend: ReconstructionBackend, worldmap: GlobalMap,
                            viz: Visualizer, calib: DepthCalibration,
                            vo: VisualOdometry, frame_wh: tuple[int, int],
                            apply_calib: bool = True,
                            meshmap: MeshMap | None = None,
+                           perf_metrics: dict[str, float] | None = None,
                            ) -> DepthCalibration:
+    total_start = time.perf_counter()
+    n_results = 0
     while True:
         try:
             res = backend.results.get_nowait()
         except Exception:
+            if perf_metrics is not None:
+                add_ms(perf_metrics, "backend_drain_ms", total_start)
+                perf_metrics["backend_results"] = (
+                    perf_metrics.get("backend_results", 0.0) + n_results
+                )
             return calib
-        worldmap.fuse(res.points, res.colors,
-                      origins=res.view_origins, view_idx=res.point_view_idx)
-        worldmap.set_correction_target(res.T_global_live)
-        if meshmap is not None and getattr(res, "view_depths", None) is not None:
-            try:
-                meshmap.integrate_backend_result(res)
-                _log_meshmap_update(viz, meshmap)
-            except Exception as exc:
-                print(f"[mesh] TSDF integration skipped: {exc}")
-        if apply_calib and res.calib.inlier_frac > 0.3:
-            calib = res.calib
-        if res.meters_per_unit is not None:
-            viz.meters_per_unit = res.meters_per_unit
-        # 주의: 여기서 vo.set_intrinsics()를 호출하면 안 된다. 실행 도중 K가
-        # 바뀌면 VO 병진/키프레임 3D의 스케일이 전환 시점 전후로 달라져,
-        # 기존 지도 위에 다른 크기의 공간이 겹쳐 그려진다 (8초 시점에 공간이
-        # 갑자기 커지던 버그). K는 시작 시 첫 프레임의 DA3 추정으로 고정한다.
-        viz.log_global_map(worldmap.points, worldmap.colors)
-        mpu = f" 1unit={res.meters_per_unit:.2f}m" if res.meters_per_unit else ""
-        print(f"[backend] window={len(res.window_ids)}kf "
-              f"{res.runtime_s:.1f}s map={len(worldmap.points)}pts "
-              f"calib a={calib.a:.3f} b={calib.b:.3f} "
-              f"scale={res.T_global_live[0]:.3f}{mpu}")
+        n_results += 1
+        calib = _apply_backend_result(
+            res, worldmap, viz, calib,
+            apply_calib=apply_calib,
+            meshmap=meshmap,
+            perf_metrics=perf_metrics,
+        )
 
 
 def dynamic_mask(detections: list[Detection], shape: tuple[int, int],
@@ -124,10 +187,23 @@ def main() -> None:
     parser.add_argument("--source", default=None,
                         help="video file path or webcam index (overrides config)")
     parser.add_argument("--max-seconds", type=float, default=None)
+    parser.add_argument("--max-frames", type=int, default=None,
+                        help="process at most this many frames")
     parser.add_argument("--no-realtime", action="store_true",
                         help="process every frame instead of wall-clock pacing")
     parser.add_argument("--profile", action="store_true",
                         help="print per-stage timings every 10 frames")
+    parser.add_argument("--perf-log", default=None, metavar="CSV",
+                        help="write per-frame performance timings to CSV")
+    parser.add_argument("--stutter-threshold-ms", type=float, default=100.0,
+                        help="loop_total threshold for [stutter] logs")
+    parser.add_argument("--runtime-profile", choices=["quality", "realtime"],
+                        default=None,
+                        help="apply a runtime overlay such as realtime")
+    parser.add_argument("--no-viz", action="store_true",
+                        help="disable Rerun logging for performance upper-bound tests")
+    parser.add_argument("--no-backend", action="store_true",
+                        help="disable the reconstruction backend for upper-bound tests")
     parser.add_argument("--map", default=None, metavar="PATH",
                         help="세션 간 지도/객체 영속화 파일 (.npz). 있으면 불러와 "
                              "재위치추정 후 이어서 누적, 종료 시 저장")
@@ -136,6 +212,8 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = Config.load(args.config)
+    if cfg.runtime_profile:
+        apply_runtime_profile(cfg, cfg.runtime_profile)
     if args.source is not None:
         if args.source.lower() == "oak":
             cfg.capture.source_kind = "oak"
@@ -144,6 +222,10 @@ def main() -> None:
             cfg.source = int(args.source) if args.source.isdigit() else args.source
     if args.no_realtime:
         cfg.realtime = False
+    if args.runtime_profile:
+        apply_runtime_profile(cfg, args.runtime_profile)
+    if args.no_backend:
+        cfg.backend.enabled = False
 
     source = _source_from_config(cfg)
     source_has_metric_depth = bool(getattr(source, "has_metric_depth", False))
@@ -162,7 +244,20 @@ def main() -> None:
     if cfg.objects.appearance:
         from .appearance import AppearanceEmbedder
         embedder = AppearanceEmbedder(torch_device)
-    viz = Visualizer(memory_limit=cfg.viz.memory_limit)
+    if args.no_viz:
+        viz = NullVisualizer()
+    else:
+        viz = Visualizer(
+            memory_limit=cfg.viz.memory_limit,
+            frame_every=cfg.viz.frame_every,
+            depth_every=cfg.viz.depth_every,
+            objects_every=cfg.viz.objects_every,
+            trajectory_every=cfg.viz.trajectory_every,
+            trajectory_max_points=cfg.viz.trajectory_max_points,
+            global_map_every=cfg.viz.global_map_every,
+            global_map_max_points=cfg.viz.global_map_max_points,
+            jpeg_quality=cfg.viz.jpeg_quality,
+        )
     if source_has_metric_depth:
         viz.meters_per_unit = 1.0
     if getattr(source, "metadata", None):
@@ -178,12 +273,16 @@ def main() -> None:
     meshmap = MeshMap(cfg.mesh) if cfg.mesh.enabled else None
     if not cfg.realtime:
         cfg.backend.period_s = 0.0
-    backend = ReconstructionBackend(cfg.backend, cfg.depth.model,
-                                    torch_device, cfg.depth.process_res,
-                                    metric_model=cfg.depth.metric_model)
-    backend.start()
-    print("waiting for backend process...")
-    backend.wait_ready()
+    if cfg.backend.enabled:
+        backend = ReconstructionBackend(cfg.backend, cfg.depth.model,
+                                        torch_device, cfg.depth.process_res,
+                                        metric_model=cfg.depth.metric_model)
+        backend.start()
+        print("waiting for backend process...")
+        backend.wait_ready()
+    else:
+        backend = _NoopBackend()
+        print("backend disabled")
     calib = DepthCalibration()
     frame_scale = 1.0  # 키프레임 3D 기준의 프레임별 mono depth 스케일 보정
     # DA3의 프레임별 intrinsics 추정은 출렁임이 크다(fx 740~1015 관측).
@@ -210,11 +309,13 @@ def main() -> None:
             saved_mesh_state = load_mesh_state(mesh_state_path, cfg.mesh)
             print(f"loaded saved mesh: {len(saved_mesh_state.submaps)} submaps")
     dyn_classes = set(cfg.detect.dynamic_classes)
+    detect_every = max(1, int(cfg.detect.every_n_frames))
     sub = cfg.viz.point_subsample
     bw = cfg.depth.process_res  # 백엔드 입력 가로 해상도
     bh = int(H * bw / W)
     kf_counter = 0
     last_backend_keyframe_ts: float | None = None
+    deferred_backend_results = []
 
     # 모델 첫 호출은 커널 컴파일로 수 초가 걸린다 (YOLOE ~3s 실측). 실시간
     # 페이싱이 시작되기 전에 더미 프레임으로 전부 워밍업해 두지 않으면
@@ -227,21 +328,38 @@ def main() -> None:
     if embedder is not None:
         embedder.warmup()
 
+    perf_rec = PerfRecorder(args.perf_log, args.stutter_threshold_ms) if (
+        args.perf_log or args.profile
+    ) else None
+
     print(f"running on {cfg.source!r} ({W}x{H})")
     frame_count, t_start = 0, time.monotonic()
     t_loop_end = t_start
+    prev_loop_perf = time.perf_counter()
     try:
         for frame in source.frames():
+            frame_arrived = time.perf_counter()
+            metrics: dict[str, float] = {
+                "source_wait_load_ms": 1e3 * (frame_arrived - prev_loop_perf),
+            }
             if args.max_seconds and frame.ts > args.max_seconds:
                 break
+            if args.max_frames is not None and frame_count >= args.max_frames:
+                break
             viz.set_time(frame.ts)
-            t0 = time.perf_counter()
+            t0 = frame_arrived
             if frame.K is not None:
                 vo.set_intrinsics(frame.K)
-            detections = detector.track(frame.bgr)
+            if frame_count % detect_every == 0:
+                t = time.perf_counter()
+                detections = detector.track(frame.bgr)
+                add_ms(metrics, "yolo_ms", t)
+            else:
+                detections = []
             t1 = time.perf_counter()
             raw_depth = None
             has_metric_depth = frame.depth_m is not None
+            t = time.perf_counter()
             if has_metric_depth:
                 fallback = None
                 if cfg.depth.oak_fill_missing:
@@ -261,6 +379,7 @@ def main() -> None:
                 if depth_est is None:
                     raise RuntimeError("non-metric source requires live depth estimator")
                 raw_depth = depth_est.infer(frame.bgr)
+            add_ms(metrics, "depth_fuse_ms", t)
 
             if K_WARMUP and len(K_samples) < K_WARMUP:
                 if depth_est is None:
@@ -273,14 +392,35 @@ def main() -> None:
                           f"fx={vo.K[0, 0]:.0f} fy={vo.K[1, 1]:.0f}")
                 else:
                     # K 확정 전에는 VO/지도를 시작하지 않는다 (2D 패널만 갱신)
+                    t = time.perf_counter()
                     viz.log_frame(frame.bgr, calib.apply(raw_depth), detections)
+                    add_ms(metrics, "log_frame_ms", t)
                     frame_count += 1
+                    loop_end_perf = time.perf_counter()
+                    metrics["loop_total_ms"] = 1e3 * (loop_end_perf - t0)
+                    if perf_rec is not None:
+                        perf_rec.record({
+                            "frame": frame_count,
+                            "ts": frame.ts,
+                            "wall_s": time.monotonic() - t_start,
+                            "is_keyframe": 0,
+                            "backend_results": int(metrics.get("backend_results", 0)),
+                            "backend_results_deferred": int(metrics.get("backend_results_deferred", 0)),
+                            "map_points": len(worldmap.points),
+                            "stable_objects": 0,
+                            "observations": 0,
+                            "vo_lost": 0,
+                            "vo_inlier_ratio": 0.0,
+                            "vo_tracked": 0,
+                        }, metrics)
+                    prev_loop_perf = loop_end_perf
                     continue
             t2 = time.perf_counter()
             if has_metric_depth:
                 depth = raw_depth
             else:
                 depth = calib.apply(raw_depth) * frame_scale
+            t = time.perf_counter()
             gray = (frame.gray_track if frame.gray_track is not None
                     and frame.gray_track.shape == (H, W)
                     else cv2.cvtColor(frame.bgr, cv2.COLOR_BGR2GRAY))
@@ -339,6 +479,7 @@ def main() -> None:
             else:
                 imu_since_keyframe = imu_candidate
             prev_frame_ts_for_imu = frame.ts
+            add_ms(metrics, "vo_ms", t)
             t3 = time.perf_counter()
 
             # 프레임별 depth 스케일 보정: 키프레임에 고정된 3D 특징점의 예측
@@ -379,11 +520,22 @@ def main() -> None:
                 kf_counter += 1
                 last_backend_keyframe_ts = frame.ts
 
-            # 백엔드 결과 반영 (논블로킹)
-            new_calib = _drain_backend_results(backend, worldmap, viz, calib,
-                                               vo, (W, H),
-                                               apply_calib=not has_metric_depth,
-                                               meshmap=meshmap)
+            # 백엔드 결과 반영. realtime profile은 결과를 수거만 하고 종료/idle
+            # 시점에 적용해 worldmap.fuse tail latency가 live loop를 막지 않게 한다.
+            if cfg.backend.live_apply:
+                new_calib = _drain_backend_results(backend, worldmap, viz, calib,
+                                                   vo, (W, H),
+                                                   apply_calib=not has_metric_depth,
+                                                   meshmap=meshmap,
+                                                   perf_metrics=metrics)
+            else:
+                t = time.perf_counter()
+                n_deferred = _collect_backend_results(backend, deferred_backend_results)
+                add_ms(metrics, "backend_drain_ms", t)
+                metrics["backend_results_deferred"] = (
+                    metrics.get("backend_results_deferred", 0.0) + n_deferred
+                )
+                new_calib = calib
             if new_calib is not calib:
                 # 새 calib은 키프레임 시점의 frame_scale까지 흡수해 피팅된 값.
                 # frame_scale을 리셋하지 않으면 같은 보정이 이중 적용되어
@@ -393,9 +545,15 @@ def main() -> None:
             worldmap.step_correction()
 
             T_wc_global = worldmap.to_global_pose(pose.T_wc)
+            t = time.perf_counter()
             viz.log_frame(frame.bgr, depth, detections, vo.K)
+            add_ms(metrics, "log_frame_ms", t)
+            t = time.perf_counter()
             viz.log_camera(T_wc_global, vo.K, W, H)
+            add_ms(metrics, "log_camera_ms", t)
+            t = time.perf_counter()
             viz.log_calibration(calib.a, calib.b, frame_scale)
+            add_ms(metrics, "log_calibration_ms", t)
             if pose.is_keyframe:
                 # 키프레임마다 현재 프레임 포인트클라우드 미리보기를 *전역 좌표*로
                 # 변환해 로깅 (카메라 좌표로 두면 다음 키프레임까지 카메라를 따라
@@ -409,13 +567,25 @@ def main() -> None:
                 pts_global = (pts.reshape(-1, 3) @ T_wc_global[:3, :3].T
                               + T_wc_global[:3, 3])
                 cols = frame.bgr[::sub, ::sub, ::-1]
+                t = time.perf_counter()
                 viz.log_live_points(pts_global, cols.reshape(-1, 3))
+                add_ms(metrics, "log_live_points_ms", t)
+            t = time.perf_counter()
             observations = localize_objects(detections, depth, vo.K, pose.T_wc,
                                             frame.depth_conf)
             for obs in observations:
                 obs.position = worldmap.to_global_points(obs.position[None])[0]
-            if embedder is not None and observations:
+            add_ms(metrics, "localize_objects_ms", t)
+            do_embed = (
+                embedder is not None and observations
+                and (not cfg.objects.appearance_keyframes_only or pose.is_keyframe)
+                and frame_count % max(1, int(cfg.objects.appearance_every_n_frames)) == 0
+            )
+            if do_embed:
+                t = time.perf_counter()
                 embedder.embed(frame.bgr, observations)
+                add_ms(metrics, "appearance_embed_ms", t)
+            t = time.perf_counter()
             visible = registry.update(observations, frame.ts)
 
             # 부재 증거: 보여야 하는 위치인데 안 보이는 노드는 신뢰를 깎는다
@@ -425,8 +595,10 @@ def main() -> None:
             registry.decay_absent(visible, observations, positions_live,
                                   pose.T_wc, vo.K, depth,
                                   cfg.objects.absence_limit)
+            add_ms(metrics, "registry_ms", t)
 
             # 이전 세션 지도가 있으면 임베딩 매칭으로 재위치추정을 시도
+            t = time.perf_counter()
             if saved_state is not None and not reloc_done and frame_count % 10 == 0:
                 from .persistence import (icp_refine, merge_into_session,
                                           merge_mesh_into_session, relocalize)
@@ -447,15 +619,44 @@ def main() -> None:
                           f"rms={rms:.3f}, scale={T[0]:.3f} "
                           f"mesh_submaps={n_mesh} → 병합 완료")
                     reloc_done = True
+            add_ms(metrics, "relocalize_ms", t)
 
             objects = registry.stable_objects(frame.ts)
+            t = time.perf_counter()
             viz.log_objects(objects, build_graph(objects, cfg.graph), visible)
+            add_ms(metrics, "log_objects_ms", t)
             t4 = time.perf_counter()
             frame_count += 1
             t_loop_end = time.monotonic()
+            loop_end_perf = time.perf_counter()
+            metrics["loop_total_ms"] = 1e3 * (loop_end_perf - t0)
+            if perf_rec is not None:
+                perf_rec.record({
+                    "frame": frame_count,
+                    "ts": frame.ts,
+                    "wall_s": t_loop_end - t_start,
+                    "is_keyframe": int(pose.is_keyframe),
+                    "backend_results": int(metrics.get("backend_results", 0)),
+                    "backend_results_deferred": int(metrics.get("backend_results_deferred", 0)),
+                    "map_points": len(worldmap.points),
+                    "stable_objects": len(objects),
+                    "observations": len(observations),
+                    "vo_lost": int(pose.lost),
+                    "vo_inlier_ratio": pose.inlier_ratio,
+                    "vo_tracked": pose.n_tracked,
+                }, metrics)
+            prev_loop_perf = loop_end_perf
             if args.profile and frame_count % 10 == 0:
-                print(f"  [prof] yolo={1e3 * (t1 - t0):.0f} depth={1e3 * (t2 - t1):.0f} "
-                      f"vo={1e3 * (t3 - t2):.0f} viz+rest={1e3 * (t4 - t3):.0f} ms")
+                print(
+                    "  [prof] "
+                    f"loop={metrics.get('loop_total_ms', 0):.0f} "
+                    f"yolo={metrics.get('yolo_ms', 0):.0f} "
+                    f"depth={metrics.get('depth_fuse_ms', 0):.0f} "
+                    f"vo={metrics.get('vo_ms', 0):.0f} "
+                    f"drain={metrics.get('backend_drain_ms', 0):.0f} "
+                    f"embed={metrics.get('appearance_embed_ms', 0):.0f} "
+                    f"viz={metrics.get('log_frame_ms', 0) + metrics.get('log_camera_ms', 0) + metrics.get('log_objects_ms', 0):.0f} ms"
+                )
             if frame_count % 30 == 0:
                 fps = frame_count / (time.monotonic() - t_start)
                 p = pose.T_wc[:3, 3]
@@ -466,6 +667,18 @@ def main() -> None:
                       f"{' LOST' if pose.lost else ''}")
         # 영상 종료 후 진행 중인 백엔드 윈도 결과를 기다려 지도에 반영
         print("video ended; draining backend...")
+        if deferred_backend_results:
+            print(f"applying {len(deferred_backend_results)} deferred backend results...")
+            for res in deferred_backend_results:
+                calib = _apply_backend_result(
+                    res, worldmap, viz, calib,
+                    apply_calib=not source_has_metric_depth,
+                    meshmap=meshmap,
+                    log_prefix="backend/deferred",
+                )
+                for _ in range(10):
+                    worldmap.step_correction()
+            deferred_backend_results.clear()
         idle_since = time.monotonic()
         while time.monotonic() - idle_since < 8.0:
             before = len(worldmap.points)
@@ -515,6 +728,9 @@ def main() -> None:
                 print(f"  {o.label:>16} pos=({o.position[0]:+.2f},"
                       f"{o.position[1]:+.2f},{o.position[2]:+.2f}) "
                       f"obs={o.n_obs} last_seen={o.last_seen:.1f}s")
+        if perf_rec is not None:
+            print(perf_rec.summary())
+            perf_rec.close()
 
 
 if __name__ == "__main__":
