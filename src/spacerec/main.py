@@ -52,6 +52,20 @@ def _source_from_config(cfg: Config):
                        realtime=cfg.realtime)
 
 
+def _log_meshmap_update(viz: Visualizer, meshmap: MeshMap) -> None:
+    changed = meshmap.changed_submaps()
+    removed = meshmap.removed_submaps()
+    mode = getattr(meshmap.cfg, "render_mode", "canonical").lower()
+    if removed:
+        viz.clear_mesh_submaps(removed)
+    if mode in {"raw", "both"}:
+        viz.log_mesh_submaps(changed)
+    elif changed:
+        viz.clear_mesh_submaps([submap.submap_id for submap in changed])
+    if mode in {"canonical", "both"} and (changed or removed):
+        viz.log_canonical_mesh(meshmap.canonical_mesh())
+
+
 def _drain_backend_results(backend: ReconstructionBackend, worldmap: GlobalMap,
                            viz: Visualizer, calib: DepthCalibration,
                            vo: VisualOdometry, frame_wh: tuple[int, int],
@@ -69,7 +83,7 @@ def _drain_backend_results(backend: ReconstructionBackend, worldmap: GlobalMap,
         if meshmap is not None and getattr(res, "view_depths", None) is not None:
             try:
                 meshmap.integrate_backend_result(res)
-                viz.log_mesh_submaps(meshmap.changed_submaps())
+                _log_meshmap_update(viz, meshmap)
             except Exception as exc:
                 print(f"[mesh] TSDF integration skipped: {exc}")
         if apply_calib and res.calib.inlier_frac > 0.3:
@@ -407,7 +421,7 @@ def main() -> None:
                                        registry, frame.ts)
                     if meshmap is not None and saved_mesh_state is not None:
                         n_mesh = merge_mesh_into_session(saved_mesh_state, T, meshmap)
-                        viz.log_mesh_submaps(meshmap.changed_submaps())
+                        _log_meshmap_update(viz, meshmap)
                     else:
                         n_mesh = 0
                     viz.log_global_map(worldmap.points, worldmap.colors)

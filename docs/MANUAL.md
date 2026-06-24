@@ -134,16 +134,21 @@ OAK-D-Lite 입력을 디렉터리로 녹화해 둔 세션도 입력으로 사용
 
 기본 지도(`world/points`)는 여전히 evidence-weighted point cloud입니다. Mesh는
 이 지도와 병존하는 표시/export 레이어이며, backend window를 TSDF submap으로
-통합한 뒤 triangle mesh를 추출합니다.
+통합한 뒤 triangle mesh를 추출합니다. 기본 `mesh.render_mode: canonical`에서는
+raw submap을 그대로 concat하지 않고, 같은 공간 cell의 겹치는 surface 중 support,
+depth residual proxy, normal agreement, recency score가 좋은 face만 골라 기본 Rerun
+표시와 export에 사용합니다.
 
 - recorded OAK replay처럼 RGB-aligned metric depth가 있는 입력이 가장 안정적입니다.
 - mesh는 source of truth가 아니라 RGB-D keyframe evidence에서 재생성 가능한
   캐시입니다. pose/Sim3 보정은 submap anchor transform 또는 affected submap
   rebuild로 처리합니다.
 - `benchmarks/mesh_smoke.py`는 모델을 로드하지 않고 recorded depth와 VO pose만으로
-  `.ply`를 생성하고 다시 읽어 vertices/faces를 검증합니다.
-- `--mesh-out <path.ply>`를 주면 main pipeline 종료 시 현재 mesh submap들을 global
-  좌표로 합친 `.ply`를 저장합니다.
+  `.ply`를 생성하고 다시 읽어 vertices/faces를 검증합니다. 출력에는 raw submap
+  concat 크기와 canonical export 크기가 함께 표시됩니다.
+- `--mesh-out <path.ply>`를 주면 main pipeline 종료 시 canonical mesh를 global
+  좌표 `.ply`로 저장합니다. 원본 submap concat을 export하려면 `mesh.render_mode: raw`,
+  Rerun에서 canonical과 raw를 함께 보려면 `both`를 사용합니다.
 - `--map maps/room.npz`로 world state를 저장하면 mesh sidecar
   `maps/room.mesh.npz`도 함께 저장됩니다. 이후 relocalization에 성공하면 이전
   mesh submap anchor에 같은 Sim3 보정을 적용해 현재 meshmap에 병합합니다.
@@ -335,6 +340,14 @@ mesh:
   depth_trunc_m: 8.0              # TSDF에 넣을 최대 depth
   min_surface_observations: 2      # 단발 bad depth로 생긴 표면 제거
   max_active_submaps: 32          # live mesh submap cap
+  render_mode: canonical          # canonical(기본), raw(디버그), both
+  canonical_cell_size: 0.10       # 겹친 surface를 비교할 world-space cell
+  canonical_distance_m: 0.10      # duplicate layer로 볼 근접 거리 기준
+  canonical_normal_cos: 0.85      # 이 cos 이상이면 같은 방향 surface 후보로 비교
+  canonical_min_support: 1        # canonical 후보 최소 관측 support
+  canonical_support_weight: 1.0   # support가 recency보다 우선되도록 크게 유지
+  canonical_residual_weight: 0.25 # depth residual proxy가 큰 submap 감점
+  canonical_recency_weight: 0.10  # 최신성은 tie-break 보너스에 가깝게 사용
   export_on_exit: false           # true면 artifacts/mesh/latest.ply 저장
 
 objects:
@@ -358,6 +371,7 @@ graph:
 | 지도가 듬성듬성하다 | `backend.voxel_size: 0.02`, `viz.point_subsample: 2` |
 | mesh가 너무 무겁다 | `mesh.voxel_size: 0.07`, `mesh.max_active_submaps: 16`, smoke `--frames` 축소 |
 | mesh가 거칠다 | recorded OAK replay 사용, `mesh.voxel_size: 0.03`, 더 느린 카메라 이동 |
+| 같은 벽 mesh가 여러 겹으로 보인다 | 기본 `mesh.render_mode: canonical` 유지, raw 확인은 `both`, 과삭제 시 `canonical_cell_size`/`canonical_distance_m` 축소 |
 | 카메라 추적이 자주 끊긴다 | 더 천천히 촬영, `vo.keyframe_interval_s: 0.3` |
 | 빠른 회전 때 backend mesh/point cloud가 흐릿하다 | OAK/replay에서 `imu.enabled: true`로 A/B 측정 후 개선될 때만 사용 |
 | 같은 물체가 여러 노드로 등록된다 | `objects.merge_radius: 0.8`, `objects.app_gate: 0.3` |

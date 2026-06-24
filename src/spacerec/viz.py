@@ -94,6 +94,13 @@ class Visualizer:
     def log_global_map(self, points: np.ndarray, colors: np.ndarray) -> None:
         rr.log("world/points", rr.Points3D(points, colors=colors, radii=0.006))
 
+    def clear_mesh_submaps(self, submap_ids: list[int]) -> None:
+        for submap_id in submap_ids:
+            rr.log(f"world/mesh/submap_{submap_id}", rr.Clear(recursive=True))
+
+    def log_canonical_mesh(self, mesh) -> None:
+        self._log_mesh("world/mesh/canonical", mesh)
+
     def log_mesh_submaps(self, submaps: list) -> None:
         for submap in submaps:
             mesh = submap.mesh
@@ -102,20 +109,23 @@ class Visualizer:
                 translation=submap.anchor_pose[:3, 3],
                 mat3x3=(submap.anchor_scale * submap.anchor_pose[:3, :3]),
             ))
-            if mesh.n_vertices == 0 or mesh.n_faces == 0:
-                rr.log(ent, rr.Clear(recursive=True))
-                continue
-            kwargs = {
-                "vertex_positions": mesh.vertices,
-                "triangle_indices": mesh.faces,
-                "vertex_colors": np.column_stack([
-                    mesh.colors,
-                    np.full(len(mesh.colors), 220, np.uint8),
-                ]),
-            }
-            if len(mesh.normals) == len(mesh.vertices):
-                kwargs["vertex_normals"] = mesh.normals
-            rr.log(ent, rr.Mesh3D(**kwargs))
+            self._log_mesh(ent, mesh)
+
+    def _log_mesh(self, ent: str, mesh) -> None:
+        if mesh.n_vertices == 0 or mesh.n_faces == 0:
+            rr.log(ent, rr.Clear(recursive=True))
+            return
+        kwargs = {
+            "vertex_positions": mesh.vertices,
+            "triangle_indices": mesh.faces,
+            "vertex_colors": np.column_stack([
+                mesh.colors,
+                np.full(len(mesh.colors), 220, np.uint8),
+            ]),
+        }
+        if len(mesh.normals) == len(mesh.vertices):
+            kwargs["vertex_normals"] = mesh.normals
+        rr.log(ent, rr.Mesh3D(**kwargs))
 
     def log_objects(self, objects: list, edges: list, visible: set[int]) -> None:
         """월드 오브젝트 노드(영속) + 관계 엣지 그래프.

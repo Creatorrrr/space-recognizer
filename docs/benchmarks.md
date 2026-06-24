@@ -104,3 +104,25 @@
 - accelerometer translation 적분은 범위 밖이다. OAK-D-Lite급 MEMS accel bias를 이중
   적분하면 짧은 시간에도 position drift가 커지므로, 현재 IMU 사용은 gyro rotation
   prior와 backend keyframe blur gating으로 제한한다.
+
+## Canonical TSDF mesh smoke (2026-06-24)
+
+명령:
+
+```bash
+.venv/bin/python benchmarks/mesh_smoke.py \
+  sources/session_20260624_054320_194430108151D05A00 --frames 120
+```
+
+해석:
+- `mesh.render_mode: canonical`이 기본이므로 `.ply` export와 기본 Rerun mesh는
+  raw submap concat이 아니라 canonical surface selection 결과다.
+- smoke 출력은 `raw_vertices/raw_faces`와 `vertices/faces`를 함께 표시한다.
+  raw 값은 backend-window submap을 그대로 합친 크기이고, `vertices/faces`는
+  canonical export 크기다.
+- canonical selection은 같은 world-space cell과 normal agreement group 안에서
+  support score를 우선하고, depth residual proxy를 감점하며, recency를 약한 tie-break
+  보너스로 사용한다. 최신 single noisy submap이 기존 high-support surface를 무조건
+  덮지 않도록 하는 것이 의도다.
+- 이 단계는 render/export-time 정리 계층이다. full spatial-block TSDF, dirty-block
+  rebuild, free-space 기반 mesh reintegration은 별도 장기 과제로 남아 있다.

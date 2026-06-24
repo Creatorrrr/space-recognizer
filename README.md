@@ -4,7 +4,8 @@
 
 - 실시간으로 물체를 검출·추적하고 3D 위치를 추정하며 (YOLOE 오픈 보캐뷸러리 + DA3-Small depth)
 - 5초 주기 멀티뷰 재구성으로 정적 공간의 3D 지도를 점점 완성하고 (DA3 any-view)
-- TSDF submap으로 정적 표면 mesh를 생성/export하고 (recorded OAK metric depth 권장)
+- TSDF submap에서 정적 표면 mesh를 만들고 기본 표시/export는 canonical mesh로 정리하며
+  (recorded OAK metric depth 권장)
 - 별도 3D 뷰어(Rerun)에 **오브젝트 노드 + 관계 그래프**를 그리고,
 - 화면 밖으로 나가거나 가려진 물체의 위치를 **계속 기억**해서 표시합니다.
 
@@ -63,6 +64,11 @@ YOLOE-26s-seg + MobileCLIP2 텍스트 인코더 0.3GB, DINOv2-small)가 자동
   sidecar `maps/room.mesh.npz`도 함께 저장됩니다. 다음 세션에서 relocalization에
   성공하면 이전 mesh submap anchor에 같은 Sim3 보정을 적용해 현재 meshmap에
   병합합니다.
+- mesh export는 기본적으로 `mesh.render_mode: canonical`을 사용합니다. 같은 벽이
+  여러 backend window submap에 조금씩 다른 위치로 생기면 support, depth residual
+  proxy, normal agreement, recency score로 선택된 canonical surface만 `.ply`와
+  기본 Rerun mesh에 남깁니다. 원본 submap을 export하려면 `mesh.render_mode: raw`,
+  Rerun에서 canonical과 raw를 함께 보려면 `both`를 사용하세요.
 
 ## Rerun 뷰어 보는 법
 
@@ -72,7 +78,8 @@ YOLOE-26s-seg + MobileCLIP2 텍스트 인코더 0.3GB, DINOv2-small)가 자동
   캘리브레이션이 동작 중인지 확인용
 - **우측 3D World**:
   - 컬러 포인트클라우드 = 누적된 정적 공간 지도
-  - mesh/submap = TSDF로 추출된 정적 표면 mesh (mesh enabled 시)
+  - mesh/canonical = TSDF submap들을 confidence/recency score로 정리한 기본 mesh
+    (`mesh.render_mode: raw|both`에서는 원본 mesh/submap도 확인 가능)
   - 파란 선 = 카메라 이동 궤적, 피라미드 = 현재 카메라
   - 구 + 라벨 = 기억된 오브젝트 (반투명 = 지금 안 보이는 물체의 기억된 위치)
   - 회색 선 = 근접 관계, 주황 선 = 위/아래 관계 (라벨에 거리, metric 앵커
@@ -101,7 +108,9 @@ YOLOE-26s-seg + MobileCLIP2 텍스트 인코더 0.3GB, DINOv2-small)가 자동
     단발성 불량 관측이 좋은 지도를 바꾸려면 반복 증거가 필요 (양방향 견고)
   MeshMap: backend window를 TSDF submap으로 통합하고 triangle mesh를 추출.
     mesh는 RGB-D keyframe evidence에서 재생성 가능한 파생 캐시로 취급하며,
-    pose/Sim3 보정은 submap anchor transform 또는 affected submap rebuild로 처리
+    pose/Sim3 보정은 submap anchor transform 또는 affected submap rebuild로 처리.
+    기본 표시/export는 raw submap concat이 아니라 support/residual/normal/recency
+    기반 canonical surface 선택을 거쳐 같은 벽의 stale duplicate layer를 줄임
   ObjectRegistry: 영속 위치(EMA), 재등장 re-ID 병합, dynamic 판정,
     부재 증거(시야 안·비가림인데 미검출 누적 → 노드 제거)
   SceneGraph: 거리 기반 근접 엣지 + 위상 관계(위/아래/옆)
@@ -132,7 +141,10 @@ DA3-small pose 헤드의 병진 과소추정, 커뮤니티 래퍼 결함 등)이
   루프 클로저는 향후 과제)
 - 대형 가구는 카메라가 궤도를 돌 때 mask 중심이 이동해 dynamic으로 오판될 수 있음.
 - 동적 물체의 시간별 궤적은 기록·표시되지만(`world/objects/dyn_traj`) 검증은 후순위.
-- mesh는 현재 TSDF submap 기반의 표시/export 레이어입니다. object localization과
+- mesh는 현재 TSDF submap 기반의 표시/export 레이어입니다. 기본 `canonical` 모드는
+  같은 공간 cell에서 support가 높고 최신성이 좋은 surface를 골라 stale duplicate
+  layer를 숨깁니다. raw submap evidence는 디버그/저장용으로 남지만, full spatial-block
+  TSDF와 dirty-block reintegration은 아직 다음 단계입니다. object localization과
   relocalization의 기준 표현은 기존 point cloud이고, DA3 video 입력에서는 metric
   scale drift가 남을 수 있어 recorded OAK metric depth가 더 안정적입니다.
 - IMU는 translation을 적분하지 않습니다. 저가 MEMS accel의 bias를 이중 적분하면

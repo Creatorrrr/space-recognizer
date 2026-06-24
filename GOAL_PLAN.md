@@ -1,72 +1,63 @@
-# IMU-Aided Visual Odometry And Reconstruction Goal
+# Canonical Mesh Consolidation Goal
 
 ## Goal Summary
-- Final outcome: `space-recognizer` uses OAK-D-Lite IMU data to improve 3D reconstruction quality by feeding gyro-derived rotation priors into the existing LK + PnP visual odometry path, while preserving the current point-cloud/object/backend pipeline.
-- Scope: `/Users/chasoik/Projects/space-recognizer`, especially `src/spacerec/imu.py`, `src/spacerec/capture.py`, `src/spacerec/oak.py`, `src/spacerec/replay.py`, `src/spacerec/vo.py`, `src/spacerec/main.py`, `src/spacerec/config.py`, tests, benchmarks, and docs.
-- Non-goals: full VIO/factor-graph SLAM, accelerometer double-integration for translation, replacing DA3/backend reconstruction, broad recorder-app rewrites, unrelated dirty-worktree cleanup, destructive git operations, or self-directed target increases.
+- Final outcome: OAK-D-Lite replay and live mesh output should not keep several stale copies of the same wall or surface in the default rendered/exported mesh. The default output must expose a confidence/recency-scored canonical mesh, while raw submaps remain available for debugging and future reintegration work.
+- Scope: `/Users/chasoik/Projects/space-recognizer`, especially `src/spacerec/mesh.py`, `src/spacerec/viz.py`, `src/spacerec/main.py`, `src/spacerec/config.py`, `tests/test_mesh.py`, tests around config/persistence, and mesh docs/benchmarks.
+- Non-goals: a full spatial-block TSDF rewrite, a full de-integration TSDF implementation, changing object detection behavior, changing VO/IMU behavior, destructive cleanup of unrelated files, or self-directed target increases.
 
 ## Baseline And Assumptions
 - Current baseline:
-  - `Frame.imu` carries at most a latest accel/gyro sample for diagnostics.
-  - `VisualOdometry.process(gray, depth, ts, exclude_mask)` ignores IMU and uses LK optical flow plus `solvePnPRansac`.
-  - `ReconstructionBackend` consumes visual VO poses through `BackendKeyframe.T_wc_live`.
-  - Recorded OAK sessions contain about 10 IMU events per RGB frame interval at the default 100 Hz IMU / 10 FPS RGB cadence.
-  - Baseline replay smoke examples:
-    - `sources/session_20260624_054320_194430108151D05A00`: `lost=0`, `avg_tracked=200.0`, `avg_inlier=0.92`.
-    - `sources/session_20260624_055321_194430108151D05A00`: `lost=1`, `avg_tracked=50.8`, `avg_inlier=0.79`.
+  - `MeshMap.integrate_views()` creates a new `MeshSubmap` for each backend window when no explicit `submap_id` is given.
+  - `MeshMap.combined_mesh()` concatenates every active submap, so overlapping windows can export several slightly offset copies of the same wall.
+  - `Visualizer.log_mesh_submaps()` logs raw submaps under `world/mesh/submap_<id>` and does not clear deleted/superseded submaps unless an empty submap is logged.
+  - `MeshCfg.max_active_submaps` is only a FIFO cap, not a confidence/latest canonicalization rule.
 - Unknowns to verify:
-  - Live OAK RGB/depth/IMU timestamp-domain alignment.
-  - Availability and direction of IMU-to-RGB-camera extrinsics in live DepthAI calibration and recorded metadata.
-  - Whether gyro priors improve high-rotation replay segments without regressing stable segments.
+  - How much canonical consolidation reduces duplicates on the recorded OAK sessions without over-deleting valid surfaces.
+  - Whether the default Rerun view should show only canonical mesh or both canonical/raw during debugging.
 - Assumptions:
-  - Use DepthAI calibration APIs such as `getImuToCameraExtrinsics(CAM_A)` for live devices when available.
-  - Use recorded metadata `imuExtrinsics` plus camera extrinsics as a replay fallback.
-  - Use gyro only for rotation priors and gating. Use accelerometer only for optional stationary gravity diagnostics, not translation integration.
-  - Keep every new IMU-assisted behavior behind config flags and preserve visual-only behavior when disabled.
+  - Latest evidence is useful as a tie-breaker but must not override stronger support from older observations by itself.
+  - A render/export-time canonicalization layer is the safest short-term fix and should not discard raw evidence needed for future spatial-block TSDF work.
+  - Existing save/load format should remain compatible.
 
 ## Checkpoint Plan
 | Step | Work | Stage Target | Verification | Done When |
 |---|---|---|---|---|
-| 1 | Review and patch this plan for the current IMU goal. | Plan is concrete, bounded, and verifiable. | Inspect `GOAL_PLAN.md`, `git status`, current IMU/VO/replay source, and recorded session cadence. | Old mesh plan is replaced with this IMU plan and progress log begins. |
-| 2 | Add IMU core data model and pure math utilities. | `ImuSample`, gyro integration, bias estimation, gravity direction, and camera-frame conversion exist without touching production VO behavior. | New `tests/test_imu.py` with red/green TDD. | Constant/nonuniform gyro, bias, gravity, and rotation-frame tests pass. |
-| 3 | Preserve frame-interval IMU samples in live and replay frame contracts. | `Frame.imu_samples` carries all samples in the previous-frame-to-current-frame interval while legacy `Frame.imu` remains available. | Replay unit tests and a recorded-session cadence check. | Recorded sessions expose a median of about 10 IMU samples per RGB interval; existing replay tests still pass. |
-| 4 | Load and validate IMU-to-camera extrinsics and timestamp metadata. | Live OAK metadata and recorded replay metadata expose a usable `R_cam_imu` or an explicit unavailable state. | Unit tests using recorded metadata and focused diagnostic output. | Extrinsics parsing is covered, and missing calibration safely disables IMU priors instead of guessing. |
-| 5 | Add gyro-aided LK initial-flow and PnP prior to `VisualOdometry`. | Optional `R_delta_prev`, `R_since_keyframe`, and `omega_norm` inputs improve rotation tracking while falling back to visual-only when unsafe. | Synthetic VO tests and existing VO regression tests. | Rotation synthetic test improves with IMU prior; lateral translation and visual-only paths do not regress. |
-| 6 | Wire IMU priors through `main.py` and replay smoke/benchmark. | Main pipeline computes gyro rotation windows and passes priors to VO when enabled; benchmark compares IMU off/on. | New or extended IMU replay smoke. | Off/on benchmark reports `lost`, `avg_tracked`, `avg_inlier`, keyframes, and prior/fallback counts. |
-| 7 | Add gyro-based keyframe blur gating. | High-angular-rate frames can be excluded or delayed from backend keyframes with starvation protection. | Unit tests and replay smoke. | Blurry frames are not promoted to backend keyframes unless starvation fallback is triggered. |
-| 8 | Update docs/config and run final verification. | README/MANUAL/config describe IMU modes, limits, benchmark commands, and safe defaults. | Full tests, replay smoke, IMU benchmark, diff check, independent verification or strongest substitute. | Every final criterion is proven from current-state evidence. |
+| 1 | Review and patch this plan for the current canonical mesh goal. | Plan is concrete, bounded, and verifiable. | Inspect `GOAL_PLAN.md`, `git status`, mesh/viz/config/test source, and current mesh smoke commands. | Stale non-mesh plan is replaced and progress log begins. |
+| 2 | Add tests that reproduce duplicate stale wall surfaces and config coverage. | Synthetic duplicate-plane submaps show raw combined output has multiple layers while canonical output keeps one layer. New config options load with safe defaults. | Focused pytest on `tests/test_mesh.py` and `tests/test_config.py`. | Duplicate reproduction and new option tests are in place. |
+| 3 | Implement canonical mesh consolidation in `MeshMap`. | `canonical_mesh()` or equivalent scores overlapping face candidates by support, residual proxy, normal agreement, and recency, preserving high-confidence older surfaces over low-confidence newer noise. | Synthetic tests for duplicate removal, noisy latest pass, save/load/export compatibility. | Default export can return canonical mesh and tests prove duplicate planes collapse to one layer. |
+| 4 | Track and clear removed/superseded submaps in visualization. | Default visualization logs canonical mesh, raw submaps remain optional/debug, and removed/superseded raw entities can be cleared. | Unit-level checks where practical plus focused source review. | Rerun default path no longer accumulates stale duplicate submap entities. |
+| 5 | Update docs/config/benchmarks as needed. | Users can choose canonical/raw/both modes and understand limitations versus future spatial-block TSDF. | Docs grep/source review and config load test. | README/MANUAL/config describe canonical mesh behavior and options. |
+| 6 | Run final verification and repair failures. | Related and full tests pass; recorded OAK mesh smoke still exports a readable mesh. | `git diff --check`, focused tests, full pytest, `benchmarks/mesh_smoke.py` on a recorded session. | Every final completion criterion is proven from current-state evidence. |
 
 ## Final Completion Criteria
-- `.venv/bin/python -m pytest tests/ -q` passes.
-- IMU pure utility tests prove gyro integration, bias estimation, gravity direction, and camera-frame conversion.
-- `Frame.imu_samples` is populated for recorded OAK replay without breaking legacy `Frame.imu`.
-- Live/replay extrinsics handling never silently guesses a camera/IMU transform when unavailable.
-- Visual-only VO remains available and compatible when IMU config flags are disabled.
-- Gyro-assisted VO has synthetic test coverage showing improved pure-rotation tracking and no regression for existing lateral translation.
-- An IMU off/on replay benchmark runs on at least `sources/session_20260624_054320_194430108151D05A00` and `sources/session_20260624_055321_194430108151D05A00`, reporting comparable metrics.
-- On the difficult recorded session, IMU-assisted mode shows either fewer `lost` frames or improved `avg_tracked`/`avg_inlier` without a material regression on the stable session. If the data does not support improvement, the implementation must keep IMU priors off by default and document the evidence.
-- Existing replay/backend/object/mesh smoke paths are not intentionally broken.
-- Docs explain IMU mode, limits, benchmark command, and why accelerometer translation integration is out of scope.
+- `GOAL_PLAN.md` matches this canonical mesh goal and includes progress evidence.
+- Synthetic duplicate-wall tests prove raw submaps may contain several layers but the default canonical/export mesh keeps one selected surface layer.
+- The scoring rule uses confidence/support evidence and recency; latest-only replacement is not the sole criterion.
+- A high-support older surface is not blindly replaced by a single low-support newer noisy pass.
+- Existing mesh TSDF generation, support filtering, Sim3 anchor correction, save/load, persistence merge, and export tests still pass.
+- Default exported mesh uses canonical output unless explicitly configured otherwise.
+- Default Rerun mesh display avoids stale duplicate raw submap accumulation; raw submaps remain inspectable via config/debug mode.
+- Recorded OAK mesh smoke creates a readable PLY and does not regress to an empty mesh.
+- Docs/config explain canonical mesh mode, raw debug mode, scoring limitations, and that full spatial-block TSDF/dirty-block rebuild is future work.
 - Existing unrelated dirty worktree changes and untracked artifacts are preserved.
 
 ## Independent Verification Policy
 - Independent final verification is required before marking the goal complete.
 - Preferred verification: a separate subagent or clean worktree/fresh checkout reruns final criteria and reviews the diff.
-- If unavailable, record why and run the strongest substitute: `git status`, `git diff --check`, full tests, focused IMU tests, replay smoke, IMU off/on benchmark, docs check, and focused diff review.
-- Final report must include exact commands, pass/fail results, benchmark metrics, generated artifact paths if any, and unresolved risks.
+- If unavailable, record why and run the strongest substitute: `git status`, `git diff --check`, full tests, focused mesh/config/persistence tests, recorded mesh smoke, artifact read-back, and focused diff review.
+- Final report must include exact commands, pass/fail results, generated artifact paths if any, raw vs canonical behavior summary, and unresolved risks.
 
 ## Self-Directed Target Increase Policy
 - User opt-in: no.
 - After mandatory targets pass, stop without raising performance or quality targets.
-- Do not expand scope into full VIO, new SLAM stacks, broad refactors, or unrequested performance targets.
+- Do not expand scope into full spatial-block TSDF, full VIO/SLAM changes, broad refactors, or unrequested performance targets.
 
 ## Stop And Ask Conditions
-- Live or recorded IMU calibration is unavailable and any fallback would require guessing axis/sign conventions.
-- IMU priors repeatedly worsen replay metrics and a design change beyond the stated approach is needed.
+- Correctness requires deleting raw evidence or breaking saved mesh compatibility.
 - Required validation needs physical OAK hardware that is not connected.
 - Required changes would overwrite unrelated user work.
 - Destructive commands, credentials, external services, or large new dependencies are required.
-- Evidence shows the target is infeasible with the current recordings or repo constraints.
+- Evidence shows render/export-time canonicalization cannot satisfy the duplicate-wall requirement and a full spatial-block TSDF rewrite is required.
 
 ## Progress Log Rules
 - After each checkpoint, log current step, changed files, verification command/result, remaining work, and blockers.
@@ -75,11 +66,9 @@
 ## Progress Log
 | Step | Status | Changed Files | Verification Result | Remaining / Blockers |
 |---|---|---|---|---|
-| 1 | Done | `GOAL_PLAN.md` | Stale mesh goal detected and replaced with this IMU-aided VO/reconstruction plan. Baseline: `pytest tests/test_vo.py tests/test_replay.py tests/test_config.py -q` -> 12 passed; `replay_smoke.py ... --frames 120` -> stable `lost=0 avg_tracked=200.0 avg_inlier=0.92`, difficult `lost=1 avg_tracked=50.8 avg_inlier=0.79`. | None. |
-| 2 | Done | `src/spacerec/imu.py`, `tests/test_imu.py` | TDD red -> green. `pytest tests/test_imu.py -q` covered gyro integration, bias, gravity, camera-frame conversion, camera rotation prior, and keyframe gating helper. | None. |
-| 3 | Done | `src/spacerec/capture.py`, `src/spacerec/replay.py`, `src/spacerec/oak.py`, `tests/test_replay.py` | Replay test now proves `Frame.imu_samples` carries frame-interval samples while legacy `Frame.imu` remains. Recorded cadence check showed median 10 IMU samples per RGB interval for both target sessions. | None. |
-| 4 | Done | `src/spacerec/replay.py`, `src/spacerec/oak.py`, `tests/test_replay.py` | Replay metadata tests cover IMU-to-camera extrinsics path composition and missing-path fallback. Manual diagnostic found recorded `R_cam_imu` and frame metadata carries `imu_to_camera_rotation`. | Live hardware calibration remains untested on physical OAK in this run. |
-| 5 | Done | `src/spacerec/vo.py`, `tests/test_vo.py` | Synthetic pure-rotation test: visual-only path loses tracking at 9 deg yaw while gyro prior path recovers `R_delta.T`; lateral translation regression still passes. | None. |
-| 6 | Done | `src/spacerec/main.py`, `benchmarks/replay_smoke.py`, `src/spacerec/config.py`, `config.yaml`, tests | `pytest tests/test_imu.py tests/test_config.py tests/test_vo.py -q` -> 17 passed. After boundary integration fix, `replay_smoke.py ... --frames 120 --compare-imu` reports stable session unchanged and difficult session `lost=1 -> 0`, `avg_tracked=50.8 -> 50.9`, `avg_inlier=0.79 -> 0.79`. | IMU remains off by default until broader live/recorded evidence exists. |
-| 7 | Done | `src/spacerec/imu.py`, `src/spacerec/main.py`, `benchmarks/replay_smoke.py`, `tests/test_imu.py` | Unit test proves high angular-rate backend keyframes are skipped until starvation fallback. Replay smoke reports `imu_blur_skipped_kf=0` and `imu_blur_forced_kf=0` on both provided sessions because they do not exceed the threshold. | Need faster-rotation recordings to observe nonzero gating in real data. |
-| 8 | Done | `README.md`, `docs/MANUAL.md`, `docs/benchmarks.md`, `src/spacerec/oak.py`, `src/spacerec/imu.py`, `tests/test_oak_depth.py`, `tests/test_imu.py` | Independent verifier found live OAK IMU windowing was not timestamp bounded and replay priors under-integrated frame boundaries. Fixed with timestamp-aligned OAK IMU windows and optional estimator `t0/t1`. Final verification: `pytest tests/ -q` -> 60 passed; `git diff --check` -> pass; `replay_smoke.py ... --frames 120 --compare-imu` -> stable unchanged, difficult `lost=1 -> 0`; `mesh_smoke.py ... --frames 60` -> 56,302 vertices / 83,309 faces round-trip read. | Live OAK hardware was not connected, so physical calibration/timestamp behavior remains a field validation item. |
+| 1 | Done | `GOAL_PLAN.md` | Stale IMU plan detected in the current worktree and replaced with this canonical mesh plan. Baseline focused tests before implementation: `.venv/bin/python -m pytest tests/test_mesh.py tests/test_config.py tests/test_persistence.py -q` -> 16 passed. | None. |
+| 2 | Done | `tests/test_mesh.py`, `tests/test_config.py`, `src/spacerec/config.py`, `config.yaml` | Added duplicate-wall, high-support older surface, raw debug mode, normal group, residual proxy, export, removed-submap, and config option coverage. Focused check: `.venv/bin/python -m pytest tests/test_mesh.py tests/test_config.py -q` -> 18 passed after residual/normal additions. | None. |
+| 3 | Done | `src/spacerec/mesh.py` | Implemented `raw_combined_mesh()`, `canonical_mesh()`, default canonical `combined_mesh()`, support/residual/normal/recency scoring, `export_ply(..., mode=None)`, and removed submap tracking. Synthetic tests prove five duplicate wall layers collapse to one canonical layer and high-support older surfaces resist single latest noisy passes. | None. |
+| 4 | Done | `src/spacerec/viz.py`, `src/spacerec/main.py` | Added `log_canonical_mesh()` and `clear_mesh_submaps()`. `main._log_meshmap_update()` logs canonical mesh by default, keeps raw submaps for `raw|both`, and clears changed/removed raw submap entities in canonical mode. Independent verifier confirmed this by source review. | No Rerun mock test; covered by source review and default-mode code path. |
+| 5 | Done | `README.md`, `docs/MANUAL.md`, `docs/benchmarks.md`, `benchmarks/mesh_smoke.py`, `config.yaml` | Docs/config describe `canonical`, `raw`, and `both`, scoring signals, limitations, and future spatial-block TSDF work. `mesh_smoke.py` now reports raw and canonical vertex/face counts. | None. |
+| 6 | Done | All changed files | Final local verification: `git diff --check` -> pass; `.venv/bin/python -m pytest tests/ -q` -> 67 passed; `.venv/bin/python benchmarks/mesh_smoke.py sources/session_20260624_054320_194430108151D05A00 --frames 120 --out-dir artifacts/mesh_canonical_verify` -> readable PLY with `raw_vertices=99765 raw_faces=155014 vertices=99765 faces=155014 read_vertices=99765 read_faces=155014`. Independent verifier reran `git diff --check`, full pytest -> 67 passed, 120-frame mesh smoke -> readable PLY, duplicate/residual probes -> pass. | Recorded smoke has one submap, so real recorded multi-submap collapse evidence remains synthetic-test based. No blocker. |

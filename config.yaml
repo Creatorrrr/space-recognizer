@@ -80,6 +80,14 @@ mesh:
   depth_trunc_m: 8.0
   min_surface_observations: 2
   max_active_submaps: 32
+  render_mode: canonical # canonical(기본), raw(디버그), both
+  canonical_cell_size: 0.10
+  canonical_distance_m: 0.10
+  canonical_normal_cos: 0.85
+  canonical_min_support: 1
+  canonical_support_weight: 1.0
+  canonical_residual_weight: 0.25
+  canonical_recency_weight: 0.10
   persist_evidence: false
   export_on_exit: false
 

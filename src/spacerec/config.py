@@ -84,6 +84,14 @@ class MeshCfg:
     depth_trunc_m: float = 8.0
     min_surface_observations: int = 2
     max_active_submaps: int = 32
+    render_mode: str = "canonical"  # "canonical", "raw", or "both"
+    canonical_cell_size: float = 0.10
+    canonical_distance_m: float = 0.10
+    canonical_normal_cos: float = 0.85
+    canonical_min_support: int = 1
+    canonical_support_weight: float = 1.0
+    canonical_residual_weight: float = 0.25
+    canonical_recency_weight: float = 0.10
     persist_evidence: bool = False
     export_on_exit: bool = False
 

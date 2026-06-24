@@ -88,6 +88,7 @@ class MeshMap:
         self.submaps: dict[int, MeshSubmap] = {}
         self._next_id = 0
         self._changed: set[int] = set()
+        self._removed: set[int] = set()
         self._T_gl_current: Sim3 = SIM3_IDENTITY
         self._T_gl_target: Sim3 = SIM3_IDENTITY
 
@@ -170,20 +171,59 @@ class MeshMap:
             self._changed.clear()
         return [self.submaps[i] for i in ids if i in self.submaps]
 
-    def combined_mesh(self) -> TriMesh:
+    def removed_submaps(self, clear: bool = True) -> list[int]:
+        ids = sorted(self._removed)
+        if clear:
+            self._removed.clear()
+        return ids
+
+    def raw_combined_mesh(self) -> TriMesh:
+        selections = {
+            sid: np.ones(submap.mesh.n_faces, dtype=bool)
+            for sid, submap in self.submaps.items()
+            if submap.mesh.n_faces > 0
+        }
+        return self._mesh_from_face_selections(selections)
+
+    def canonical_mesh(self) -> TriMesh:
+        selections = self._canonical_face_selections()
+        return self._mesh_from_face_selections(selections)
+
+    def combined_mesh(self, mode: str | None = None) -> TriMesh:
+        mode = (mode or getattr(self.cfg, "render_mode", "canonical")).lower()
+        if mode == "raw":
+            return self.raw_combined_mesh()
+        return self.canonical_mesh()
+
+    def _mesh_from_face_selections(self, selections: dict[int, np.ndarray]) -> TriMesh:
         verts, faces, norms, colors = [], [], [], []
         offset = 0
         for submap in self.submaps.values():
             mesh = submap.mesh
             if mesh.n_vertices == 0 or mesh.n_faces == 0:
                 continue
+            keep = selections.get(submap.submap_id)
+            if keep is None or not np.any(keep):
+                continue
+            kept_faces = mesh.faces[keep]
+            used = np.unique(kept_faces.reshape(-1))
+            remap = np.full(mesh.n_vertices, -1, np.int32)
+            remap[used] = np.arange(len(used), dtype=np.int32)
             gv = submap.global_vertices()
-            gn = mesh.normals @ submap.anchor_pose[:3, :3].T
-            verts.append(gv)
-            faces.append(mesh.faces + offset)
-            norms.append(gn.astype(np.float32))
-            colors.append(mesh.colors)
-            offset += len(gv)
+            if len(mesh.normals) == mesh.n_vertices:
+                gn = mesh.normals @ submap.anchor_pose[:3, :3].T
+                kept_normals = gn[used].astype(np.float32)
+            else:
+                kept_normals = np.zeros((len(used), 3), np.float32)
+            if len(mesh.colors) == mesh.n_vertices:
+                kept_colors = mesh.colors[used]
+            else:
+                kept_colors = np.full((len(used), 3), 180, np.uint8)
+            verts.append(gv[used])
+            faces.append(remap[kept_faces] + offset)
+            norms.append(kept_normals)
+            colors.append(kept_colors)
+            offset += len(used)
         if not verts:
             return TriMesh.empty()
         return TriMesh(
@@ -193,8 +233,59 @@ class MeshMap:
             colors=np.concatenate(colors).astype(np.uint8),
         )
 
-    def export_ply(self, path: str | Path) -> TriMesh:
-        mesh = self.combined_mesh()
+    def _canonical_face_selections(self) -> dict[int, np.ndarray]:
+        if not self.submaps:
+            return {}
+        cell = _canonical_cell_size(self.cfg)
+        recency_rank = _recency_ranks(self.submaps.values())
+        normal_cos = float(getattr(self.cfg, "canonical_normal_cos", 0.85))
+        groups: dict[tuple[int, int, int], list[dict]] = {}
+        face_refs: dict[int, list[tuple[tuple[int, int, int], int]]] = {}
+
+        for sid, submap in self.submaps.items():
+            mesh = submap.mesh
+            if mesh.n_vertices == 0 or mesh.n_faces == 0:
+                continue
+            support = _submap_support(submap)
+            if support < int(getattr(self.cfg, "canonical_min_support", 1)):
+                continue
+            score = _canonical_submap_score(submap, recency_rank.get(sid, 0), self.cfg)
+            gv = submap.global_vertices()
+            normals = _global_vertex_normals(submap)
+            refs = []
+            for face in mesh.faces:
+                centroid = gv[face].mean(axis=0)
+                normal = _face_normal(gv, normals, face)
+                key = _canonical_cell_key(centroid, cell)
+                group_idx = _find_normal_group(groups.setdefault(key, []), normal, normal_cos)
+                if group_idx < 0:
+                    group_idx = len(groups[key])
+                    groups[key].append({"normal": normal, "score": score, "sid": sid})
+                else:
+                    current = groups[key][group_idx]
+                    if (score > current["score"] + 1e-9
+                            or (abs(score - current["score"]) <= 1e-9 and sid > current["sid"])):
+                        current["normal"] = normal
+                        current["score"] = score
+                        current["sid"] = sid
+                refs.append((key, group_idx))
+            face_refs[sid] = refs
+
+        selections: dict[int, np.ndarray] = {}
+        for sid, submap in self.submaps.items():
+            mesh = submap.mesh
+            if mesh.n_faces == 0:
+                continue
+            keep = np.zeros(mesh.n_faces, dtype=bool)
+            for i, (key, group_idx) in enumerate(face_refs.get(sid, [])):
+                group = groups.get(key, [])
+                keep[i] = group_idx < len(group) and group[group_idx]["sid"] == sid
+            if np.any(keep):
+                selections[sid] = keep
+        return selections
+
+    def export_ply(self, path: str | Path, mode: str | None = None) -> TriMesh:
+        mesh = self.combined_mesh(mode)
         write_ply(path, mesh)
         return mesh
 
@@ -211,6 +302,7 @@ class MeshMap:
             oldest = min(self.submaps)
             del self.submaps[oldest]
             self._changed.discard(oldest)
+            self._removed.add(oldest)
 
     def _rebuild_submap(self, submap: MeshSubmap) -> None:
         submap.mesh = _integrate_tsdf(submap.views, submap.anchor_pose, self.cfg)
@@ -260,6 +352,104 @@ def _coerce_views(
             kf_id=int(ids[i]) if i < len(ids) else i,
         ))
     return views
+
+
+def _canonical_cell_size(cfg: MeshCfg) -> float:
+    configured = float(getattr(cfg, "canonical_cell_size", 0.0))
+    distance = float(getattr(cfg, "canonical_distance_m", 0.0))
+    fallback = max(2.0 * float(cfg.voxel_size), float(cfg.trunc_margin))
+    return max(configured, distance, fallback, 1e-6)
+
+
+def _submap_support(submap: MeshSubmap) -> int:
+    return max(len(submap.views), len(submap.window_ids), 1)
+
+
+def _latest_window_id(submap: MeshSubmap) -> int:
+    return max(submap.window_ids) if submap.window_ids else submap.submap_id
+
+
+def _recency_ranks(submaps: Iterable[MeshSubmap]) -> dict[int, int]:
+    ordered = sorted(submaps, key=lambda s: (_latest_window_id(s), s.submap_id))
+    return {submap.submap_id: i for i, submap in enumerate(ordered)}
+
+
+def _canonical_submap_score(submap: MeshSubmap, recency_rank: int, cfg: MeshCfg) -> float:
+    support = float(_submap_support(submap))
+    support_w = float(getattr(cfg, "canonical_support_weight", 1.0))
+    residual_w = float(getattr(cfg, "canonical_residual_weight", 0.25))
+    recency_w = float(getattr(cfg, "canonical_recency_weight", 0.10))
+    residual = _submap_residual_proxy(submap, cfg)
+    return support_w * support - residual_w * residual + recency_w * float(recency_rank)
+
+
+def _submap_residual_proxy(submap: MeshSubmap, cfg: MeshCfg) -> float:
+    if not submap.views or submap.mesh.n_vertices == 0:
+        return 0.0
+    verts = submap.global_vertices().astype(np.float64)
+    if len(verts) > 512:
+        sample = np.linspace(0, len(verts) - 1, 512).astype(np.int32)
+        verts = verts[sample]
+    verts_h = np.column_stack([verts, np.ones(len(verts))])
+    residuals = []
+    for view in submap.views:
+        T_cw = np.linalg.inv(view.T_wc)
+        cam = (T_cw @ verts_h.T).T[:, :3]
+        z = cam[:, 2]
+        in_front = z > 1e-6
+        if not np.any(in_front):
+            continue
+        z_safe = np.where(in_front, z, 1.0)
+        u = np.rint(view.K[0, 0] * cam[:, 0] / z_safe + view.K[0, 2]).astype(np.int32)
+        v = np.rint(view.K[1, 1] * cam[:, 1] / z_safe + view.K[1, 2]).astype(np.int32)
+        h, w = view.depth.shape
+        inside = in_front & (u >= 0) & (u < w) & (v >= 0) & (v < h)
+        if not np.any(inside):
+            continue
+        idx = np.nonzero(inside)[0]
+        measured = view.depth[v[idx], u[idx]]
+        ok = view.valid[v[idx], u[idx]] & (measured > 0) & np.isfinite(measured)
+        if np.any(ok):
+            residuals.append(np.abs(measured[ok] - z[idx][ok]))
+    if not residuals:
+        return 1.0
+    residual = float(np.median(np.concatenate(residuals)))
+    tol = max(float(cfg.trunc_margin), 2.0 * float(cfg.voxel_size), 1e-6)
+    return float(np.clip(residual / tol, 0.0, 4.0))
+
+
+def _global_vertex_normals(submap: MeshSubmap) -> np.ndarray:
+    mesh = submap.mesh
+    if len(mesh.normals) == mesh.n_vertices:
+        normals = mesh.normals.astype(np.float64) @ submap.anchor_pose[:3, :3].T
+        n = np.linalg.norm(normals, axis=1, keepdims=True)
+        return np.divide(normals, np.maximum(n, 1e-12)).astype(np.float32)
+    return np.empty((0, 3), np.float32)
+
+
+def _face_normal(vertices: np.ndarray, vertex_normals: np.ndarray, face: np.ndarray) -> np.ndarray:
+    if len(vertex_normals) == len(vertices):
+        normal = vertex_normals[face].mean(axis=0).astype(np.float64)
+    else:
+        a, b, c = vertices[face].astype(np.float64)
+        normal = np.cross(b - a, c - a)
+    norm = float(np.linalg.norm(normal))
+    if norm < 1e-12:
+        return np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    return (normal / norm).astype(np.float32)
+
+
+def _canonical_cell_key(centroid: np.ndarray, cell_size: float) -> tuple[int, int, int]:
+    cell = np.floor(np.asarray(centroid, dtype=np.float64) / cell_size + 0.5).astype(np.int64)
+    return int(cell[0]), int(cell[1]), int(cell[2])
+
+
+def _find_normal_group(groups: list[dict], normal: np.ndarray, normal_cos: float) -> int:
+    threshold = float(np.clip(normal_cos, 0.0, 1.0))
+    for i, group in enumerate(groups):
+        if abs(float(np.dot(normal, group["normal"]))) >= threshold:
+            return i
+    return -1
 
 
 def _integrate_tsdf(views: list[MeshView], anchor_pose: np.ndarray, cfg: MeshCfg) -> TriMesh:

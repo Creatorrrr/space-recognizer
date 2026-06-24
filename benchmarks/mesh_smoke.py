@@ -99,6 +99,7 @@ def run_session(path: Path, args, cfg: Config) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{path.name}.ply"
     mesh = meshmap.export_ply(out_path)
+    raw_mesh = meshmap.raw_combined_mesh()
     read_vertices, read_faces = _readable_mesh(out_path)
     runtime_s = time.perf_counter() - t0
     return {
@@ -108,6 +109,8 @@ def run_session(path: Path, args, cfg: Config) -> dict:
         "keyframes": len(depths),
         "lost": lost,
         "submaps": len(meshmap.submaps),
+        "raw_vertices": raw_mesh.n_vertices,
+        "raw_faces": raw_mesh.n_faces,
         "vertices": mesh.n_vertices,
         "faces": mesh.n_faces,
         "read_vertices": read_vertices,
@@ -136,7 +139,8 @@ def main() -> None:
             f"session={result['session']} "
             f"frames={result['frames']} depth_frames={result['depth_frames']} "
             f"keyframes={result['keyframes']} lost={result['lost']} "
-            f"submaps={result['submaps']} vertices={result['vertices']} "
+            f"submaps={result['submaps']} raw_vertices={result['raw_vertices']} "
+            f"raw_faces={result['raw_faces']} vertices={result['vertices']} "
             f"faces={result['faces']} read_vertices={result['read_vertices']} "
             f"read_faces={result['read_faces']} runtime_s={result['runtime_s']:.2f} "
             f"output={result['output']}"

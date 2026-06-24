@@ -36,6 +36,14 @@ mesh:
   trunc_margin: 0.16
   min_surface_observations: 3
   max_active_submaps: 8
+  render_mode: both
+  canonical_cell_size: 0.18
+  canonical_distance_m: 0.09
+  canonical_normal_cos: 0.80
+  canonical_min_support: 2
+  canonical_support_weight: 1.5
+  canonical_residual_weight: 0.4
+  canonical_recency_weight: 0.2
 imu:
   enabled: true
   use_lk_prior: false
@@ -63,6 +71,14 @@ imu:
     assert cfg.mesh.trunc_margin == 0.16
     assert cfg.mesh.min_surface_observations == 3
     assert cfg.mesh.max_active_submaps == 8
+    assert cfg.mesh.render_mode == "both"
+    assert cfg.mesh.canonical_cell_size == 0.18
+    assert cfg.mesh.canonical_distance_m == 0.09
+    assert cfg.mesh.canonical_normal_cos == 0.80
+    assert cfg.mesh.canonical_min_support == 2
+    assert cfg.mesh.canonical_support_weight == 1.5
+    assert cfg.mesh.canonical_residual_weight == 0.4
+    assert cfg.mesh.canonical_recency_weight == 0.2
     assert cfg.imu.enabled is True
     assert cfg.imu.use_lk_prior is False
     assert cfg.imu.use_pnp_prior is True
