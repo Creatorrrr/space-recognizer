@@ -111,8 +111,10 @@ OAK-D-Lite 입력을 디렉터리로 녹화해 둔 세션도 입력으로 사용
 .venv/bin/python benchmarks/replay_smoke.py sources/session_20260624_054320_194430108151D05A00 --frames 60
 .venv/bin/python benchmarks/replay_smoke.py sources/session_20260624_054320_194430108151D05A00 --frames 60 --full-models
 .venv/bin/python benchmarks/replay_smoke.py sources/session_20260624_054320_194430108151D05A00 sources/session_20260624_055321_194430108151D05A00 --frames 120 --compare-imu
-.venv/bin/python benchmarks/mesh_smoke.py sources/session_20260624_054320_194430108151D05A00 --frames 120 --out-dir artifacts/mesh
+.venv/bin/python benchmarks/replay_smoke.py sources/session_20260624_054320_194430108151D05A00 --frames 60 --direct-fusion
+.venv/bin/python benchmarks/mesh_smoke.py sources/session_20260624_054320_194430108151D05A00 --frames 120 --fusion direct --out-dir artifacts/mesh
 .venv/bin/python -m spacerec.main --source sources/session_20260624_054320_194430108151D05A00 --max-seconds 3 --no-realtime
+.venv/bin/python -m spacerec.main --source sources/session_20260624_054320_194430108151D05A00 --fusion backend --no-realtime
 .venv/bin/python -m spacerec.main --source sources/session_20260624_054320_194430108151D05A00 --no-realtime --mesh-out artifacts/mesh/session.ply
 ```
 
@@ -126,6 +128,13 @@ OAK-D-Lite 입력을 디렉터리로 녹화해 둔 세션도 입력으로 사용
 - 녹화 replay는 파일 입력이지만 metric depth와 RGB intrinsics를 가진
   source로 취급됩니다. 따라서 DA3 mono-only 영상 경로가 아니라 OAK metric
   depth 경로를 탑니다.
+- 기본 `fusion.mode: auto`에서는 OAK metric depth가 있는 녹화 replay/live OAK가
+  자동으로 direct fusion을 탑니다. 이 모드는 RGB-aligned depth를 직접 3D로
+  역투영해 기존 `GlobalMap`/`MeshMap`에 넣고, `depth.oak_fill_missing`을 끄므로
+  DA3-Small, DA3 any-view, DA3METRIC 모델을 로드하지 않습니다.
+  `capture.replay_depth_mode`는 `calibrated`여야 하며, `resize` 모드는 direct
+  정밀 재구성용으로 권장하지 않습니다. 필요하면 `--fusion direct` 또는
+  `--fusion backend`로 강제할 수 있습니다.
 - `--compare-imu`는 각 세션을 visual-only와 IMU-assisted로 두 번 돌려
   `lost`, `avg_tracked`, `avg_inlier`, `imu_prior_frames`,
   `imu_blur_skipped_kf`를 함께 출력합니다. 이 결과가 개선을 보이지 않으면
@@ -331,6 +340,17 @@ capture:
 depth:
   oak_fill_missing: false         # true면 OAK stereo 구멍만 DA3로 metric 보정
 
+fusion:
+  mode: auto                      # OAK metric depth는 direct, 일반 영상은 backend
+  direct_point_subsample: 4       # direct point cloud 역투영 stride
+  direct_mesh_window_size: 6      # TSDF submap을 만들 direct RGB-D keyframe 수
+  direct_mesh_overlap: 2          # 인접 direct mesh window 중첩
+  direct_mesh_downsample: 1       # mesh 입력 depth/color 다운샘플 배율
+  direct_edge_filter: true        # stereo flying-pixel 억제
+  direct_edge_rel_thresh: 0.06
+  direct_mask_dilate_px: 2        # 동적 객체 mask 경계 확장
+  require_aligned_depth: true     # RGB-aligned OAK/replay depth만 허용
+
 detect:
   conf: 0.35                      # 검출 신뢰도 임계값. 오검출 많으면 ↑ (0.45)
   every_n_frames: 1               # N프레임마다 YOLOE 실행. realtime profile은 5
@@ -408,6 +428,7 @@ viz:
 | FPS가 너무 낮다 | `depth.oak_fill_missing: false` 확인 → `backend.metric_anchor: false` → `proc_width: 960` → `backend.window_size: 8` |
 | 평균 FPS는 괜찮은데 중간중간 끊긴다 | `--perf-log artifacts/perf/live.csv --profile`로 `loop_total` p99/max와 `[stutter]` stage 확인 |
 | OAK metric replay 실시간 체감이 중요하다 | `--runtime-profile realtime` 또는 `runtime_profile: realtime`로 live 중 backend/mesh/appearance를 끄고 정밀 재구성은 quality/offline으로 별도 실행 |
+| DA3 없이 OAK depth만으로 누적 3D 지도를 만들고 싶다 | 기본 `fusion.mode: auto`에서 OAK 녹화/live OAK는 자동 direct. 강제하려면 `--fusion direct --no-realtime` 사용. `--no-backend`는 재구성 off 상한 측정용이므로 함께 쓰지 않음 |
 | backend 시점에 멈칫한다 | `backend.metric_anchor: false`, `backend.period_s: 10`, `backend.window_size: 8`, `--no-backend` upper-bound 비교 |
 | backend 결과 적용 때 0.5초 이상 멈춘다 | realtime profile처럼 `backend.live_apply: false`로 live loop에서는 결과 수거만 하고 종료/idle 때 지도 융합 |
 | DINOv2가 tail latency를 만든다 | `objects.appearance: false` 또는 `appearance_keyframes_only: true`, `appearance_every_n_frames` 증가 |

@@ -22,6 +22,7 @@ from .config import Config, apply_runtime_profile
 from .depth import DepthEstimator, fuse_metric_depth
 from .detect import Detection, ObjectDetector
 from .device import select_torch_device
+from .directfusion import DirectFusionBackend, DirectFusionKeyframe
 from .geometry import sim3_apply, sim3_inverse
 from .graph import build_graph
 from .imu import estimate_camera_rotation, should_accept_backend_keyframe
@@ -181,6 +182,59 @@ def _needs_live_depth_estimator(cfg: Config, source_has_metric_depth: bool) -> b
     return (not source_has_metric_depth) or bool(cfg.depth.oak_fill_missing)
 
 
+def resolve_fusion_mode(cfg: Config, source_has_metric_depth: bool) -> str:
+    """Resolve configured reconstruction/fusion mode for this source."""
+    mode = str(cfg.fusion.mode).strip().lower()
+    valid = {"auto", "backend", "direct", "none"}
+    if mode not in valid:
+        raise ValueError(f"unknown fusion mode: {cfg.fusion.mode!r}")
+    if mode == "auto":
+        mode = "direct" if source_has_metric_depth else "backend"
+    if mode == "direct" and not source_has_metric_depth:
+        raise ValueError("fusion.mode=direct requires a metric-depth source")
+    if mode == "backend" and not bool(cfg.backend.enabled):
+        mode = "none"
+    return mode
+
+
+def _apply_no_backend_override(cfg: Config) -> None:
+    if str(cfg.fusion.mode).strip().lower() == "direct":
+        raise ValueError("--no-backend disables reconstruction; use --fusion direct without --no-backend")
+    cfg.backend.enabled = False
+    cfg.fusion.mode = "none"
+
+
+def _check_direct_fusion_alignment(cfg: Config, source) -> None:
+    if not bool(cfg.fusion.require_aligned_depth):
+        return
+    depth_mode = getattr(source, "depth_mode", None)
+    if depth_mode is not None:
+        mode = str(depth_mode).lower()
+        if mode not in {"calibrated", "reproject"}:
+            raise ValueError(
+                "fusion.mode=direct requires RGB-aligned replay depth; "
+                "use capture.replay_depth_mode=calibrated")
+        if getattr(source, "_depth_to_rgb", None) is None:
+            raise ValueError(
+                "fusion.mode=direct requires recorded depth-to-rgb calibration")
+        return
+    oak_mode = cfg.capture.source_kind.lower() == "oak" or cfg.source == "oak"
+    if oak_mode and not bool(cfg.capture.oak_align_depth_to_rgb):
+        raise ValueError(
+            "fusion.mode=direct requires capture.oak_align_depth_to_rgb=true")
+
+
+def prepare_fusion_mode(cfg: Config, source) -> str:
+    source_has_metric_depth = bool(getattr(source, "has_metric_depth", False))
+    fusion_mode = resolve_fusion_mode(cfg, source_has_metric_depth)
+    if fusion_mode == "direct":
+        _check_direct_fusion_alignment(cfg, source)
+        if cfg.depth.oak_fill_missing:
+            print("[fusion] direct mode disables depth.oak_fill_missing to keep DA3-free")
+            cfg.depth.oak_fill_missing = False
+    return fusion_mode
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="spacerec")
     parser.add_argument("--config", default="config.yaml")
@@ -200,6 +254,11 @@ def main() -> None:
     parser.add_argument("--runtime-profile", choices=["quality", "realtime"],
                         default=None,
                         help="apply a runtime overlay such as realtime")
+    parser.add_argument("--fusion", choices=["auto", "backend", "direct", "none"],
+                        default=None,
+                        help="reconstruction source: DA3 backend, OAK direct RGB-D, or none")
+    parser.add_argument("--direct-fusion", action="store_true",
+                        help="shortcut for --fusion direct")
     parser.add_argument("--no-viz", action="store_true",
                         help="disable Rerun logging for performance upper-bound tests")
     parser.add_argument("--no-backend", action="store_true",
@@ -224,11 +283,23 @@ def main() -> None:
         cfg.realtime = False
     if args.runtime_profile:
         apply_runtime_profile(cfg, args.runtime_profile)
+    if args.fusion:
+        cfg.fusion.mode = args.fusion
+    if args.direct_fusion:
+        cfg.fusion.mode = "direct"
     if args.no_backend:
-        cfg.backend.enabled = False
+        try:
+            _apply_no_backend_override(cfg)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
 
     source = _source_from_config(cfg)
     source_has_metric_depth = bool(getattr(source, "has_metric_depth", False))
+    try:
+        fusion_mode = prepare_fusion_mode(cfg, source)
+    except ValueError as exc:
+        source.release()
+        raise SystemExit(str(exc)) from exc
     W, H = source.proc_width, source.proc_height
     source_K = getattr(source, "K", None)
 
@@ -273,16 +344,21 @@ def main() -> None:
     meshmap = MeshMap(cfg.mesh) if cfg.mesh.enabled else None
     if not cfg.realtime:
         cfg.backend.period_s = 0.0
-    if cfg.backend.enabled:
+    if fusion_mode == "backend" and cfg.backend.enabled:
         backend = ReconstructionBackend(cfg.backend, cfg.depth.model,
                                         torch_device, cfg.depth.process_res,
                                         metric_model=cfg.depth.metric_model)
         backend.start()
         print("waiting for backend process...")
         backend.wait_ready()
+    elif fusion_mode == "direct":
+        backend = DirectFusionBackend(cfg.fusion, cfg.capture)
+        backend.start()
+        backend.wait_ready()
+        print("direct OAK RGB-D fusion enabled")
     else:
         backend = _NoopBackend()
-        print("backend disabled")
+        print("reconstruction disabled")
     calib = DepthCalibration()
     frame_scale = 1.0  # 키프레임 3D 기준의 프레임별 mono depth 스케일 보정
     # DA3의 프레임별 intrinsics 추정은 출렁임이 크다(fx 740~1015 관측).
@@ -504,19 +580,31 @@ def main() -> None:
                 blur_omega_rad_s=cfg.imu.keyframe_blur_omega_rad_s,
                 max_delay_s=cfg.imu.keyframe_max_delay_s,
             )
-            if pose.is_keyframe and accept_backend_keyframe:
-                small = cv2.resize(frame.bgr, (bw, bh), interpolation=cv2.INTER_AREA)
-                backend.add_keyframe(BackendKeyframe(
-                    kf_id=kf_counter, ts=frame.ts,
-                    rgb=cv2.cvtColor(small, cv2.COLOR_BGR2RGB),
-                    T_wc_live=pose.T_wc.copy(),
-                    raw_depth=cv2.resize(raw_depth, (bw, bh)),
-                    dyn_mask=None if excl is None else
-                             cv2.resize(excl.astype(np.uint8), (bw, bh),
-                                        interpolation=cv2.INTER_NEAREST).astype(bool),
-                    calib_ab=((1.0, 0.0) if has_metric_depth
-                              else (calib.a * frame_scale, calib.b * frame_scale)),
-                ))
+            if pose.is_keyframe and accept_backend_keyframe and fusion_mode != "none":
+                if fusion_mode == "direct":
+                    backend.add_keyframe(DirectFusionKeyframe(
+                        kf_id=kf_counter,
+                        ts=frame.ts,
+                        bgr=frame.bgr.copy(),
+                        depth_m=depth.copy(),
+                        K=vo.K.copy(),
+                        T_wc=pose.T_wc.copy(),
+                        dyn_mask=None if excl is None else excl.copy(),
+                        depth_conf=None if frame.depth_conf is None else frame.depth_conf.copy(),
+                    ))
+                else:
+                    small = cv2.resize(frame.bgr, (bw, bh), interpolation=cv2.INTER_AREA)
+                    backend.add_keyframe(BackendKeyframe(
+                        kf_id=kf_counter, ts=frame.ts,
+                        rgb=cv2.cvtColor(small, cv2.COLOR_BGR2RGB),
+                        T_wc_live=pose.T_wc.copy(),
+                        raw_depth=cv2.resize(raw_depth, (bw, bh)),
+                        dyn_mask=None if excl is None else
+                                 cv2.resize(excl.astype(np.uint8), (bw, bh),
+                                            interpolation=cv2.INTER_NEAREST).astype(bool),
+                        calib_ab=((1.0, 0.0) if has_metric_depth
+                                  else (calib.a * frame_scale, calib.b * frame_scale)),
+                    ))
                 kf_counter += 1
                 last_backend_keyframe_ts = frame.ts
 

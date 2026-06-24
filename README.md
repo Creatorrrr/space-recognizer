@@ -31,6 +31,7 @@ uv pip install -p .venv -e ".[oak]"       # OAK-D-Lite를 쓸 때만 필요
 .venv/bin/python -m spacerec.main --source 0          # 웹캠 (카메라 권한 필요)
 .venv/bin/python -m spacerec.main --source oak        # OAK-D-Lite RGB + metric stereo depth
 .venv/bin/python -m spacerec.main --source sources/session_20260624_054320_194430108151D05A00 --no-realtime
+.venv/bin/python -m spacerec.main --source sources/session_20260624_054320_194430108151D05A00 --fusion backend --no-realtime
 .venv/bin/python -m spacerec.main --source sources/session_20260624_054320_194430108151D05A00 --no-realtime --mesh-out artifacts/mesh/session.ply
 .venv/bin/python -m spacerec.main --source 0 --map maps/room.npz  # 세션 간 누적
 
@@ -41,6 +42,10 @@ uv pip install -p .venv -e ".[oak]"       # OAK-D-Lite를 쓸 때만 필요
 #   --profile           : 단계별 처리 시간 출력
 #   --perf-log out.csv  : 프레임별 stage timing CSV 저장
 #   --runtime-profile realtime : OAK metric replay용 저지연 프로파일 적용
+#   --fusion auto       : OAK metric depth는 direct, 일반 영상은 backend(기본 config)
+#   --fusion direct     : DA3 없이 OAK metric depth만으로 누적 3D 재구성 강제
+#   --fusion backend    : 기존 DA3 backend 재구성 강제
+#   --fusion none       : 누적 재구성 끄기 (`--no-backend`와 같은 상한 측정 용도)
 ```
 
 첫 실행 시 모델 가중치(총 약 2.2GB: DA3-SMALL 0.3GB, DA3METRIC-LARGE 1.4GB,
@@ -63,6 +68,11 @@ YOLOE-26s-seg + MobileCLIP2 텍스트 인코더 0.3GB, DINOv2-small)가 자동
   hole-fill은 `depth.oak_fill_missing: true`일 때만 추가로 동작합니다.
   빠른 포맷 확인만 필요하면 `resize`로 바꿔 단순 리사이즈 smoke를 돌릴 수
   있습니다.
+- 기본 config의 `fusion.mode: auto`에서는 OAK live/replay처럼 RGB-aligned
+  metric depth가 있는 입력은 DA3 없이 direct fusion으로 누적하고, 일반
+  웹캠/단안 영상처럼 metric depth가 없는 입력은 기존 DA3 backend를 사용합니다.
+  direct 모드는 `depth.oak_fill_missing`을 끄고 DA3 depth/backend 모델을 로드하지
+  않습니다. 필요하면 `--fusion direct` 또는 `--fusion backend`로 강제할 수 있습니다.
 - 영상 파일 모드는 기본적으로 **웹캠처럼 벽시계 기준으로 프레임을 드롭**하며
   재생합니다 (`config.yaml`의 `realtime: false`로 전체 프레임 처리 가능).
 - `--map maps/room.npz`로 world state를 저장할 때 mesh가 활성화되어 있으면
@@ -140,6 +150,12 @@ mesh, DINOv2 appearance, Rerun 대용량 로그를 줄이는 realtime overlay를
   → mono depth 보정(a,b), intrinsics 추정, (옵션) metric 앵커
   → T_global_live(Sim3)를 부드럽게 갱신 — 객체 위치가 점프하지 않음
 
+[Direct RGB-D fusion — OAK metric depth 전용]
+  RGB-aligned OAK depth + VO pose + dynamic mask
+  → metric depth 직접 역투영 → 전역 지도 voxel 융합
+  → RGB-D keyframe window를 기존 MeshMap TSDF 경로에 전달
+  → DA3-Small/DA3 any-view/DA3METRIC 모델 로드 없음
+
 [월드 모델 — 증거 기반 갱신]
   GlobalMap: 가중치 voxel + free-space carving — 새 관측의 시선이 옛 표면을
     관통하면 빈 공간 증거로 깎아 제거. 잘못된 재구성은 재촬영으로 지워지고,
@@ -166,9 +182,9 @@ DA3-small pose 헤드의 병진 과소추정, 커뮤니티 래퍼 결함 등)이
 .venv/bin/python benchmarks/headless_run.py   # 헤드리스 전체 파이프라인 → /tmp/map.npz
 .venv/bin/python benchmarks/oak_smoke.py      # OAK USB/K/depth stream 확인
 .venv/bin/python benchmarks/perf_matrix.py sources/session_20260624_054529_194430108151D05A00 --frames 120 --headless
-.venv/bin/python benchmarks/replay_smoke.py sources/session_20260624_054320_194430108151D05A00 --frames 60 --full-models
+.venv/bin/python benchmarks/replay_smoke.py sources/session_20260624_054320_194430108151D05A00 --frames 60 --full-models --direct-fusion
 .venv/bin/python benchmarks/replay_smoke.py sources/session_20260624_054320_194430108151D05A00 sources/session_20260624_055321_194430108151D05A00 --frames 120 --compare-imu
-.venv/bin/python benchmarks/mesh_smoke.py sources/session_20260624_054320_194430108151D05A00 --frames 120
+.venv/bin/python benchmarks/mesh_smoke.py sources/session_20260624_054320_194430108151D05A00 --frames 120 --fusion direct
 ```
 
 ## 알려진 한계 / 다음 단계
@@ -179,6 +195,10 @@ DA3-small pose 헤드의 병진 과소추정, 커뮤니티 래퍼 결함 등)이
 - 전역 좌표계는 라이브 VO 궤적을 따르므로 장시간 사용 시 drift가 누적됩니다.
   (DA3-small의 pose 헤드가 병진을 과소추정해 독립적 drift 보정원으로 쓸 수 없음 —
   루프 클로저는 향후 과제)
+- `--fusion direct`도 라이브 VO pose를 그대로 쓰므로 loop closure가 없습니다.
+  OAK metric depth라 스케일은 안정적이지만, 장시간 재방문 시 pose drift로 표면이
+  겹칠 수 있습니다. free-space carving과 canonical mesh는 완화책이지 SLAM
+  loop-closure 대체재는 아닙니다.
 - 대형 가구는 카메라가 궤도를 돌 때 mask 중심이 이동해 dynamic으로 오판될 수 있음.
 - 동적 물체의 시간별 궤적은 기록·표시되지만(`world/objects/dyn_traj`) 검증은 후순위.
 - mesh는 현재 TSDF submap 기반의 표시/export 레이어입니다. 기본 `canonical` 모드는

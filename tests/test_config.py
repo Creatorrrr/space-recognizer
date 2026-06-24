@@ -132,6 +132,47 @@ viz:
     assert cfg.viz.jpeg_quality == 55
 
 
+def test_load_reads_fusion_config(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+fusion:
+  mode: direct
+  direct_point_subsample: 3
+  direct_mesh_window_size: 5
+  direct_mesh_overlap: 2
+  direct_mesh_downsample: 2
+  direct_edge_filter: false
+  direct_edge_rel_thresh: 0.08
+  direct_mask_dilate_px: 1
+  require_aligned_depth: false
+""",
+        encoding="utf-8",
+    )
+
+    cfg = Config.load(path)
+
+    assert cfg.fusion.mode == "direct"
+    assert cfg.fusion.direct_point_subsample == 3
+    assert cfg.fusion.direct_mesh_window_size == 5
+    assert cfg.fusion.direct_mesh_overlap == 2
+    assert cfg.fusion.direct_mesh_downsample == 2
+    assert cfg.fusion.direct_edge_filter is False
+    assert cfg.fusion.direct_edge_rel_thresh == 0.08
+    assert cfg.fusion.direct_mask_dilate_px == 1
+    assert cfg.fusion.require_aligned_depth is False
+
+
+def test_fusion_config_defaults_preserve_backend_mode():
+    cfg = Config()
+
+    assert cfg.fusion.mode == "backend"
+    assert cfg.fusion.direct_point_subsample >= 1
+    assert cfg.fusion.direct_mesh_window_size >= 2
+    assert cfg.fusion.direct_mesh_overlap < cfg.fusion.direct_mesh_window_size
+    assert cfg.fusion.require_aligned_depth is True
+
+
 def test_realtime_runtime_profile_applies_tail_latency_overrides():
     cfg = Config()
     cfg.depth.oak_fill_missing = True

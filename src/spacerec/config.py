@@ -80,6 +80,19 @@ class BackendCfg:
 
 
 @dataclass
+class FusionCfg:
+    mode: str = "backend"  # "backend", "direct", "none", or "auto"
+    direct_point_subsample: int = 4
+    direct_mesh_window_size: int = 6
+    direct_mesh_overlap: int = 2
+    direct_mesh_downsample: int = 1
+    direct_edge_filter: bool = True
+    direct_edge_rel_thresh: float = 0.06
+    direct_mask_dilate_px: int = 2
+    require_aligned_depth: bool = True
+
+
+@dataclass
 class MeshCfg:
     enabled: bool = True
     voxel_size: float = 0.05
@@ -144,6 +157,7 @@ class Config:
     vo: VoCfg = field(default_factory=VoCfg)
     imu: ImuCfg = field(default_factory=ImuCfg)
     backend: BackendCfg = field(default_factory=BackendCfg)
+    fusion: FusionCfg = field(default_factory=FusionCfg)
     mesh: MeshCfg = field(default_factory=MeshCfg)
     objects: ObjectsCfg = field(default_factory=ObjectsCfg)
     graph: GraphCfg = field(default_factory=GraphCfg)
@@ -154,7 +168,8 @@ class Config:
         raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
         sections = {
             "capture": CaptureCfg, "depth": DepthCfg, "detect": DetectCfg,
-            "vo": VoCfg, "imu": ImuCfg, "backend": BackendCfg, "mesh": MeshCfg,
+            "vo": VoCfg, "imu": ImuCfg, "backend": BackendCfg,
+            "fusion": FusionCfg, "mesh": MeshCfg,
             "objects": ObjectsCfg, "graph": GraphCfg, "viz": VizCfg,
         }
         kwargs = {}

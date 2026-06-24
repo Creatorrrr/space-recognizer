@@ -36,6 +36,15 @@ def _set_nested(cfg: dict[str, Any], path: tuple[str, ...], value: Any) -> None:
 
 VARIANTS: list[tuple[str, dict[tuple[str, ...], Any], list[str]]] = [
     ("baseline", {}, []),
+    ("fusion_direct", {
+        ("fusion", "mode"): "direct",
+        ("mesh", "enabled"): False,
+        ("backend", "metric_anchor"): False,
+    }, ["--fusion", "direct"]),
+    ("fusion_none", {
+        ("fusion", "mode"): "none",
+        ("mesh", "enabled"): False,
+    }, ["--fusion", "none"]),
     ("mesh_off", {("mesh", "enabled"): False}, []),
     ("metric_anchor_off", {
         ("mesh", "enabled"): False,
