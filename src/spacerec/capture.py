@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from typing import Any
 from typing import Iterator
 
 import cv2
@@ -19,6 +20,12 @@ class Frame:
     ts: float            # seconds since stream start (video time)
     bgr: np.ndarray      # processing-resolution BGR image
     index: int           # source frame index
+    depth_m: np.ndarray | None = None       # optional metric depth aligned to bgr
+    depth_conf: np.ndarray | None = None    # optional confidence/validity map
+    K: np.ndarray | None = None             # optional camera intrinsics for bgr
+    gray_track: np.ndarray | None = None    # optional tracking image
+    imu: dict[str, Any] | None = None       # optional accelerometer/gyro sample
+    metadata: dict[str, Any] | None = None  # optional source metadata
 
 
 class VideoSource:

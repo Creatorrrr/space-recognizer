@@ -52,6 +52,12 @@ class BackendResult:
     meters_per_unit: float | None = None  # metric 앵커 환산 계수 (표시용)
     view_origins: np.ndarray | None = None  # (V,3) 각 뷰의 카메라 원점 (전역)
     point_view_idx: np.ndarray | None = None  # (N,) 각 포인트가 나온 뷰 번호
+    view_depths: np.ndarray | None = None     # (V,H,W) calibrated z-depth
+    view_valid: np.ndarray | None = None      # (V,H,W) static/valid mask
+    view_colors: np.ndarray | None = None     # (V,H,W,3) RGB uint8
+    view_poses: np.ndarray | None = None      # (V,4,4) global camera poses
+    view_intrinsics: np.ndarray | None = None  # (V,3,3)
+    anchor_kf_id: int | None = None
     window_ids: list[int] = field(default_factory=list)
     runtime_s: float = 0.0
 
@@ -129,8 +135,8 @@ class _Worker:
     def _run_window(self) -> BackendResult | None:
         t0 = time.monotonic()
         n_new = self.cfg.window_size - self.cfg.overlap
-        new_kfs = self._pending[-n_new:]
-        self._pending = []
+        new_kfs = self._pending[:n_new]
+        self._pending = self._pending[n_new:]
         old_kfs = self._reconstructed[-self.cfg.overlap:]
         window = old_kfs + new_kfs
         ids = [kf.kf_id for kf in window]
@@ -189,20 +195,28 @@ class _Worker:
         # 각 포인트의 출처 뷰와 카메라 원점도 함께 보낸다 — 지도 쪽에서
         # 시선 관통(free-space carving)으로 잘못된 옛 표면을 지우는 데 사용.
         pts_list, col_list, vidx_list = [], [], []
+        mesh_depths, mesh_valids, mesh_colors = [], [], []
+        mesh_poses, mesh_intrinsics = [], []
         view_origins = np.array(
             [sim3_apply(S, T[:3, 3][None])[0] for T in T_wc_win])
         for i, kf in enumerate(window):
-            keep = static_valid(i, kf)
+            K = pred.intrinsics[i]
+            z_full = (alpha * pred.depth[i] + beta).astype(np.float32)
+            keep = static_valid(i, kf) & (z_full > 1e-6)
+            rgb_small = cv2.resize(kf.rgb, (dw, dh), interpolation=cv2.INTER_AREA)
+            mesh_depths.append(np.where(keep, z_full, 0).astype(np.float32))
+            mesh_valids.append(keep.astype(bool))
+            mesh_colors.append(rgb_small.astype(np.uint8))
+            mesh_poses.append(self.kf_global_poses[kf.kf_id].astype(np.float64))
+            mesh_intrinsics.append(K.astype(np.float64))
             vs, us = np.nonzero(keep)
             if len(vs) == 0:
                 continue
-            K = pred.intrinsics[i]
-            z = alpha * pred.depth[i][vs, us] + beta
+            z = z_full[vs, us]
             cam = np.stack([(us - K[0, 2]) / K[0, 0] * z,
                             (vs - K[1, 2]) / K[1, 1] * z, z], axis=1)
             T = T_wc_win[i]
             world = sim3_apply(S, cam @ T[:3, :3].T + T[:3, 3])
-            rgb_small = cv2.resize(kf.rgb, (dw, dh), interpolation=cv2.INTER_AREA)
             pts_list.append(world)
             col_list.append(rgb_small[vs, us])
             vidx_list.append(np.full(len(world), i, np.uint8))
@@ -247,6 +261,12 @@ class _Worker:
             intrinsics=np.median(pred.intrinsics, axis=0),
             depth_size=(dw, dh), meters_per_unit=self._meters_per_unit,
             view_origins=view_origins, point_view_idx=point_view_idx,
+            view_depths=np.stack(mesh_depths) if mesh_depths else None,
+            view_valid=np.stack(mesh_valids) if mesh_valids else None,
+            view_colors=np.stack(mesh_colors) if mesh_colors else None,
+            view_poses=np.stack(mesh_poses) if mesh_poses else None,
+            view_intrinsics=np.stack(mesh_intrinsics) if mesh_intrinsics else None,
+            anchor_kf_id=ids[0] if ids else None,
             window_ids=ids, runtime_s=time.monotonic() - t0)
 
 

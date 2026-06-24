@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 import torch
 
+from .calib import DepthCalibration, fit_affine_depth
 from .device import select_torch_device
 
 
@@ -32,3 +33,46 @@ class DepthEstimator:
             self.last_K = K
         return cv2.resize(depth, (bgr.shape[1], bgr.shape[0]),
                           interpolation=cv2.INTER_LINEAR)
+
+
+def fuse_metric_depth(primary_m: np.ndarray,
+                      fallback_relative: np.ndarray | None = None,
+                      valid_mask: np.ndarray | None = None,
+                      min_depth_m: float = 0.3,
+                      max_depth_m: float = 8.0,
+                      min_valid: int = 500
+                      ) -> tuple[np.ndarray, DepthCalibration, np.ndarray]:
+    """Use metric stereo depth first, then optionally metric-fit DA3 holes.
+
+    `primary_m` is expected in meters, already aligned to the RGB frame.
+    `fallback_relative` can be any positive relative depth map at the same
+    resolution (or resizable to it). It is affine-fitted to the reliable
+    stereo pixels and only used where stereo has no valid measurement.
+    """
+    primary = np.asarray(primary_m, dtype=np.float32)
+    valid = np.isfinite(primary) & (primary >= min_depth_m) & (primary <= max_depth_m)
+    if valid_mask is not None:
+        valid &= np.asarray(valid_mask, dtype=bool)
+
+    depth = np.where(valid, primary, 0.0).astype(np.float32)
+    calib = DepthCalibration(inlier_frac=1.0 if int(valid.sum()) else 0.0)
+
+    if fallback_relative is None or int(valid.sum()) < min_valid:
+        return depth, calib, valid
+
+    fallback = np.asarray(fallback_relative, dtype=np.float32)
+    if fallback.shape != primary.shape:
+        fallback = cv2.resize(fallback, (primary.shape[1], primary.shape[0]),
+                              interpolation=cv2.INTER_LINEAR)
+
+    fit = fit_affine_depth(fallback, primary, valid)
+    if fit.inlier_frac <= 0.3:
+        return depth, fit, valid
+
+    filled = fit.apply(fallback).astype(np.float32)
+    fill = (~valid
+            & np.isfinite(filled)
+            & (filled >= min_depth_m)
+            & (filled <= max_depth_m))
+    depth[fill] = filled[fill]
+    return depth, fit, valid

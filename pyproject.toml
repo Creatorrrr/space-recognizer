@@ -42,6 +42,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+oak = ["depthai==2.32.0.0"]
 
 [build-system]
 requires = ["hatchling"]

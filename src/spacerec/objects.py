@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 
+import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
@@ -32,20 +33,52 @@ class Observation:
     emb: np.ndarray | None = None  # 외형 임베딩 (L2 정규화, AppearanceEmbedder)
 
 
+def _robust_depth_sample(depth: np.ndarray, ys: np.ndarray, xs: np.ndarray,
+                         conf: np.ndarray | None = None) -> float | None:
+    vals = depth[ys, xs]
+    valid = np.isfinite(vals) & (vals > 1e-6)
+    if conf is not None:
+        valid &= conf[ys, xs] > 0
+    vals = vals[valid]
+    if len(vals) == 0:
+        return None
+    if len(vals) >= 20:
+        lo, hi = np.percentile(vals, [10, 90])
+        trimmed = vals[(vals >= lo) & (vals <= hi)]
+        if len(trimmed):
+            vals = trimmed
+    return float(np.median(vals))
+
+
 def localize_objects(detections: list[Detection], depth: np.ndarray,
-                     K: np.ndarray, T_wc: np.ndarray) -> list[Observation]:
-    """Mask-interior depth median -> camera-frame 3D -> world-frame position."""
+                     K: np.ndarray, T_wc: np.ndarray,
+                     conf: np.ndarray | None = None) -> list[Observation]:
+    """Mask-interior robust depth -> camera-frame 3D -> world-frame position."""
     results = []
     for det in detections:
         if det.mask is not None and det.mask.any():
-            ys, xs = np.nonzero(det.mask)
-            z = float(np.median(depth[ys, xs]))
+            mask = det.mask
+            if mask.sum() >= 25:
+                eroded = cv2.erode(mask.astype(np.uint8), np.ones((3, 3), np.uint8),
+                                   iterations=1).astype(bool)
+                if eroded.any():
+                    mask = eroded
+            ys, xs = np.nonzero(mask)
+            z = _robust_depth_sample(depth, ys, xs, conf)
+            if z is None:
+                continue
             u, v = float(np.median(xs)), float(np.median(ys))
         else:
             x0, y0, x1, y1 = det.box
             u, v = (x0 + x1) / 2, (y0 + y1) / 2
-            z = float(depth[int(np.clip(v, 0, depth.shape[0] - 1)),
-                            int(np.clip(u, 0, depth.shape[1] - 1))])
+            ui = int(np.clip(u, 0, depth.shape[1] - 1))
+            vi = int(np.clip(v, 0, depth.shape[0] - 1))
+            y0p, y1p = max(0, vi - 2), min(depth.shape[0], vi + 3)
+            x0p, x1p = max(0, ui - 2), min(depth.shape[1], ui + 3)
+            yy, xx = np.mgrid[y0p:y1p, x0p:x1p]
+            z = _robust_depth_sample(depth, yy.ravel(), xx.ravel(), conf)
+            if z is None:
+                continue
         if z <= 1e-6:
             continue
         cam = np.array([(u - K[0, 2]) / K[0, 0] * z,

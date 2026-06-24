@@ -2,11 +2,13 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
-from spacerec.config import BackendCfg, ObjectsCfg
+from spacerec.config import BackendCfg, MeshCfg, ObjectsCfg
 from spacerec.geometry import sim3_apply
+from spacerec.mesh import MeshMap
 from spacerec.objects import ObjectRegistry, WorldObject
-from spacerec.persistence import (SavedState, load_state, merge_into_session,
-                                  relocalize, save_state)
+from spacerec.persistence import (SavedState, load_mesh_state, load_state,
+                                  merge_into_session, merge_mesh_into_session,
+                                  relocalize, save_mesh_state, save_state)
 from spacerec.worldmap import GlobalMap
 
 
@@ -100,3 +102,55 @@ def test_relocalize_rejects_wrong_scene():
         ("lamp", [0, 1, 2.0], _emb(13)),
     ])
     assert relocalize(saved, reg) is None
+
+
+def test_save_load_mesh_state_roundtrip(tmp_path):
+    mm = MeshMap(MeshCfg(voxel_size=0.05, trunc_margin=0.15))
+    K = np.array([[60.0, 0.0, 16.0], [0.0, 60.0, 12.0], [0.0, 0.0, 1.0]])
+    depth = np.full((24, 32), 1.0, np.float32)
+    color = np.full((24, 32, 3), 180, np.uint8)
+    pose = np.eye(4)
+    mm.integrate_views(
+        np.stack([depth, depth]),
+        np.stack([color, color]),
+        np.stack([depth > 0, depth > 0]),
+        np.stack([pose, pose]),
+        np.stack([K, K]),
+        window_ids=[0, 1],
+    )
+
+    path = tmp_path / "mesh_state.npz"
+    assert save_mesh_state(path, mm) == 1
+    loaded = load_mesh_state(path, MeshCfg(voxel_size=0.05, trunc_margin=0.15))
+
+    assert len(loaded.submaps) == 1
+    mesh = next(iter(loaded.submaps.values())).mesh
+    assert mesh.n_vertices > 0
+    assert mesh.n_faces > 0
+
+
+def test_merge_mesh_into_session_applies_sim3_to_saved_anchors():
+    saved = MeshMap(MeshCfg(voxel_size=0.05, trunc_margin=0.15))
+    K = np.array([[60.0, 0.0, 16.0], [0.0, 60.0, 12.0], [0.0, 0.0, 1.0]])
+    depth = np.full((24, 32), 1.0, np.float32)
+    color = np.full((24, 32, 3), 180, np.uint8)
+    pose = np.eye(4)
+    saved.integrate_views(
+        np.stack([depth, depth]),
+        np.stack([color, color]),
+        np.stack([depth > 0, depth > 0]),
+        np.stack([pose, pose]),
+        np.stack([K, K]),
+        window_ids=[0, 1],
+    )
+    original = next(iter(saved.submaps.values()))
+    original_local = original.mesh.vertices.copy()
+    original_global = original.global_vertices().copy()
+    T = (1.1, np.eye(3), np.array([0.2, 0.3, -0.1]))
+    current = MeshMap(MeshCfg(voxel_size=0.05, trunc_margin=0.15))
+
+    assert merge_mesh_into_session(saved, T, current) == 1
+    merged = next(iter(current.submaps.values()))
+
+    assert np.allclose(merged.mesh.vertices, original_local)
+    assert np.allclose(merged.global_vertices(), sim3_apply(T, original_global), atol=1e-6)

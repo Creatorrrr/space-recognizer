@@ -13,6 +13,29 @@ class DepthCfg:
     model: str = "depth-anything/DA3-SMALL"
     process_res: int = 504
     metric_model: str = "depth-anything/DA3METRIC-LARGE"
+    oak_fill_missing: bool = True
+    oak_fill_min_valid: int = 500
+
+
+@dataclass
+class CaptureCfg:
+    source_kind: str = "video"  # "video" or "oak"
+    oak_rgb_width: int = 1280
+    oak_rgb_height: int = 720
+    oak_depth_resolution: str = "400p"
+    oak_fps: float = 15.0
+    oak_queue_size: int = 4
+    oak_align_depth_to_rgb: bool = True
+    oak_lr_check: bool = True
+    oak_subpixel: bool = True
+    oak_extended_disparity: bool = False
+    oak_median_filter: str = "7x7"
+    oak_depth_min_m: float = 0.3
+    oak_depth_max_m: float = 8.0
+    oak_enable_imu: bool = True
+    oak_imu_rate_hz: int = 100
+    replay_depth_mode: str = "calibrated"  # "calibrated" or "resize"
+    replay_pair_tolerance_ms: float = 20.0
 
 
 @dataclass
@@ -43,6 +66,18 @@ class BackendCfg:
 
 
 @dataclass
+class MeshCfg:
+    enabled: bool = True
+    voxel_size: float = 0.05
+    trunc_margin: float = 0.15
+    depth_trunc_m: float = 8.0
+    min_surface_observations: int = 2
+    max_active_submaps: int = 32
+    persist_evidence: bool = False
+    export_on_exit: bool = False
+
+
+@dataclass
 class ObjectsCfg:
     ema_alpha: float = 0.3
     merge_radius: float = 0.5      # 연관 게이트의 상한 (크기 비례 게이트가 기본)
@@ -70,10 +105,12 @@ class Config:
     source: str | int = 0
     realtime: bool = True
     proc_width: int = 1280
+    capture: CaptureCfg = field(default_factory=CaptureCfg)
     depth: DepthCfg = field(default_factory=DepthCfg)
     detect: DetectCfg = field(default_factory=DetectCfg)
     vo: VoCfg = field(default_factory=VoCfg)
     backend: BackendCfg = field(default_factory=BackendCfg)
+    mesh: MeshCfg = field(default_factory=MeshCfg)
     objects: ObjectsCfg = field(default_factory=ObjectsCfg)
     graph: GraphCfg = field(default_factory=GraphCfg)
     viz: VizCfg = field(default_factory=VizCfg)
@@ -82,9 +119,9 @@ class Config:
     def load(cls, path: str | Path = "config.yaml") -> "Config":
         raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
         sections = {
-            "depth": DepthCfg, "detect": DetectCfg, "vo": VoCfg,
-            "backend": BackendCfg, "objects": ObjectsCfg,
-            "graph": GraphCfg, "viz": VizCfg,
+            "capture": CaptureCfg, "depth": DepthCfg, "detect": DetectCfg,
+            "vo": VoCfg, "backend": BackendCfg, "mesh": MeshCfg,
+            "objects": ObjectsCfg, "graph": GraphCfg, "viz": VizCfg,
         }
         kwargs = {}
         for key, value in raw.items():

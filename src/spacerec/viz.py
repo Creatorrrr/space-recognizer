@@ -3,6 +3,7 @@
 Entity tree:
   world/                      3D world frame (right-handed, Y down = camera convention)
     points                    global static point cloud
+    mesh/                     TSDF submap triangle meshes
     camera/                   live camera pose (Transform3D)
       image                   pinhole + RGB / depth / detections
     objects/                  object nodes + graph edges
@@ -92,6 +93,29 @@ class Visualizer:
 
     def log_global_map(self, points: np.ndarray, colors: np.ndarray) -> None:
         rr.log("world/points", rr.Points3D(points, colors=colors, radii=0.006))
+
+    def log_mesh_submaps(self, submaps: list) -> None:
+        for submap in submaps:
+            mesh = submap.mesh
+            ent = f"world/mesh/submap_{submap.submap_id}"
+            rr.log(ent, rr.Transform3D(
+                translation=submap.anchor_pose[:3, 3],
+                mat3x3=(submap.anchor_scale * submap.anchor_pose[:3, :3]),
+            ))
+            if mesh.n_vertices == 0 or mesh.n_faces == 0:
+                rr.log(ent, rr.Clear(recursive=True))
+                continue
+            kwargs = {
+                "vertex_positions": mesh.vertices,
+                "triangle_indices": mesh.faces,
+                "vertex_colors": np.column_stack([
+                    mesh.colors,
+                    np.full(len(mesh.colors), 220, np.uint8),
+                ]),
+            }
+            if len(mesh.normals) == len(mesh.vertices):
+                kwargs["vertex_normals"] = mesh.normals
+            rr.log(ent, rr.Mesh3D(**kwargs))
 
     def log_objects(self, objects: list, edges: list, visible: set[int]) -> None:
         """월드 오브젝트 노드(영속) + 관계 엣지 그래프.

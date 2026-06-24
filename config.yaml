@@ -3,9 +3,30 @@ source: sources/sample_720p.mp4  # 파일 경로 또는 웹캠 인덱스(정수)
 realtime: true        # true면 파일도 벽시계 기준으로 프레임 드롭 (웹캠 에뮬레이션)
 proc_width: 1280      # 처리 해상도 (가로)
 
+capture:
+  source_kind: video  # video 또는 oak. --source oak로도 전환 가능
+  oak_rgb_width: 1280
+  oak_rgb_height: 720
+  oak_depth_resolution: 400p
+  oak_fps: 15.0       # USB2(HIGH) 연결에서도 안정적인 기본값
+  oak_queue_size: 4
+  oak_align_depth_to_rgb: true
+  oak_lr_check: true
+  oak_subpixel: true
+  oak_extended_disparity: false
+  oak_median_filter: 7x7
+  oak_depth_min_m: 0.3
+  oak_depth_max_m: 8.0
+  oak_enable_imu: true
+  oak_imu_rate_hz: 100
+  replay_depth_mode: calibrated  # recorded OAK sessions: calibrated or resize
+  replay_pair_tolerance_ms: 20.0
+
 depth:
   model: depth-anything/DA3-SMALL  # HF model id (공식 depth-anything-3 패키지)
   process_res: 504
+  oak_fill_missing: true           # OAK stereo 빈 픽셀을 DA3로 metric 보정해 채움
+  oak_fill_min_valid: 500
 
 detect:
   # YOLOE-26 오픈 보캐뷸러리 (기본): COCO에 없는 실내 물체(rug, wardrobe 등)를
@@ -42,6 +63,16 @@ backend:
   voxel_size: 0.03     # 전역 지도 voxel (장면 스케일 단위)
   max_points: 800000
   metric_anchor: true   # DA3METRIC-LARGE로 미터 단위 추정 (윈도당 +0.3~1s)
+
+mesh:
+  enabled: true
+  voxel_size: 0.05      # TSDF mesh voxel size
+  trunc_margin: 0.15    # 보통 voxel_size의 3배
+  depth_trunc_m: 8.0
+  min_surface_observations: 2
+  max_active_submaps: 32
+  persist_evidence: false
+  export_on_exit: false
 
 objects:
   ema_alpha: 0.3

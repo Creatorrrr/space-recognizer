@@ -18,19 +18,44 @@ from .backend import BackendKeyframe, ReconstructionBackend
 from .calib import DepthCalibration
 from .capture import VideoSource
 from .config import Config
-from .depth import DepthEstimator
+from .depth import DepthEstimator, fuse_metric_depth
 from .detect import Detection, ObjectDetector
 from .geometry import sim3_apply, sim3_inverse
 from .graph import build_graph
+from .mesh import MeshMap
 from .objects import ObjectRegistry, localize_objects
 from .viz import Visualizer
 from .vo import VisualOdometry, default_intrinsics
 from .worldmap import GlobalMap
 
 
+def _source_from_config(cfg: Config):
+    if isinstance(cfg.source, str):
+        from .replay import RecordedOakSource, is_recorded_oak_session
+
+        if is_recorded_oak_session(cfg.source):
+            return RecordedOakSource(
+                cfg.source,
+                proc_width=cfg.proc_width,
+                realtime=cfg.realtime,
+                depth_mode=cfg.capture.replay_depth_mode,
+                max_pair_dt_ms=cfg.capture.replay_pair_tolerance_ms,
+            )
+
+    oak_mode = cfg.capture.source_kind.lower() == "oak" or cfg.source == "oak"
+    if oak_mode:
+        from .oak import OakSource
+
+        return OakSource(cfg.capture, proc_width=cfg.proc_width)
+    return VideoSource(cfg.source, proc_width=cfg.proc_width,
+                       realtime=cfg.realtime)
+
+
 def _drain_backend_results(backend: ReconstructionBackend, worldmap: GlobalMap,
                            viz: Visualizer, calib: DepthCalibration,
-                           vo: VisualOdometry, frame_wh: tuple[int, int]
+                           vo: VisualOdometry, frame_wh: tuple[int, int],
+                           apply_calib: bool = True,
+                           meshmap: MeshMap | None = None,
                            ) -> DepthCalibration:
     while True:
         try:
@@ -40,7 +65,13 @@ def _drain_backend_results(backend: ReconstructionBackend, worldmap: GlobalMap,
         worldmap.fuse(res.points, res.colors,
                       origins=res.view_origins, view_idx=res.point_view_idx)
         worldmap.set_correction_target(res.T_global_live)
-        if res.calib.inlier_frac > 0.3:
+        if meshmap is not None and getattr(res, "view_depths", None) is not None:
+            try:
+                meshmap.integrate_backend_result(res)
+                viz.log_mesh_submaps(meshmap.changed_submaps())
+            except Exception as exc:
+                print(f"[mesh] TSDF integration skipped: {exc}")
+        if apply_calib and res.calib.inlier_frac > 0.3:
             calib = res.calib
         if res.meters_per_unit is not None:
             viz.meters_per_unit = res.meters_per_unit
@@ -79,11 +110,17 @@ def main() -> None:
     parser.add_argument("--map", default=None, metavar="PATH",
                         help="세션 간 지도/객체 영속화 파일 (.npz). 있으면 불러와 "
                              "재위치추정 후 이어서 누적, 종료 시 저장")
+    parser.add_argument("--mesh-out", default=None, metavar="PATH",
+                        help="종료 시 생성된 mesh를 .ply로 export")
     args = parser.parse_args()
 
     cfg = Config.load(args.config)
     if args.source is not None:
-        cfg.source = int(args.source) if args.source.isdigit() else args.source
+        if args.source.lower() == "oak":
+            cfg.capture.source_kind = "oak"
+            cfg.source = "oak"
+        else:
+            cfg.source = int(args.source) if args.source.isdigit() else args.source
     if args.no_realtime:
         cfg.realtime = False
 
@@ -96,11 +133,20 @@ def main() -> None:
         from .appearance import AppearanceEmbedder
         embedder = AppearanceEmbedder(depth_est.device)
     viz = Visualizer(memory_limit=cfg.viz.memory_limit)
-    source = VideoSource(cfg.source, proc_width=cfg.proc_width, realtime=cfg.realtime)
+    source = _source_from_config(cfg)
+    source_has_metric_depth = bool(getattr(source, "has_metric_depth", False))
+    if source_has_metric_depth:
+        viz.meters_per_unit = 1.0
+    if getattr(source, "metadata", None):
+        print(f"source metadata: {source.metadata if not isinstance(source.metadata, dict) else source.metadata.get('device', source.metadata)}")
     W, H = source.proc_width, source.proc_height
-    K = default_intrinsics(W, H)
+    source_K = getattr(source, "K", None)
+    K = source_K if source_K is not None else default_intrinsics(W, H)
     vo = VisualOdometry(K, cfg.vo)
     worldmap = GlobalMap(cfg.backend)
+    meshmap = MeshMap(cfg.mesh) if cfg.mesh.enabled else None
+    if not cfg.realtime:
+        cfg.backend.period_s = 0.0
     backend = ReconstructionBackend(cfg.backend, cfg.depth.model,
                                     depth_est.device, cfg.depth.process_res,
                                     metric_model=cfg.depth.metric_model)
@@ -112,11 +158,12 @@ def main() -> None:
     # DA3의 프레임별 intrinsics 추정은 출렁임이 크다(fx 740~1015 관측).
     # 처음 K_WARMUP 프레임 동안 표본을 모아 중앙값으로 확정한 뒤 VO를 시작해야
     # 실행 도중 K가 바뀌며 지도 스케일이 갈라지는 일이 없다.
-    K_WARMUP = 10
+    K_WARMUP = 0 if source_K is not None else 10
     K_samples: list[np.ndarray] = []
     registry = ObjectRegistry(cfg.objects)
 
     saved_state = None
+    saved_mesh_state = None
     reloc_done = False
     if args.map:
         from .persistence import load_state
@@ -126,6 +173,11 @@ def main() -> None:
                   f"{len(saved_state.obj_classes)} objects — 재위치추정 대기")
         else:
             print(f"no saved world at {args.map} (새로 시작, 종료 시 저장)")
+        mesh_state_path = Path(args.map).with_suffix(".mesh.npz")
+        if meshmap is not None and mesh_state_path.exists():
+            from .persistence import load_mesh_state
+            saved_mesh_state = load_mesh_state(mesh_state_path, cfg.mesh)
+            print(f"loaded saved mesh: {len(saved_mesh_state.submaps)} submaps")
     dyn_classes = set(cfg.detect.dynamic_classes)
     sub = cfg.viz.point_subsample
     bw = cfg.depth.process_res  # 백엔드 입력 가로 해상도
@@ -138,7 +190,8 @@ def main() -> None:
     print("warming up models...")
     dummy = np.zeros((H, W, 3), np.uint8)
     detector.track(dummy)
-    depth_est.infer(dummy)
+    if not source_has_metric_depth or cfg.depth.oak_fill_missing:
+        depth_est.infer(dummy)
     if embedder is not None:
         embedder.warmup()
 
@@ -151,10 +204,28 @@ def main() -> None:
                 break
             viz.set_time(frame.ts)
             t0 = time.perf_counter()
+            if frame.K is not None:
+                vo.set_intrinsics(frame.K)
             detections = detector.track(frame.bgr)
             t1 = time.perf_counter()
-            raw_depth = depth_est.infer(frame.bgr)
-            if len(K_samples) < K_WARMUP:
+            raw_depth = None
+            has_metric_depth = frame.depth_m is not None
+            if has_metric_depth:
+                fallback = (depth_est.infer(frame.bgr)
+                            if cfg.depth.oak_fill_missing else None)
+                depth, oak_calib, _ = fuse_metric_depth(
+                    frame.depth_m, fallback, frame.depth_m > 0,
+                    min_depth_m=cfg.capture.oak_depth_min_m,
+                    max_depth_m=cfg.capture.oak_depth_max_m,
+                    min_valid=cfg.depth.oak_fill_min_valid,
+                )
+                raw_depth = depth
+                calib = oak_calib
+                frame_scale = 1.0
+            else:
+                raw_depth = depth_est.infer(frame.bgr)
+
+            if K_WARMUP and len(K_samples) < K_WARMUP:
                 if depth_est.last_K is not None:
                     K_samples.append(depth_est.last_K)
                 if len(K_samples) == K_WARMUP:
@@ -167,8 +238,13 @@ def main() -> None:
                     frame_count += 1
                     continue
             t2 = time.perf_counter()
-            depth = calib.apply(raw_depth) * frame_scale
-            gray = cv2.cvtColor(frame.bgr, cv2.COLOR_BGR2GRAY)
+            if has_metric_depth:
+                depth = raw_depth
+            else:
+                depth = calib.apply(raw_depth) * frame_scale
+            gray = (frame.gray_track if frame.gray_track is not None
+                    and frame.gray_track.shape == (H, W)
+                    else cv2.cvtColor(frame.bgr, cv2.COLOR_BGR2GRAY))
             excl = dynamic_mask(detections, (H, W), dyn_classes)
             pose = vo.process(gray, depth, frame.ts, excl)
             t3 = time.perf_counter()
@@ -176,7 +252,8 @@ def main() -> None:
             # 프레임별 depth 스케일 보정: 키프레임에 고정된 3D 특징점의 예측
             # z와 이번 프레임 depth 맵의 측정 z를 비교해, mono depth의 프레임별
             # 스케일 요동을 다음 프레임부터 상쇄한다 (log-EMA, 한 프레임 지연).
-            if pose.feat_uv is not None and len(pose.feat_uv) >= 20:
+            if (not has_metric_depth
+                    and pose.feat_uv is not None and len(pose.feat_uv) >= 20):
                 u = pose.feat_uv[:, 0].astype(int).clip(0, W - 1)
                 v = pose.feat_uv[:, 1].astype(int).clip(0, H - 1)
                 z_meas = depth[v, u]
@@ -197,13 +274,16 @@ def main() -> None:
                     dyn_mask=None if excl is None else
                              cv2.resize(excl.astype(np.uint8), (bw, bh),
                                         interpolation=cv2.INTER_NEAREST).astype(bool),
-                    calib_ab=(calib.a * frame_scale, calib.b * frame_scale),
+                    calib_ab=((1.0, 0.0) if has_metric_depth
+                              else (calib.a * frame_scale, calib.b * frame_scale)),
                 ))
                 kf_counter += 1
 
             # 백엔드 결과 반영 (논블로킹)
             new_calib = _drain_backend_results(backend, worldmap, viz, calib,
-                                               vo, (W, H))
+                                               vo, (W, H),
+                                               apply_calib=not has_metric_depth,
+                                               meshmap=meshmap)
             if new_calib is not calib:
                 # 새 calib은 키프레임 시점의 frame_scale까지 흡수해 피팅된 값.
                 # frame_scale을 리셋하지 않으면 같은 보정이 이중 적용되어
@@ -230,7 +310,8 @@ def main() -> None:
                               + T_wc_global[:3, 3])
                 cols = frame.bgr[::sub, ::sub, ::-1]
                 viz.log_live_points(pts_global, cols.reshape(-1, 3))
-            observations = localize_objects(detections, depth, vo.K, pose.T_wc)
+            observations = localize_objects(detections, depth, vo.K, pose.T_wc,
+                                            frame.depth_conf)
             for obs in observations:
                 obs.position = worldmap.to_global_points(obs.position[None])[0]
             if embedder is not None and observations:
@@ -247,7 +328,8 @@ def main() -> None:
 
             # 이전 세션 지도가 있으면 임베딩 매칭으로 재위치추정을 시도
             if saved_state is not None and not reloc_done and frame_count % 10 == 0:
-                from .persistence import icp_refine, merge_into_session, relocalize
+                from .persistence import (icp_refine, merge_into_session,
+                                          merge_mesh_into_session, relocalize)
                 result = relocalize(saved_state, registry)
                 if result is not None:
                     T, matches, rms = result
@@ -255,9 +337,15 @@ def main() -> None:
                                    cfg.backend.voxel_size)
                     merge_into_session(saved_state, T, matches, worldmap,
                                        registry, frame.ts)
+                    if meshmap is not None and saved_mesh_state is not None:
+                        n_mesh = merge_mesh_into_session(saved_mesh_state, T, meshmap)
+                        viz.log_mesh_submaps(meshmap.changed_submaps())
+                    else:
+                        n_mesh = 0
                     viz.log_global_map(worldmap.points, worldmap.colors)
                     print(f"[reloc] 이전 지도 정렬 성공: 매칭 {len(matches)}개, "
-                          f"rms={rms:.3f}, scale={T[0]:.3f} → 병합 완료")
+                          f"rms={rms:.3f}, scale={T[0]:.3f} "
+                          f"mesh_submaps={n_mesh} → 병합 완료")
                     reloc_done = True
 
             objects = registry.stable_objects(frame.ts)
@@ -281,25 +369,39 @@ def main() -> None:
         idle_since = time.monotonic()
         while time.monotonic() - idle_since < 8.0:
             before = len(worldmap.points)
-            calib = _drain_backend_results(backend, worldmap, viz, calib, vo, (W, H))
+            calib = _drain_backend_results(backend, worldmap, viz, calib, vo,
+                                           (W, H),
+                                           apply_calib=not source_has_metric_depth,
+                                           meshmap=meshmap)
             for _ in range(10):
                 worldmap.step_correction()
             if len(worldmap.points) != before:
                 idle_since = time.monotonic()
             time.sleep(0.3)
         if args.map:
-            from .persistence import save_state
+            from .persistence import save_mesh_state, save_state
             if saved_state is not None and not reloc_done:
                 # 이전 지도와 정렬하지 못함 — 덮어쓰면 이전 공간이 사라지므로
                 # 별도 파일로 저장해 보존한다
                 alt = str(Path(args.map).with_suffix(".unmerged.npz"))
                 n = save_state(alt, worldmap, registry, viz.meters_per_unit)
+                if meshmap is not None:
+                    save_mesh_state(Path(alt).with_suffix(".mesh.npz"), meshmap)
                 print(f"[reloc] 정렬 실패 — 이전 지도 보존, 이번 세션은 {alt}에 "
                       f"저장 ({n} objects)")
             else:
                 n = save_state(args.map, worldmap, registry, viz.meters_per_unit)
+                if meshmap is not None:
+                    save_mesh_state(Path(args.map).with_suffix(".mesh.npz"), meshmap)
                 print(f"world saved to {args.map} "
                       f"({len(worldmap.points)} pts, {n} objects)")
+        mesh_out = args.mesh_out
+        if mesh_out is None and cfg.mesh.enabled and cfg.mesh.export_on_exit:
+            mesh_out = "artifacts/mesh/latest.ply"
+        if mesh_out and meshmap is not None:
+            mesh = meshmap.export_ply(mesh_out)
+            print(f"mesh saved to {mesh_out} "
+                  f"({mesh.n_vertices} vertices, {mesh.n_faces} faces)")
     finally:
         backend.stop()
         source.release()

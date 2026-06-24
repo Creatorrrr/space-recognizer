@@ -3,7 +3,7 @@ import numpy as np
 from spacerec.config import GraphCfg, ObjectsCfg
 from spacerec.detect import Detection
 from spacerec.graph import build_graph
-from spacerec.objects import Observation, ObjectRegistry, WorldObject
+from spacerec.objects import Observation, ObjectRegistry, WorldObject, localize_objects
 
 
 def _det(track_id, cls_name="chair"):
@@ -38,6 +38,22 @@ def test_registry_persistence_and_ema():
     assert visible == set()
     assert len(reg.objects) == 1
     assert np.allclose(obj.position, p0 + 0.05)
+
+
+def test_localize_objects_uses_robust_mask_depth():
+    depth = np.full((20, 20), 2.0, np.float32)
+    depth[5, 5] = 0.0
+    depth[6, 6] = 8.0  # mask edge/outlier should not move the object center
+    mask = np.zeros((20, 20), bool)
+    mask[4:12, 4:12] = True
+    det = Detection(track_id=1, cls_name="chair", conf=0.9,
+                    box=np.array([4, 4, 12, 12], dtype=np.float32), mask=mask)
+    K = np.array([[100.0, 0.0, 10.0], [0.0, 100.0, 10.0], [0.0, 0.0, 1.0]])
+
+    obs = localize_objects([det], depth, K, np.eye(4))
+
+    assert len(obs) == 1
+    assert obs[0].position[2] == 2.0
 
 
 def test_registry_reidentify_same_class_nearby():

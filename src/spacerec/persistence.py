@@ -168,3 +168,47 @@ def merge_into_session(saved: SavedState, T: Sim3,
             embedding=emb.copy() if emb.any() else None)
         registry.objects[obj.obj_id] = obj
         registry._next_id += 1
+
+
+def save_mesh_state(path: str | Path, meshmap) -> int:
+    """Save mesh submap geometry beside the point/object world state."""
+    from .mesh import save_meshmap
+
+    return save_meshmap(path, meshmap)
+
+
+def load_mesh_state(path: str | Path, cfg=None):
+    """Load mesh submap geometry saved by `save_mesh_state`."""
+    from .mesh import load_meshmap
+
+    return load_meshmap(path, cfg)
+
+
+def merge_mesh_into_session(saved_meshmap, T: Sim3, meshmap) -> int:
+    """Merge saved mesh submaps after applying the old->current Sim3 anchor transform."""
+    from .mesh import MeshSubmap, TriMesh
+
+    n = 0
+    for saved in saved_meshmap.submaps.values():
+        sid = meshmap._next_id
+        meshmap._next_id += 1
+        submap = MeshSubmap(
+            submap_id=sid,
+            anchor_pose=saved.anchor_pose.copy(),
+            anchor_scale=float(saved.anchor_scale),
+            window_ids=list(saved.window_ids),
+            mesh=TriMesh(
+                vertices=saved.mesh.vertices.copy(),
+                faces=saved.mesh.faces.copy(),
+                normals=saved.mesh.normals.copy(),
+                colors=saved.mesh.colors.copy(),
+            ),
+            version=saved.version,
+            pose_version=saved.pose_version,
+            dirty=False,
+        )
+        submap.apply_sim3(T)
+        meshmap.submaps[sid] = submap
+        meshmap._changed.add(sid)
+        n += 1
+    return n
