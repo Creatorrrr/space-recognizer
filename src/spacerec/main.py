@@ -22,6 +22,7 @@ from .depth import DepthEstimator, fuse_metric_depth
 from .detect import Detection, ObjectDetector
 from .geometry import sim3_apply, sim3_inverse
 from .graph import build_graph
+from .imu import estimate_camera_rotation, should_accept_backend_keyframe
 from .mesh import MeshMap
 from .objects import ObjectRegistry, localize_objects
 from .viz import Visualizer
@@ -143,6 +144,11 @@ def main() -> None:
     source_K = getattr(source, "K", None)
     K = source_K if source_K is not None else default_intrinsics(W, H)
     vo = VisualOdometry(K, cfg.vo)
+    R_cam_imu = getattr(source, "R_cam_imu", None)
+    imu_since_keyframe = []
+    imu_max_angle_rad = np.radians(cfg.imu.max_rotation_deg)
+    prev_frame_ts_for_imu: float | None = None
+    imu_keyframe_ts: float | None = None
     worldmap = GlobalMap(cfg.backend)
     meshmap = MeshMap(cfg.mesh) if cfg.mesh.enabled else None
     if not cfg.realtime:
@@ -183,6 +189,7 @@ def main() -> None:
     bw = cfg.depth.process_res  # 백엔드 입력 가로 해상도
     bh = int(H * bw / W)
     kf_counter = 0
+    last_backend_keyframe_ts: float | None = None
 
     # 모델 첫 호출은 커널 컴파일로 수 초가 걸린다 (YOLOE ~3s 실측). 실시간
     # 페이싱이 시작되기 전에 더미 프레임으로 전부 워밍업해 두지 않으면
@@ -246,7 +253,60 @@ def main() -> None:
                     and frame.gray_track.shape == (H, W)
                     else cv2.cvtColor(frame.bgr, cv2.COLOR_BGR2GRAY))
             excl = dynamic_mask(detections, (H, W), dyn_classes)
-            pose = vo.process(gray, depth, frame.ts, excl)
+            if R_cam_imu is None and frame.metadata is not None:
+                meta_R = frame.metadata.get("imu_to_camera_rotation")
+                if meta_R is not None:
+                    R_cam_imu = np.asarray(meta_R, dtype=np.float64)
+            imu_samples = list(frame.imu_samples or [])
+            imu_candidate = imu_since_keyframe + imu_samples
+            imu_time_aligned = True
+            if frame.metadata is not None:
+                imu_time_aligned = bool(frame.metadata.get("imu_timestamp_aligned", True))
+            delta_t0 = prev_frame_ts_for_imu if imu_time_aligned else None
+            delta_t1 = frame.ts if imu_time_aligned else None
+            keyframe_t0 = imu_keyframe_ts if imu_time_aligned else None
+            keyframe_t1 = frame.ts if imu_time_aligned else None
+            delta_prior = None
+            since_prior = None
+            if cfg.imu.enabled and R_cam_imu is not None:
+                if cfg.imu.use_lk_prior:
+                    delta_prior = estimate_camera_rotation(
+                        imu_samples,
+                        R_cam_imu,
+                        min_samples=cfg.imu.min_rotation_samples,
+                        max_angle_rad=imu_max_angle_rad,
+                        t0=delta_t0,
+                        t1=delta_t1,
+                    )
+                if cfg.imu.use_pnp_prior:
+                    since_prior = estimate_camera_rotation(
+                        imu_candidate,
+                        R_cam_imu,
+                        min_samples=cfg.imu.min_rotation_samples,
+                        max_angle_rad=imu_max_angle_rad,
+                        t0=keyframe_t0,
+                        t1=keyframe_t1,
+                    )
+            omega_norm = None
+            if delta_prior is not None:
+                omega_norm = delta_prior.omega_norm
+            elif since_prior is not None:
+                omega_norm = since_prior.omega_norm
+            pose = vo.process(
+                gray,
+                depth,
+                frame.ts,
+                excl,
+                R_delta_prev=None if delta_prior is None else delta_prior.R,
+                R_since_keyframe=None if since_prior is None else since_prior.R,
+                omega_norm=omega_norm,
+            )
+            if pose.is_keyframe:
+                imu_since_keyframe = []
+                imu_keyframe_ts = frame.ts
+            else:
+                imu_since_keyframe = imu_candidate
+            prev_frame_ts_for_imu = frame.ts
             t3 = time.perf_counter()
 
             # 프레임별 depth 스케일 보정: 키프레임에 고정된 3D 특징점의 예측
@@ -264,7 +324,14 @@ def main() -> None:
                     frame_scale = float(np.clip(frame_scale * ratio ** 0.3,
                                                 0.5, 2.0))
 
-            if pose.is_keyframe:
+            accept_backend_keyframe = should_accept_backend_keyframe(
+                frame_ts=frame.ts,
+                last_backend_keyframe_ts=last_backend_keyframe_ts,
+                omega_norm=omega_norm,
+                blur_omega_rad_s=cfg.imu.keyframe_blur_omega_rad_s,
+                max_delay_s=cfg.imu.keyframe_max_delay_s,
+            )
+            if pose.is_keyframe and accept_backend_keyframe:
                 small = cv2.resize(frame.bgr, (bw, bh), interpolation=cv2.INTER_AREA)
                 backend.add_keyframe(BackendKeyframe(
                     kf_id=kf_counter, ts=frame.ts,
@@ -278,6 +345,7 @@ def main() -> None:
                               else (calib.a * frame_scale, calib.b * frame_scale)),
                 ))
                 kf_counter += 1
+                last_backend_keyframe_ts = frame.ts
 
             # 백엔드 결과 반영 (논블로킹)
             new_calib = _drain_backend_results(backend, worldmap, viz, calib,

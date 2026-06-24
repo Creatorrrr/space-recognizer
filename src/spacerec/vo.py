@@ -77,12 +77,15 @@ class VisualOdometry:
         self.K = K.copy()
 
     def process(self, gray: np.ndarray, depth: np.ndarray, ts: float,
-                exclude_mask: np.ndarray | None) -> PoseResult:
+                exclude_mask: np.ndarray | None,
+                R_delta_prev: np.ndarray | None = None,
+                R_since_keyframe: np.ndarray | None = None,
+                omega_norm: float | None = None) -> PoseResult:
         if self.keyframe is None:
             self._make_keyframe(gray, depth, ts, exclude_mask)
             return PoseResult(self.T_wc.copy(), 1.0, 0, True)
 
-        result = self._track(gray)
+        result = self._track(gray, R_delta_prev, R_since_keyframe)
         need_kf = (
             result.lost
             or ts - self.keyframe.ts >= self.cfg.keyframe_interval_s
@@ -101,15 +104,84 @@ class VisualOdometry:
             return np.inf
         return float(np.median(np.linalg.norm(self._pts2d - self._kf_pts2d, axis=1)))
 
-    def _track(self, gray: np.ndarray) -> PoseResult:
+    def _warp_points_with_rotation(self, pts: np.ndarray,
+                                   R_delta: np.ndarray) -> np.ndarray:
+        H = self.K @ np.asarray(R_delta, dtype=np.float64).reshape(3, 3) @ np.linalg.inv(self.K)
+        homog = np.column_stack([pts, np.ones(len(pts), dtype=np.float64)])
+        warped = (H @ homog.T).T
+        z = warped[:, 2:3]
+        valid = np.abs(z) > 1e-12
+        out = pts.astype(np.float32).copy()
+        out[valid[:, 0]] = (warped[valid[:, 0], :2] / z[valid[:, 0]]).astype(np.float32)
+        return out
+
+    def _lk_track(self, gray: np.ndarray, p0: np.ndarray,
+                  initial: np.ndarray | None = None
+                  ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        params = dict(_LK_PARAMS)
+        flags = int(params.pop("flags", 0))
+        if initial is None:
+            p1, st, _ = cv2.calcOpticalFlowPyrLK(
+                self._prev_gray, gray, p0, None, flags=flags, **params)
+        else:
+            p1, st, _ = cv2.calcOpticalFlowPyrLK(
+                self._prev_gray, gray, p0, initial.copy(),
+                flags=flags | cv2.OPTFLOW_USE_INITIAL_FLOW, **params)
+        if p1 is None or st is None:
+            empty = np.zeros((len(p0), 1, 2), dtype=np.float32)
+            return empty, np.zeros((len(p0), 1), dtype=np.uint8), np.full(len(p0), np.inf)
+        p0r, st_b, _ = cv2.calcOpticalFlowPyrLK(
+            gray, self._prev_gray, p1, None, flags=flags, **params)
+        if p0r is None or st_b is None:
+            return p1, st, np.full(len(p0), np.inf)
+        fb_err = np.linalg.norm(p0 - p0r, axis=2).ravel()
+        good_back = st_b.ravel() == 1
+        fb_err[~good_back] = np.inf
+        return p1, st, fb_err
+
+    def _choose_lk_result(self, base: tuple[np.ndarray, np.ndarray, np.ndarray],
+                          aided: tuple[np.ndarray, np.ndarray, np.ndarray] | None
+                          ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if aided is None:
+            return base
+
+        def score(item: tuple[np.ndarray, np.ndarray, np.ndarray]) -> tuple[int, float]:
+            _, st, fb = item
+            good = (st.ravel() == 1) & (fb < 1.5)
+            median = float(np.median(fb[good])) if np.any(good) else np.inf
+            return int(good.sum()), median
+
+        base_good, base_med = score(base)
+        aided_good, aided_med = score(aided)
+        if aided_good > base_good or (aided_good == base_good and aided_med <= base_med):
+            return aided
+        return base
+
+    def _solve_pnp(self, pts3d: np.ndarray, pts2d: np.ndarray,
+                   R_guess: np.ndarray | None = None):
+        kwargs = dict(reprojectionError=4.0, iterationsCount=100,
+                      flags=cv2.SOLVEPNP_ITERATIVE)
+        if R_guess is not None:
+            rvec0, _ = cv2.Rodrigues(np.asarray(R_guess, dtype=np.float64).reshape(3, 3))
+            kwargs.update(rvec=rvec0, tvec=np.zeros((3, 1), dtype=np.float64),
+                          useExtrinsicGuess=True)
+        return cv2.solvePnPRansac(
+            pts3d.astype(np.float64), pts2d.astype(np.float64), self.K, None,
+            **kwargs)
+
+    def _track(self, gray: np.ndarray, R_delta_prev: np.ndarray | None = None,
+               R_since_keyframe: np.ndarray | None = None) -> PoseResult:
         if self._pts2d is None or len(self._pts2d) < 8:
             return PoseResult(self.T_wc.copy(), 0.0, 0, False, lost=True)
 
         p0 = self._pts2d.astype(np.float32).reshape(-1, 1, 2)
-        p1, st, _ = cv2.calcOpticalFlowPyrLK(self._prev_gray, gray, p0, None, **_LK_PARAMS)
-        p0r, st_b, _ = cv2.calcOpticalFlowPyrLK(gray, self._prev_gray, p1, None, **_LK_PARAMS)
-        fb_err = np.linalg.norm(p0 - p0r, axis=2).ravel()
-        good = (st.ravel() == 1) & (st_b.ravel() == 1) & (fb_err < 1.5)
+        base_lk = self._lk_track(gray, p0)
+        aided_lk = None
+        if R_delta_prev is not None:
+            initial = self._warp_points_with_rotation(p0.reshape(-1, 2), R_delta_prev)
+            aided_lk = self._lk_track(gray, p0, initial.reshape(-1, 1, 2))
+        p1, st, fb_err = self._choose_lk_result(base_lk, aided_lk)
+        good = (st.ravel() == 1) & (fb_err < 1.5)
 
         self._pts2d = p1.reshape(-1, 2)[good]
         self._pts3d = self._pts3d[good]
@@ -118,10 +190,10 @@ class VisualOdometry:
         if n < 8:
             return PoseResult(self.T_wc.copy(), 0.0, n, False, lost=True)
 
-        ok, rvec, tvec, inliers = cv2.solvePnPRansac(
-            self._pts3d.astype(np.float64), self._pts2d.astype(np.float64),
-            self.K, None, reprojectionError=4.0, iterationsCount=100,
-            flags=cv2.SOLVEPNP_ITERATIVE)
+        ok, rvec, tvec, inliers = self._solve_pnp(
+            self._pts3d, self._pts2d, R_since_keyframe)
+        if (not ok or inliers is None or len(inliers) < 6) and R_since_keyframe is not None:
+            ok, rvec, tvec, inliers = self._solve_pnp(self._pts3d, self._pts2d)
         if not ok or inliers is None or len(inliers) < 6:
             return PoseResult(self.T_wc.copy(), 0.0, n, False, lost=True)
 

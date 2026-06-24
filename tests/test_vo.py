@@ -60,3 +60,36 @@ def test_vo_recovers_lateral_translation():
     assert abs(t[1]) < 0.01 and abs(t[2]) < 0.02
     # 회전은 거의 없어야 함
     assert np.allclose(r1.T_wc[:3, :3], np.eye(3), atol=0.02)
+
+
+def test_vo_rotation_prior_tracks_large_pure_rotation():
+    W, H, Z = 320, 240, 2.0
+    K = default_intrinsics(W, H)
+    angle = np.radians(9.0)
+    R_delta, _ = cv2.Rodrigues(np.array([0.0, angle, 0.0], dtype=np.float64))
+    H_prev_to_cur = K @ R_delta @ np.linalg.inv(K)
+
+    img0 = _noise_image((H, W), seed=4)
+    img1 = cv2.warpPerspective(img0, H_prev_to_cur, (W, H),
+                               flags=cv2.INTER_LINEAR)
+    depth = np.full((H, W), Z, np.float32)
+    cfg = VoCfg(keyframe_interval_s=100.0, keyframe_min_flow_px=1e9,
+                min_inlier_ratio=0.0)
+
+    plain = VisualOdometry(K, cfg)
+    assert plain.process(img0, depth, 0.0, None).is_keyframe
+    plain_result = plain.process(img1, depth, 0.1, None)
+
+    aided = VisualOdometry(K, cfg)
+    assert aided.process(img0, depth, 0.0, None).is_keyframe
+    aided_result = aided.process(
+        img1, depth, 0.1, None,
+        R_delta_prev=R_delta,
+        R_since_keyframe=R_delta,
+    )
+
+    assert plain_result.lost
+    assert not aided_result.lost
+    assert aided_result.n_tracked >= 8
+    assert aided_result.inlier_ratio == pytest.approx(1.0)
+    assert np.allclose(aided_result.T_wc[:3, :3], R_delta.T, atol=0.02)

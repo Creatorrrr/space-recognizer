@@ -48,8 +48,9 @@ YOLOE-26s-seg + MobileCLIP2 텍스트 인코더 0.3GB, DINOv2-small)가 자동
 - OAK-D-Lite 모드는 DepthAI가 RGB와 RGB에 정합된 미터 단위 stereo depth를
   가져오고, stereo가 비는 픽셀만 DA3로 metric 보정해 채웁니다. USB 상태가
   `HIGH`면 USB 2.0 연결이므로 USB 3 케이블/포트를 먼저 확인하세요.
-  IMU가 노출되는 장치에서는 accel/gyro도 함께 읽어 smoke 출력과 프레임
-  metadata에 남깁니다. 현재 pose 추정에는 아직 직접 융합하지 않습니다.
+  IMU가 노출되는 장치에서는 accel/gyro도 함께 읽고, `imu.enabled: true`일 때
+  gyro 적분 회전을 LK 초기 flow와 PnP 초기값으로 넘깁니다. 현재 녹화 세션
+  A/B에서는 어려운 세션의 `lost`가 줄었지만 검증 폭이 아직 좁아 기본값은 off입니다.
 - OAK 녹화 세션 디렉터리(`metadata.json`, `events.jsonl`, `streams/`)도
   `--source`로 바로 재생할 수 있습니다. `capture.replay_depth_mode` 기본값
   `calibrated`는 녹화된 stereo depth를 RGB 카메라 좌표계로 재투영하고,
@@ -86,7 +87,7 @@ YOLOE-26s-seg + MobileCLIP2 텍스트 인코더 0.3GB, DINOv2-small)가 자동
   DINOv2-small 외형 임베딩  → 재등장 물체 re-ID
   OAK stereo depth(선택)   → 미터 단위 depth, DA3-Small은 hole-fill 보조
   DA3-Small mono depth     → 웹캠/영상 기본 depth → 객체 3D 위치
-  LK 광학흐름 + PnP RANSAC → 카메라 pose (live 좌표계)
+  LK 광학흐름 + PnP RANSAC → 카메라 pose (옵션: gyro rotation prior)
 
 [백엔드 계층 — 5초 주기, 별도 프로세스]
   키프레임 윈도(12뷰, 절반 중첩) → DA3 any-view 멀티뷰 추론
@@ -118,6 +119,7 @@ DA3-small pose 헤드의 병진 과소추정, 커뮤니티 래퍼 결함 등)이
 .venv/bin/python benchmarks/headless_run.py   # 헤드리스 전체 파이프라인 → /tmp/map.npz
 .venv/bin/python benchmarks/oak_smoke.py      # OAK USB/K/depth stream 확인
 .venv/bin/python benchmarks/replay_smoke.py sources/session_20260624_054320_194430108151D05A00 --frames 60 --full-models
+.venv/bin/python benchmarks/replay_smoke.py sources/session_20260624_054320_194430108151D05A00 sources/session_20260624_055321_194430108151D05A00 --frames 120 --compare-imu
 .venv/bin/python benchmarks/mesh_smoke.py sources/session_20260624_054320_194430108151D05A00 --frames 120
 ```
 
@@ -133,6 +135,9 @@ DA3-small pose 헤드의 병진 과소추정, 커뮤니티 래퍼 결함 등)이
 - mesh는 현재 TSDF submap 기반의 표시/export 레이어입니다. object localization과
   relocalization의 기준 표현은 기존 point cloud이고, DA3 video 입력에서는 metric
   scale drift가 남을 수 있어 recorded OAK metric depth가 더 안정적입니다.
+- IMU는 translation을 적분하지 않습니다. 저가 MEMS accel의 bias를 이중 적분하면
+  몇 초 안에 위치가 크게 드리프트하므로, 현재는 gyro rotation prior와 고속 회전
+  backend keyframe gating에만 사용합니다.
 - YOLOE 오픈 보캐뷸러리는 검출이 풍부한 대신 중복/노이즈 노드가 다소 늘 수 있음
   (`detect.conf` 상향이나 어휘 축소로 조절).
 - `--map` 재위치추정은 같은 물체가 3개 이상 다시 보여야 성공 — 이전 세션과

@@ -56,6 +56,17 @@ class VoCfg:
 
 
 @dataclass
+class ImuCfg:
+    enabled: bool = False
+    use_lk_prior: bool = True
+    use_pnp_prior: bool = True
+    min_rotation_samples: int = 2
+    max_rotation_deg: float = 35.0
+    keyframe_blur_omega_rad_s: float = 2.5
+    keyframe_max_delay_s: float = 1.0
+
+
+@dataclass
 class BackendCfg:
     period_s: float = 5.0
     window_size: int = 12
@@ -109,6 +120,7 @@ class Config:
     depth: DepthCfg = field(default_factory=DepthCfg)
     detect: DetectCfg = field(default_factory=DetectCfg)
     vo: VoCfg = field(default_factory=VoCfg)
+    imu: ImuCfg = field(default_factory=ImuCfg)
     backend: BackendCfg = field(default_factory=BackendCfg)
     mesh: MeshCfg = field(default_factory=MeshCfg)
     objects: ObjectsCfg = field(default_factory=ObjectsCfg)
@@ -120,7 +132,7 @@ class Config:
         raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
         sections = {
             "capture": CaptureCfg, "depth": DepthCfg, "detect": DetectCfg,
-            "vo": VoCfg, "backend": BackendCfg, "mesh": MeshCfg,
+            "vo": VoCfg, "imu": ImuCfg, "backend": BackendCfg, "mesh": MeshCfg,
             "objects": ObjectsCfg, "graph": GraphCfg, "viz": VizCfg,
         }
         kwargs = {}

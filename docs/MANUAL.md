@@ -92,11 +92,13 @@ uv pip install -p .venv -e ".[oak]"
   가장 큽니다.
 - OAK 모드는 RGB에 정합된 미터 단위 stereo depth를 우선 사용하고, stereo가
   비는 픽셀만 DA3를 OAK depth에 affine 정합해 채웁니다.
-- IMU가 노출되는 OAK-D-Lite에서는 accel/gyro stream도 읽습니다. 현재는
-  `benchmarks/oak_smoke.py`와 프레임 metadata에서 확인 가능한 진단/향후 VO
-  융합용 입력이며, pose 계산에는 아직 직접 보정값으로 넣지 않습니다.
+- IMU가 노출되는 OAK-D-Lite에서는 accel/gyro stream도 읽습니다.
+  `imu.enabled: true`로 켜면 gyro 적분 회전을 LK 초기 flow와 PnP 초기값으로
+  넘기고, 고속 회전 구간의 backend keyframe 승격을 지연시킵니다.
+  현재 제공된 녹화 세션 A/B에서는 어려운 세션의 `lost`가 줄었지만 검증 폭이
+  아직 좁아 기본값은 off입니다.
 - `config.yaml`의 `capture.*`에서 OAK RGB 크기, FPS, LR-check, subpixel,
-  depth min/max, IMU 활성화 여부를 조정할 수 있습니다.
+  depth min/max, IMU stream 활성화 여부를 조정할 수 있습니다.
 
 ### 3-4. OAK 녹화 세션 재생
 
@@ -107,6 +109,7 @@ OAK-D-Lite 입력을 디렉터리로 녹화해 둔 세션도 입력으로 사용
 ```bash
 .venv/bin/python benchmarks/replay_smoke.py sources/session_20260624_054320_194430108151D05A00 --frames 60
 .venv/bin/python benchmarks/replay_smoke.py sources/session_20260624_054320_194430108151D05A00 --frames 60 --full-models
+.venv/bin/python benchmarks/replay_smoke.py sources/session_20260624_054320_194430108151D05A00 sources/session_20260624_055321_194430108151D05A00 --frames 120 --compare-imu
 .venv/bin/python benchmarks/mesh_smoke.py sources/session_20260624_054320_194430108151D05A00 --frames 120 --out-dir artifacts/mesh
 .venv/bin/python -m spacerec.main --source sources/session_20260624_054320_194430108151D05A00 --max-seconds 3 --no-realtime
 .venv/bin/python -m spacerec.main --source sources/session_20260624_054320_194430108151D05A00 --no-realtime --mesh-out artifacts/mesh/session.ply
@@ -122,6 +125,10 @@ OAK-D-Lite 입력을 디렉터리로 녹화해 둔 세션도 입력으로 사용
 - 녹화 replay는 파일 입력이지만 metric depth와 RGB intrinsics를 가진
   source로 취급됩니다. 따라서 DA3 mono-only 영상 경로가 아니라 OAK metric
   depth 경로를 탑니다.
+- `--compare-imu`는 각 세션을 visual-only와 IMU-assisted로 두 번 돌려
+  `lost`, `avg_tracked`, `avg_inlier`, `imu_prior_frames`,
+  `imu_blur_skipped_kf`를 함께 출력합니다. 이 결과가 개선을 보이지 않으면
+  `imu.enabled`는 끈 상태로 두는 것이 안전합니다.
 
 ### 3-5. TSDF mesh 생성/export
 
@@ -306,6 +313,15 @@ detect:
 vo:
   keyframe_interval_s: 0.5        # 키프레임 간격. 줄이면 정밀↑ 부하↑
 
+imu:
+  enabled: false                  # true면 gyro-derived LK/PnP rotation prior 사용
+  use_lk_prior: true
+  use_pnp_prior: true
+  min_rotation_samples: 2
+  max_rotation_deg: 35.0          # 이상치 rotation prior는 버리고 visual-only fallback
+  keyframe_blur_omega_rad_s: 2.5  # 고속 회전 frame은 backend keyframe 승격 지연
+  keyframe_max_delay_s: 1.0       # 지연이 길어지면 starvation 방지로 승격 허용
+
 backend:
   period_s: 5.0                   # 3D 재구성 주기 (초)
   window_size: 12                 # 재구성에 쓰는 키프레임 수
@@ -343,6 +359,7 @@ graph:
 | mesh가 너무 무겁다 | `mesh.voxel_size: 0.07`, `mesh.max_active_submaps: 16`, smoke `--frames` 축소 |
 | mesh가 거칠다 | recorded OAK replay 사용, `mesh.voxel_size: 0.03`, 더 느린 카메라 이동 |
 | 카메라 추적이 자주 끊긴다 | 더 천천히 촬영, `vo.keyframe_interval_s: 0.3` |
+| 빠른 회전 때 backend mesh/point cloud가 흐릿하다 | OAK/replay에서 `imu.enabled: true`로 A/B 측정 후 개선될 때만 사용 |
 | 같은 물체가 여러 노드로 등록된다 | `objects.merge_radius: 0.8`, `objects.app_gate: 0.3` |
 | 정지한 물체에 `~`(동적) 표시가 붙는다 | `objects.dynamic_var_thresh: 0.5` |
 | 오검출/중복 노드가 많다 (YOLOE) | `detect.conf: 0.45`, `vocabulary`에서 불필요 어휘 제거 |
@@ -362,6 +379,9 @@ graph:
 
 # OAK-D-Lite 연결/캘리브레이션/depth stream 점검
 .venv/bin/python benchmarks/oak_smoke.py
+
+# recorded OAK replay에서 IMU off/on VO 비교
+.venv/bin/python benchmarks/replay_smoke.py sources/session_20260624_054320_194430108151D05A00 sources/session_20260624_055321_194430108151D05A00 --frames 120 --compare-imu
 
 # recorded OAK replay에서 TSDF mesh export smoke
 .venv/bin/python benchmarks/mesh_smoke.py sources/session_20260624_054320_194430108151D05A00 --frames 120
@@ -394,6 +414,11 @@ graph:
 **Q. 콘솔에 `LOST`가 계속 찍힙니다.**
 카메라 추적 실패입니다. 너무 빠른 움직임, 모션 블러, 특징 없는 벽면이 원인입니다.
 천천히, 질감 있는 장면을 비추면 자동으로 복구됩니다.
+
+**Q. IMU를 켜면 위치 추정도 좋아지나요?**
+현재 IMU는 gyro로 회전 prior만 제공합니다. accelerometer translation 적분은 bias와
+노이즈가 이중 적분되어 몇 초 안에 크게 드리프트하므로 쓰지 않습니다. 녹화 세션
+A/B에서 개선이 확인될 때만 `imu.enabled: true`를 사용하세요.
 
 **Q. 지도가 두 겹으로 어긋나 보입니다.**
 장시간 사용으로 drift가 누적된 경우입니다. 어긋난 옛 표면은 그 자리를 다시

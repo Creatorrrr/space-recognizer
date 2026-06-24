@@ -36,6 +36,14 @@ mesh:
   trunc_margin: 0.16
   min_surface_observations: 3
   max_active_submaps: 8
+imu:
+  enabled: true
+  use_lk_prior: false
+  use_pnp_prior: true
+  min_rotation_samples: 3
+  max_rotation_deg: 25.0
+  keyframe_blur_omega_rad_s: 1.8
+  keyframe_max_delay_s: 0.7
 """,
         encoding="utf-8",
     )
@@ -55,6 +63,13 @@ mesh:
     assert cfg.mesh.trunc_margin == 0.16
     assert cfg.mesh.min_surface_observations == 3
     assert cfg.mesh.max_active_submaps == 8
+    assert cfg.imu.enabled is True
+    assert cfg.imu.use_lk_prior is False
+    assert cfg.imu.use_pnp_prior is True
+    assert cfg.imu.min_rotation_samples == 3
+    assert cfg.imu.max_rotation_deg == 25.0
+    assert cfg.imu.keyframe_blur_omega_rad_s == 1.8
+    assert cfg.imu.keyframe_max_delay_s == 0.7
 
 
 def test_select_torch_device_prefers_cuda(monkeypatch):

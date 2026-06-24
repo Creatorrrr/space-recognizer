@@ -14,6 +14,8 @@ from typing import Iterator
 import cv2
 import numpy as np
 
+from .imu import ImuSample
+
 
 @dataclass
 class Frame:
@@ -25,6 +27,7 @@ class Frame:
     K: np.ndarray | None = None             # optional camera intrinsics for bgr
     gray_track: np.ndarray | None = None    # optional tracking image
     imu: dict[str, Any] | None = None       # optional accelerometer/gyro sample
+    imu_samples: list[ImuSample] | None = None  # optional samples over the frame interval
     metadata: dict[str, Any] | None = None  # optional source metadata
 
 

@@ -75,3 +75,32 @@
    60° FOV 가정 fx=1108 대비 상당한 차이)을 담당.
 5. 전 구간 scale=1.000, calib a≈0.97-1.0으로 좌표계 일관성 확보. 10초 영상 기준
    지도 ~23k 포인트(voxel 0.03), 톱다운에서 단일 방 구조 확인.
+
+## IMU-aided VO A/B (2026-06-24)
+
+명령:
+
+```bash
+.venv/bin/python benchmarks/replay_smoke.py \
+  sources/session_20260624_054320_194430108151D05A00 \
+  sources/session_20260624_055321_194430108151D05A00 \
+  --frames 120 --compare-imu
+```
+
+| 세션 | 모드 | lost | keyframes | avg_tracked | avg_inlier | imu_prior_frames | blur_skipped_kf |
+|---|---|---:|---:|---:|---:|---:|---:|
+| session_20260624_054320_194430108151D05A00 | off | 0 | 23 | 200.0 | 0.92 | 0 | 0 |
+| session_20260624_054320_194430108151D05A00 | on | 0 | 23 | 200.0 | 0.92 | 119 | 0 |
+| session_20260624_055321_194430108151D05A00 | off | 1 | 33 | 50.8 | 0.79 | 0 | 0 |
+| session_20260624_055321_194430108151D05A00 | on | 0 | 33 | 50.9 | 0.79 | 119 | 0 |
+
+해석:
+- gyro prior는 두 기록 모두 119/120프레임에서 계산되어 LK/PnP 경로에 전달됐다.
+- 안정 세션은 지표 변화가 없었고, 어려운 세션은 `lost`가 1에서 0으로 줄었다.
+  다만 개선 폭이 현재 두 녹화 120프레임 smoke에 한정되므로 `imu.enabled` 기본값은
+  보수적으로 `false`를 유지하고, 현장 녹화에서는 `--compare-imu`로 확인한 뒤 켠다.
+- 두 기록 모두 `keyframe_blur_omega_rad_s=2.5`를 넘는 backend keyframe 후보가 없어
+  blur gating skip은 0이었다. 빠른 회전 기록을 추가 확보하면 이 카운터를 먼저 본다.
+- accelerometer translation 적분은 범위 밖이다. OAK-D-Lite급 MEMS accel bias를 이중
+  적분하면 짧은 시간에도 position drift가 커지므로, 현재 IMU 사용은 gyro rotation
+  prior와 backend keyframe blur gating으로 제한한다.

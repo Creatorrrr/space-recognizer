@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 
 from .capture import Frame
+from .imu import ImuSample
 
 
 class ReplayFormatError(RuntimeError):
@@ -232,6 +233,31 @@ def _transform_between_recorded_cameras(meta: dict[str, Any],
     return R_total, t_total
 
 
+def imu_to_camera_rotation_from_metadata(meta: dict[str, Any],
+                                         target_socket: int = 0) -> np.ndarray | None:
+    """Return recorded OAK IMU-frame to target camera-frame rotation.
+
+    DepthAI recordings store IMU extrinsics to one camera socket. If the target
+    camera differs, compose through the recorded camera extrinsics path. Missing
+    metadata returns None so downstream IMU priors can stay disabled.
+    """
+
+    imu_ext = meta.get("calibration", {}).get("eeprom", {}).get("imuExtrinsics")
+    if not isinstance(imu_ext, dict):
+        return None
+    R_imu_to_source = np.asarray(imu_ext.get("rotationMatrix"), dtype=np.float64)
+    if R_imu_to_source.shape != (3, 3):
+        return None
+    source_socket = int(imu_ext.get("toCameraSocket", target_socket))
+    if source_socket == target_socket:
+        return R_imu_to_source
+    source_to_target = _transform_between_recorded_cameras(
+        meta, source_socket=source_socket, target_socket=target_socket)
+    if source_to_target is None:
+        return None
+    return source_to_target[0] @ R_imu_to_source
+
+
 def reproject_depth_to_rgb(depth_m: np.ndarray, K_depth: np.ndarray,
                            K_rgb: np.ndarray,
                            depth_to_rgb: tuple[np.ndarray, np.ndarray],
@@ -299,6 +325,7 @@ class RecordedOakSource:
         self.depth_events = self.events.get("depth", [])
         self.left_events = self.events.get("left", [])
         self.imu_events = self.events.get("imu", [])
+        self._imu_event_times = [event.ts_device_ns for event in self.imu_events]
         self.realtime = bool(realtime)
         self.depth_mode = depth_mode
         self.max_pair_delta_ns = int(max_pair_dt_ms * 1_000_000)
@@ -322,6 +349,8 @@ class RecordedOakSource:
                                         self.proc_width, self.proc_height)
         self._depth_to_rgb = _transform_between_recorded_cameras(
             self.metadata, source_socket=1, target_socket=0)
+        self.R_cam_imu = imu_to_camera_rotation_from_metadata(
+            self.metadata, target_socket=0)
 
     def _resize_bgr(self, bgr: np.ndarray) -> np.ndarray:
         if bgr.shape[1] == self.proc_width and bgr.shape[0] == self.proc_height:
@@ -390,8 +419,45 @@ class RecordedOakSource:
         sample["timestamp_s"] = (int(ts) - self._start_ts_ns) / 1e9
         return sample or None
 
+    def _record_to_imu_sample(self, event: ReplayEvent,
+                              rec: dict[str, Any]) -> ImuSample:
+        accel = rec.get("accel") or {}
+        gyro = rec.get("gyro") or {}
+        ts = int(rec.get("ts_device_ns") or event.ts_device_ns)
+        return ImuSample(
+            t=(ts - self._start_ts_ns) / 1e9,
+            accel=np.array([accel.get("x", 0.0),
+                            accel.get("y", 0.0),
+                            accel.get("z", 0.0)], dtype=np.float64),
+            gyro=np.array([gyro.get("x", 0.0),
+                           gyro.get("y", 0.0),
+                           gyro.get("z", 0.0)], dtype=np.float64),
+        )
+
+    def _load_imu_window(self, prev_rgb_ts_ns: int | None,
+                         rgb_ts_ns: int) -> list[ImuSample]:
+        if not self.imu_events:
+            return []
+        if prev_rgb_ts_ns is None:
+            start_idx = bisect.bisect_left(self._imu_event_times, rgb_ts_ns)
+        else:
+            start_idx = bisect.bisect_right(self._imu_event_times, prev_rgb_ts_ns)
+        end_idx = bisect.bisect_right(self._imu_event_times, rgb_ts_ns)
+        samples: list[ImuSample] = []
+        lower = rgb_ts_ns if prev_rgb_ts_ns is None else prev_rgb_ts_ns
+        for event in self.imu_events[start_idx:end_idx]:
+            for rec in event.raw.get("records") or []:
+                ts = int(rec.get("ts_device_ns") or event.ts_device_ns)
+                if prev_rgb_ts_ns is not None and ts <= lower:
+                    continue
+                if ts > rgb_ts_ns:
+                    continue
+                samples.append(self._record_to_imu_sample(event, rec))
+        return samples
+
     def frames(self) -> Iterator[Frame]:
         wall_start = time.monotonic()
+        prev_rgb_ts_ns: int | None = None
         for index, rgb_event in enumerate(self.rgb_events):
             if self._closed:
                 return
@@ -405,6 +471,8 @@ class RecordedOakSource:
                 raise ReplayFormatError(f"rgb payload must be HxWx3, got {bgr.shape}")
             bgr = self._resize_bgr(bgr)
             depth_m, depth_conf = self._load_depth_for(rgb_event, bgr.shape[:2])
+            imu_samples = self._load_imu_window(prev_rgb_ts_ns,
+                                                rgb_event.ts_device_ns)
             yield Frame(
                 ts=ts,
                 bgr=bgr,
@@ -414,13 +482,17 @@ class RecordedOakSource:
                 K=self.K.copy(),
                 gray_track=self._load_gray_for(rgb_event, bgr),
                 imu=self._load_imu_for(rgb_event),
+                imu_samples=imu_samples,
                 metadata={
                     "recording": str(self.root),
                     "source_metadata": self.metadata,
                     "depth_mode": self.depth_mode,
                     "has_depth_to_rgb_calibration": self._depth_to_rgb is not None,
+                    "imu_to_camera_rotation": (
+                        None if self.R_cam_imu is None else self.R_cam_imu.tolist()),
                 },
             )
+            prev_rgb_ts_ns = rgb_event.ts_device_ns
 
     def release(self) -> None:
         self._closed = True

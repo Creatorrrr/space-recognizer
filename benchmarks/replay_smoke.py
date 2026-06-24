@@ -19,6 +19,7 @@ import spacerec  # noqa: F401
 from spacerec.backend import BackendKeyframe, _Worker
 from spacerec.config import Config
 from spacerec.device import select_torch_device
+from spacerec.imu import estimate_camera_rotation, should_accept_backend_keyframe
 from spacerec.objects import ObjectRegistry, localize_objects
 from spacerec.replay import RecordedOakSource, _nearest
 from spacerec.vo import VisualOdometry
@@ -70,7 +71,7 @@ def _run_backend_window(cfg: Config, keyframes: list[BackendKeyframe]) -> int:
 
 
 def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
-                backend: bool) -> dict:
+                backend: bool, imu_enabled: bool | None = None) -> dict:
     src = RecordedOakSource(
         path,
         proc_width=cfg.proc_width,
@@ -88,6 +89,13 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
         registry = ObjectRegistry(cfg.objects)
 
     vo = VisualOdometry(src.K, cfg.vo)
+    use_imu = cfg.imu.enabled if imu_enabled is None else bool(imu_enabled)
+    R_cam_imu = src.R_cam_imu
+    imu_since_keyframe = []
+    imu_max_angle_rad = np.radians(cfg.imu.max_rotation_deg)
+    prev_frame_ts_for_imu: float | None = None
+    imu_keyframe_ts: float | None = None
+    last_backend_keyframe_ts: float | None = None
     stats = Counter()
     valid_fracs = []
     inliers = []
@@ -111,13 +119,79 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
             detections = detector.track(frame.bgr) if detector is not None else []
             for det in detections:
                 classes[det.cls_name] += 1
+            imu_samples = list(frame.imu_samples or [])
+            imu_candidate = imu_since_keyframe + imu_samples
+            imu_time_aligned = True
+            if frame.metadata is not None:
+                imu_time_aligned = bool(frame.metadata.get("imu_timestamp_aligned", True))
+            delta_t0 = prev_frame_ts_for_imu if imu_time_aligned else None
+            delta_t1 = frame.ts if imu_time_aligned else None
+            keyframe_t0 = imu_keyframe_ts if imu_time_aligned else None
+            keyframe_t1 = frame.ts if imu_time_aligned else None
+            delta_prior = None
+            since_prior = None
+            if use_imu:
+                if R_cam_imu is None:
+                    stats["imu_no_extrinsics"] += 1
+                elif not imu_samples:
+                    stats["imu_no_samples"] += 1
+                else:
+                    if cfg.imu.use_lk_prior:
+                        delta_prior = estimate_camera_rotation(
+                            imu_samples,
+                            R_cam_imu,
+                            min_samples=cfg.imu.min_rotation_samples,
+                            max_angle_rad=imu_max_angle_rad,
+                            t0=delta_t0,
+                            t1=delta_t1,
+                        )
+                    if cfg.imu.use_pnp_prior:
+                        since_prior = estimate_camera_rotation(
+                            imu_candidate,
+                            R_cam_imu,
+                            min_samples=cfg.imu.min_rotation_samples,
+                            max_angle_rad=imu_max_angle_rad,
+                            t0=keyframe_t0,
+                            t1=keyframe_t1,
+                        )
+                    stats["imu_lk_priors"] += int(delta_prior is not None)
+                    stats["imu_pnp_priors"] += int(since_prior is not None)
+                    stats["imu_prior_frames"] += int(
+                        delta_prior is not None or since_prior is not None)
+            omega_norm = None
+            if delta_prior is not None:
+                omega_norm = delta_prior.omega_norm
+            elif since_prior is not None:
+                omega_norm = since_prior.omega_norm
             pose = vo.process(
                 gray,
                 frame.depth_m if frame.depth_m is not None else np.ones(gray.shape, np.float32),
                 frame.ts,
                 _dynamic_mask(detections, gray.shape, set(cfg.detect.dynamic_classes)),
+                R_delta_prev=None if delta_prior is None else delta_prior.R,
+                R_since_keyframe=None if since_prior is None else since_prior.R,
+                omega_norm=omega_norm,
             )
-            if backend and pose.is_keyframe and frame.depth_m is not None and len(keyframes) < 6:
+            if pose.is_keyframe:
+                imu_since_keyframe = []
+                imu_keyframe_ts = frame.ts
+            else:
+                imu_since_keyframe = imu_candidate
+            prev_frame_ts_for_imu = frame.ts
+            accept_backend_keyframe = should_accept_backend_keyframe(
+                frame_ts=frame.ts,
+                last_backend_keyframe_ts=last_backend_keyframe_ts,
+                omega_norm=omega_norm,
+                blur_omega_rad_s=cfg.imu.keyframe_blur_omega_rad_s,
+                max_delay_s=cfg.imu.keyframe_max_delay_s,
+            )
+            if pose.is_keyframe and not accept_backend_keyframe:
+                stats["imu_blur_skipped_kf"] += 1
+            elif (pose.is_keyframe and omega_norm is not None
+                  and omega_norm > cfg.imu.keyframe_blur_omega_rad_s):
+                stats["imu_blur_forced_kf"] += 1
+            if (backend and pose.is_keyframe and accept_backend_keyframe
+                    and frame.depth_m is not None and len(keyframes) < 6):
                 bw = min(cfg.depth.process_res, 252)
                 bh = int(frame.bgr.shape[0] * bw / frame.bgr.shape[1])
                 dyn = _dynamic_mask(detections, gray.shape, set(cfg.detect.dynamic_classes))
@@ -136,6 +210,8 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
                         interpolation=cv2.INTER_NEAREST).astype(bool),
                     calib_ab=(1.0, 0.0),
                 ))
+            if pose.is_keyframe and accept_backend_keyframe:
+                last_backend_keyframe_ts = frame.ts
             stats["lost"] += int(pose.lost)
             stats["keyframes"] += int(pose.is_keyframe)
             if pose.n_tracked:
@@ -153,6 +229,7 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
 
     return {
         "session": path.name,
+        "imu": "on" if use_imu else "off",
         "payload_missing": payload_missing,
         "pair_count": pair_count,
         "pair_median_ms": pair_median_ms,
@@ -167,6 +244,13 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
         "detections": stats["detections"],
         "object_observations": stats["object_observations"],
         "objects": 0 if registry is None else len(registry.objects),
+        "imu_prior_frames": stats["imu_prior_frames"],
+        "imu_lk_priors": stats["imu_lk_priors"],
+        "imu_pnp_priors": stats["imu_pnp_priors"],
+        "imu_no_extrinsics": stats["imu_no_extrinsics"],
+        "imu_no_samples": stats["imu_no_samples"],
+        "imu_blur_skipped_kf": stats["imu_blur_skipped_kf"],
+        "imu_blur_forced_kf": stats["imu_blur_forced_kf"],
         "backend_keyframes": len(keyframes),
         "backend_points": backend_points,
         "top_classes": classes.most_common(6),
@@ -182,29 +266,43 @@ def main() -> None:
                     help="load YOLOE and report detections/object observations")
     ap.add_argument("--backend", action="store_true",
                     help="run one direct DA3 backend window and report point count")
+    ap.add_argument("--imu", action="store_true",
+                    help="enable gyro-derived VO rotation priors for this run")
+    ap.add_argument("--compare-imu", action="store_true",
+                    help="run each session twice: visual-only, then IMU-assisted")
     args = ap.parse_args()
 
     cfg = Config.load(args.config)
     for session in args.sessions:
-        result = run_session(Path(session), cfg, args.frames, args.full_models,
-                             args.backend)
-        print(
-            "REPLAY_SMOKE "
-            f"session={result['session']} payload_missing={result['payload_missing']} "
-            f"pairs={result['pair_count']} pair_median_ms={result['pair_median_ms']:.1f} "
-            f"pair_max_ms={result['pair_max_ms']:.1f} frames={result['frames']} "
-            f"depth_frames={result['depth_frames']} "
-            f"depth_valid_mean={result['depth_valid_mean']:.3f} "
-            f"lost={result['lost']} keyframes={result['keyframes']} "
-            f"avg_tracked={result['avg_tracked']:.1f} "
-            f"avg_inlier={result['avg_inlier']:.2f} "
-            f"detections={result['detections']} "
-            f"object_observations={result['object_observations']} "
-            f"objects={result['objects']} "
-            f"backend_keyframes={result['backend_keyframes']} "
-            f"backend_points={result['backend_points']} "
-            f"top_classes={result['top_classes']}"
-        )
+        modes = (False, True) if args.compare_imu else (bool(args.imu or cfg.imu.enabled),)
+        for imu_enabled in modes:
+            result = run_session(Path(session), cfg, args.frames, args.full_models,
+                                 args.backend, imu_enabled=imu_enabled)
+            print(
+                "REPLAY_SMOKE "
+                f"session={result['session']} imu={result['imu']} "
+                f"payload_missing={result['payload_missing']} "
+                f"pairs={result['pair_count']} pair_median_ms={result['pair_median_ms']:.1f} "
+                f"pair_max_ms={result['pair_max_ms']:.1f} frames={result['frames']} "
+                f"depth_frames={result['depth_frames']} "
+                f"depth_valid_mean={result['depth_valid_mean']:.3f} "
+                f"lost={result['lost']} keyframes={result['keyframes']} "
+                f"avg_tracked={result['avg_tracked']:.1f} "
+                f"avg_inlier={result['avg_inlier']:.2f} "
+                f"imu_prior_frames={result['imu_prior_frames']} "
+                f"imu_lk_priors={result['imu_lk_priors']} "
+                f"imu_pnp_priors={result['imu_pnp_priors']} "
+                f"imu_no_extrinsics={result['imu_no_extrinsics']} "
+                f"imu_no_samples={result['imu_no_samples']} "
+                f"imu_blur_skipped_kf={result['imu_blur_skipped_kf']} "
+                f"imu_blur_forced_kf={result['imu_blur_forced_kf']} "
+                f"detections={result['detections']} "
+                f"object_observations={result['object_observations']} "
+                f"objects={result['objects']} "
+                f"backend_keyframes={result['backend_keyframes']} "
+                f"backend_points={result['backend_points']} "
+                f"top_classes={result['top_classes']}"
+            )
 
 
 if __name__ == "__main__":

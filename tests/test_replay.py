@@ -8,6 +8,7 @@ from spacerec.replay import (
     RecordedOakSource,
     ReplayFormatError,
     crop_scaled_intrinsics,
+    imu_to_camera_rotation_from_metadata,
     is_recorded_oak_session,
     reproject_depth_to_rgb,
 )
@@ -84,6 +85,15 @@ def _make_session(tmp_path: Path) -> Path:
                 "ts_device_ns": ts,
             }],
         })
+    _write_event(root, {
+        "type": "imu", "stream": "imu", "seq": 99,
+        "ts_device_ns": 1_050_000_000, "ts_host_ns": 1_050_000_000,
+        "records": [{
+            "accel": {"x": 4.0, "y": 5.0, "z": 6.0},
+            "gyro": {"x": 0.4, "y": 0.5, "z": 0.6},
+            "ts_device_ns": 1_050_000_000,
+        }],
+    })
     return root
 
 
@@ -112,6 +122,9 @@ def test_recorded_oak_source_yields_metric_frames(tmp_path):
     assert frames[0].depth_conf.shape == (2, 4)
     assert frames[0].K.shape == (3, 3)
     assert frames[0].imu["accel"].tolist() == [1.0, 2.0, 3.0]
+    assert [round(sample.t, 2) for sample in frames[0].imu_samples] == [0.0]
+    assert [round(sample.t, 2) for sample in frames[1].imu_samples] == [0.05, 0.1]
+    assert frames[1].imu_samples[0].gyro.tolist() == [0.4, 0.5, 0.6]
     assert frames[1].ts == pytest.approx(0.1)
 
 
@@ -134,3 +147,36 @@ def test_reproject_depth_to_rgb_identity_transform():
     aligned = reproject_depth_to_rgb(depth, K, K, (np.eye(3), np.zeros(3)), (2, 2))
 
     assert aligned.tolist() == [[1.0, 2.0], [0.0, 3.0]]
+
+
+def test_imu_to_camera_rotation_uses_recorded_extrinsics_path():
+    meta = _metadata()
+    R_imu_to_cam_b = [[1.0, 0.0, 0.0],
+                      [0.0, 0.0, -1.0],
+                      [0.0, 1.0, 0.0]]
+    R_cam_b_to_cam_a = [[0.0, -1.0, 0.0],
+                        [1.0, 0.0, 0.0],
+                        [0.0, 0.0, 1.0]]
+    meta["calibration"]["eeprom"] = {
+        "imuExtrinsics": {
+            "rotationMatrix": R_imu_to_cam_b,
+            "toCameraSocket": 1,
+            "translation": {"x": 0.0, "y": 0.0, "z": 0.0},
+        },
+        "cameraData": [[1, {
+            "extrinsics": {
+                "rotationMatrix": R_cam_b_to_cam_a,
+                "toCameraSocket": 0,
+                "translation": {"x": 0.0, "y": 0.0, "z": 0.0},
+            },
+        }]],
+    }
+
+    R = imu_to_camera_rotation_from_metadata(meta, target_socket=0)
+
+    assert R == pytest.approx(
+        np.asarray(R_cam_b_to_cam_a) @ np.asarray(R_imu_to_cam_b))
+
+
+def test_imu_to_camera_rotation_returns_none_when_path_missing():
+    assert imu_to_camera_rotation_from_metadata(_metadata(), target_socket=0) is None

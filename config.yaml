@@ -56,6 +56,15 @@ vo:
   keyframe_min_flow_px: 40.0
   min_inlier_ratio: 0.5
 
+imu:
+  enabled: false          # true면 gyro-derived LK/PnP rotation prior 사용
+  use_lk_prior: true
+  use_pnp_prior: true
+  min_rotation_samples: 2
+  max_rotation_deg: 35.0  # 이보다 큰 frame-window prior는 버리고 visual-only로 fallback
+  keyframe_blur_omega_rad_s: 2.5
+  keyframe_max_delay_s: 1.0
+
 backend:
   period_s: 5.0
   window_size: 12      # 멀티뷰 윈도 키프레임 수

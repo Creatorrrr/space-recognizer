@@ -15,6 +15,7 @@ import numpy as np
 
 from .capture import Frame
 from .config import CaptureCfg
+from .imu import ImuSample
 
 
 def _enum_name(value: Any) -> str:
@@ -87,6 +88,7 @@ class OakSource:
         self._imu_enabled = False
         self.metadata: dict[str, Any] = {}
         self.K: np.ndarray | None = None
+        self._imu_t0_s: float | None = None
 
         devices = dai.Device.getAllAvailableDevices()
         if not devices:
@@ -118,6 +120,11 @@ class OakSource:
 
         self.metadata = self._collect_metadata()
         self.K = self._read_intrinsics()
+        self.R_cam_imu = self._read_imu_to_camera_rotation()
+        self.metadata["imu_to_camera_rotation"] = (
+            None if self.R_cam_imu is None else self.R_cam_imu.tolist())
+        self._imu_pending_samples: list[ImuSample] = []
+        self._prev_rgb_imu_ts_s: float | None = None
         self._queues = {
             name: self._device.getOutputQueue(
                 name=name, maxSize=int(cfg.oak_queue_size), blocking=False)
@@ -220,28 +227,124 @@ class OakSource:
         except Exception:
             return None
 
+    def _read_imu_to_camera_rotation(self) -> np.ndarray | None:
+        device = self._device
+        assert device is not None
+        try:
+            calib = device.readCalibration()
+            transform = calib.getImuToCameraExtrinsics(
+                _socket(self.dai, "CAM_A", "RGB"))
+            T = np.asarray(transform, dtype=np.float64)
+            if T.shape == (4, 4):
+                return T[:3, :3]
+            if T.shape == (3, 3):
+                return T
+        except Exception:
+            return None
+        return None
+
     def _read_imu(self) -> dict[str, Any] | None:
-        msg = self._latest("imu")
-        if msg is None:
+        samples = self._read_imu_samples()
+        if not samples:
             return None
-        packets = getattr(msg, "packets", None)
-        if not packets:
+        latest = samples[-1]
+        sample: dict[str, Any] = {
+            "accel": latest.accel.astype(np.float32),
+            "gyro": latest.gyro.astype(np.float32),
+            "timestamp_s": latest.t,
+        }
+        return sample
+
+    @staticmethod
+    def _timestamp_value_s(value: Any) -> float | None:
+        if value is None:
             return None
-        packet = packets[-1]
-        sample: dict[str, Any] = {}
-        accel = getattr(packet, "acceleroMeter", None)
-        gyro = getattr(packet, "gyroscope", None)
-        if accel is not None:
-            sample["accel"] = np.array([accel.x, accel.y, accel.z], dtype=np.float32)
-        if gyro is not None:
-            sample["gyro"] = np.array([gyro.x, gyro.y, gyro.z], dtype=np.float32)
-        ts = getattr(packet, "timestamp", None)
-        if ts is not None:
+        try:
+            return float(value.total_seconds())
+        except AttributeError:
             try:
-                sample["timestamp_s"] = float(ts.total_seconds())
-            except AttributeError:
-                sample["timestamp_s"] = float(ts)
-        return sample or None
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+    @classmethod
+    def _timestamp_member_s(cls, obj: Any, names: tuple[str, ...]) -> float | None:
+        for name in names:
+            member = getattr(obj, name, None)
+            if member is None:
+                continue
+            try:
+                value = member() if callable(member) else member
+            except Exception:
+                continue
+            ts_s = cls._timestamp_value_s(value)
+            if ts_s is not None:
+                return ts_s
+        return None
+
+    def _message_timestamp_s(self, msg: Any) -> float | None:
+        return self._timestamp_member_s(
+            msg,
+            ("getTimestampDevice", "timestampDevice", "getTimestamp", "timestamp"),
+        )
+
+    def _packet_timestamp_s(self, packet: Any) -> float | None:
+        ts = self._timestamp_member_s(
+            packet,
+            ("getTimestampDevice", "timestampDevice", "getTimestamp", "timestamp"),
+        )
+        if ts is None:
+            gyro = getattr(packet, "gyroscope", None)
+            ts = self._timestamp_member_s(
+                gyro,
+                ("timestampDevice", "timestamp"),
+            )
+        return ts
+
+    def _read_imu_samples(self) -> list[ImuSample]:
+        q = self._queues.get("imu")
+        samples: list[ImuSample] = []
+        while q is not None:
+            msg = q.tryGet()
+            if msg is None:
+                break
+            packets = getattr(msg, "packets", None)
+            if not packets:
+                continue
+            for packet in packets:
+                ts_s = self._packet_timestamp_s(packet)
+                if ts_s is None:
+                    continue
+                if self._imu_t0_s is None:
+                    self._imu_t0_s = ts_s
+                accel = getattr(packet, "acceleroMeter", None)
+                gyro = getattr(packet, "gyroscope", None)
+                samples.append(ImuSample(
+                    t=ts_s - self._imu_t0_s,
+                    accel=np.array([
+                        getattr(accel, "x", 0.0),
+                        getattr(accel, "y", 0.0),
+                        getattr(accel, "z", 0.0),
+                    ], dtype=np.float64),
+                    gyro=np.array([
+                        getattr(gyro, "x", 0.0),
+                        getattr(gyro, "y", 0.0),
+                        getattr(gyro, "z", 0.0),
+                    ], dtype=np.float64),
+                ))
+        return samples
+
+    def _pop_imu_window(self, rgb_ts_s: float) -> list[ImuSample]:
+        lower = self._prev_rgb_imu_ts_s
+        window: list[ImuSample] = []
+        pending: list[ImuSample] = []
+        for sample in sorted(self._imu_pending_samples, key=lambda s: s.t):
+            if sample.t > rgb_ts_s:
+                pending.append(sample)
+            elif lower is None or sample.t > lower:
+                window.append(sample)
+        self._imu_pending_samples = pending
+        return window
 
     def frames(self) -> Iterator[Frame]:
         start = time.monotonic()
@@ -251,6 +354,13 @@ class OakSource:
         last_imu: dict[str, Any] | None = None
         while not self._closed:
             rgb_msg = self._queues["rgb"].get()
+            rgb_ts_abs = self._message_timestamp_s(rgb_msg)
+            if rgb_ts_abs is not None and self._imu_t0_s is None:
+                self._imu_t0_s = rgb_ts_abs
+            rgb_ts_s = (
+                None if rgb_ts_abs is None or self._imu_t0_s is None
+                else rgb_ts_abs - self._imu_t0_s
+            )
             bgr = rgb_msg.getCvFrame()
             if bgr.shape[1] != self.proc_width or bgr.shape[0] != self.proc_height:
                 bgr = cv2.resize(bgr, (self.proc_width, self.proc_height),
@@ -268,13 +378,27 @@ class OakSource:
             if left_msg is not None:
                 last_gray = left_msg.getCvFrame()
 
-            imu_sample = self._read_imu()
-            if imu_sample is not None:
-                last_imu = imu_sample
+            new_imu_samples = self._read_imu_samples()
+            if rgb_ts_s is None:
+                imu_samples = new_imu_samples
+            else:
+                self._imu_pending_samples.extend(new_imu_samples)
+                imu_samples = self._pop_imu_window(rgb_ts_s)
+                self._prev_rgb_imu_ts_s = rgb_ts_s
+            if imu_samples:
+                latest_imu = imu_samples[-1]
+                last_imu = {
+                    "accel": latest_imu.accel.astype(np.float32),
+                    "gyro": latest_imu.gyro.astype(np.float32),
+                    "timestamp_s": latest_imu.t,
+                }
 
             index += 1
+            frame_ts = rgb_ts_s if rgb_ts_s is not None else time.monotonic() - start
+            metadata = dict(self.metadata)
+            metadata["imu_timestamp_aligned"] = rgb_ts_s is not None
             yield Frame(
-                ts=time.monotonic() - start,
+                ts=frame_ts,
                 bgr=bgr,
                 index=index,
                 depth_m=None if last_depth_m is None else last_depth_m.copy(),
@@ -282,7 +406,8 @@ class OakSource:
                 K=None if self.K is None else self.K.copy(),
                 gray_track=None if last_gray is None else last_gray.copy(),
                 imu=None if last_imu is None else dict(last_imu),
-                metadata=self.metadata,
+                imu_samples=list(imu_samples),
+                metadata=metadata,
             )
 
     def release(self) -> None:
