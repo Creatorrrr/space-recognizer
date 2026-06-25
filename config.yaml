@@ -62,6 +62,12 @@ vo:
   keyframe_interval_s: 0.5
   keyframe_min_flow_px: 40.0
   min_inlier_ratio: 0.5
+  pnp_aided_reproj_tol: 1.4
+  pnp_aided_min_inlier_delta: -2
+  pnp_max_step_depth_frac: 0.5
+  pnp_max_velocity_units_s: 3.0
+  pnp_step_floor_units: 0.10
+  pnp_divergence_step_factor: 3.0
 
 imu:
   enabled: true          # true면 gyro-derived LK/PnP rotation prior 사용
@@ -123,6 +129,26 @@ objects:
   app_weight: 0.6
   app_gate: 0.4        # cos 유사도가 이보다 낮으면 같은 물체로 보지 않음
   absence_limit: 12    # 시야 안·비가림인데 미검출이 이만큼 누적되면 노드 제거
+
+loop_closure:
+  enabled: true
+  check_every_frames: 10
+  min_matches: 3
+  min_observations: 3
+  min_distinct_classes: 2
+  min_spread: 0.5
+  max_match_distance: 1.0
+  match_size_factor: 2.0
+  min_cos: 0.45
+  require_appearance: false
+  app_weight: 0.5
+  allow_scale: false
+  max_rms: 0.25
+  max_rms_frac: 0.30
+  max_yaw_delta_deg: 15.0
+  max_translation_delta: 1.0
+  max_scale_delta: 0.12
+  min_accept_interval_s: 1.0
 
 graph:
   near_dist: 1.2       # 근접 엣지 거리 임계값

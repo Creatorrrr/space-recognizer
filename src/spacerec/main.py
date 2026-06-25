@@ -6,6 +6,7 @@ import argparse
 import logging
 import queue
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import spacerec  # noqa: F401  (env vars must be set before heavy imports)
@@ -26,8 +27,9 @@ from .directfusion import DirectFusionBackend, DirectFusionKeyframe
 from .geometry import sim3_apply, sim3_inverse
 from .graph import build_graph
 from .imu import estimate_camera_rotation, should_accept_backend_keyframe
+from .loopclosure import LoopClosureEstimator
 from .mesh import MeshMap
-from .objects import ObjectRegistry, localize_objects
+from .objects import ObjectRegistry, Observation, localize_objects
 from .perf import PerfRecorder, add_ms
 from .viz import NullVisualizer, Visualizer
 from .vo import VisualOdometry, default_intrinsics
@@ -93,13 +95,38 @@ def _apply_backend_result(res, worldmap: GlobalMap, viz: Visualizer,
                           calib: DepthCalibration, apply_calib: bool = True,
                           meshmap: MeshMap | None = None,
                           perf_metrics: dict[str, float] | None = None,
-                          log_prefix: str = "backend") -> DepthCalibration:
+                          log_prefix: str = "backend",
+                          apply_correction_target: bool = True) -> DepthCalibration:
+    if not apply_correction_target:
+        # Direct RGB-D fusion emits live-frame points. Once object-loop
+        # correction is active, fuse those points in the current global frame
+        # without replacing the correction target with direct-fusion identity.
+        view_origins = None
+        if res.view_origins is not None:
+            view_origins = worldmap.to_global_points(res.view_origins)
+        view_poses = None
+        if res.view_poses is not None:
+            view_poses = np.stack([
+                worldmap.to_global_pose(pose)
+                for pose in res.view_poses
+            ])
+        res = replace(
+            res,
+            points=worldmap.to_global_points(res.points),
+            view_origins=view_origins,
+            view_poses=view_poses,
+            kf_global_poses={
+                k: worldmap.to_global_pose(pose)
+                for k, pose in res.kf_global_poses.items()
+            },
+        )
     t = time.perf_counter()
     worldmap.fuse(res.points, res.colors,
                   origins=res.view_origins, view_idx=res.point_view_idx)
     if perf_metrics is not None:
         add_ms(perf_metrics, "worldmap_fuse_ms", t)
-    worldmap.set_correction_target(res.T_global_live)
+    if apply_correction_target:
+        worldmap.set_correction_target(res.T_global_live)
     if meshmap is not None and getattr(res, "view_depths", None) is not None:
         t = time.perf_counter()
         try:
@@ -145,6 +172,7 @@ def _drain_backend_results(backend: ReconstructionBackend, worldmap: GlobalMap,
                            apply_calib: bool = True,
                            meshmap: MeshMap | None = None,
                            perf_metrics: dict[str, float] | None = None,
+                           apply_correction_target: bool = True,
                            ) -> DepthCalibration:
     total_start = time.perf_counter()
     n_results = 0
@@ -164,6 +192,7 @@ def _drain_backend_results(backend: ReconstructionBackend, worldmap: GlobalMap,
             apply_calib=apply_calib,
             meshmap=meshmap,
             perf_metrics=perf_metrics,
+            apply_correction_target=apply_correction_target,
         )
 
 
@@ -373,6 +402,7 @@ def main() -> None:
     K_WARMUP = 0 if source_K is not None or depth_est is None else 10
     K_samples: list[np.ndarray] = []
     registry = ObjectRegistry(cfg.objects)
+    loop_closure = LoopClosureEstimator(cfg.loop_closure)
 
     saved_state = None
     saved_mesh_state = None
@@ -621,7 +651,9 @@ def main() -> None:
                                                    vo, (W, H),
                                                    apply_calib=not has_metric_depth,
                                                    meshmap=meshmap,
-                                                   perf_metrics=metrics)
+                                                   perf_metrics=metrics,
+                                                   apply_correction_target=(
+                                                       fusion_mode != "direct"))
             else:
                 t = time.perf_counter()
                 n_deferred = _collect_backend_results(backend, deferred_backend_results)
@@ -665,20 +697,50 @@ def main() -> None:
                 viz.log_live_points(pts_global, cols.reshape(-1, 3))
                 add_ms(metrics, "log_live_points_ms", t)
             t = time.perf_counter()
-            observations = localize_objects(detections, depth, vo.K, pose.T_wc,
-                                            frame.depth_conf)
-            for obs in observations:
-                obs.position = worldmap.to_global_points(obs.position[None])[0]
+            live_observations = localize_objects(detections, depth, vo.K, pose.T_wc,
+                                                 frame.depth_conf)
             add_ms(metrics, "localize_objects_ms", t)
             do_embed = (
-                embedder is not None and observations
+                embedder is not None and live_observations
                 and (not cfg.objects.appearance_keyframes_only or pose.is_keyframe)
                 and frame_count % max(1, int(cfg.objects.appearance_every_n_frames)) == 0
             )
             if do_embed:
                 t = time.perf_counter()
-                embedder.embed(frame.bgr, observations)
+                embedder.embed(frame.bgr, live_observations)
                 add_ms(metrics, "appearance_embed_ms", t)
+            t = time.perf_counter()
+            loop_result = loop_closure.estimate(
+                frame_count,
+                frame.ts,
+                live_observations,
+                registry,
+                worldmap.T_global_live,
+            )
+            add_ms(metrics, "loop_correction_ms", t)
+            metrics["loop_correction_attempted"] = float(loop_result.attempted)
+            metrics["loop_correction_accepted"] = float(loop_result.accepted)
+            metrics["loop_correction_matches"] = float(loop_result.match_count)
+            metrics["loop_correction_rms"] = float(loop_result.rms)
+            metrics["loop_correction_yaw_delta_deg"] = float(loop_result.yaw_delta_deg)
+            if loop_result.accepted and loop_result.T_global_live is not None:
+                worldmap.set_correction_target(loop_result.T_global_live)
+                print(
+                    "[loop] object correction accepted "
+                    f"matches={loop_result.match_count} rms={loop_result.rms:.3f} "
+                    f"yaw_delta={loop_result.yaw_delta_deg:.1f}deg "
+                    f"trans_delta={loop_result.translation_delta:.2f} "
+                    f"scale_delta={loop_result.scale_delta:.3f}"
+                )
+            observations = [
+                Observation(
+                    det=obs.det,
+                    position=worldmap.to_global_points(obs.position[None])[0],
+                    size=obs.size,
+                    emb=obs.emb,
+                )
+                for obs in live_observations
+            ]
             t = time.perf_counter()
             visible = registry.update(observations, frame.ts)
 
@@ -735,6 +797,15 @@ def main() -> None:
                     "map_points": len(worldmap.points),
                     "stable_objects": len(objects),
                     "observations": len(observations),
+                    "loop_correction_attempted": int(
+                        metrics.get("loop_correction_attempted", 0)),
+                    "loop_correction_accepted": int(
+                        metrics.get("loop_correction_accepted", 0)),
+                    "loop_correction_matches": int(
+                        metrics.get("loop_correction_matches", 0)),
+                    "loop_correction_rms": metrics.get("loop_correction_rms", 0.0),
+                    "loop_correction_yaw_delta_deg": metrics.get(
+                        "loop_correction_yaw_delta_deg", 0.0),
                     "vo_lost": int(pose.lost),
                     "vo_inlier_ratio": pose.inlier_ratio,
                     "vo_tracked": pose.n_tracked,
@@ -769,6 +840,7 @@ def main() -> None:
                     apply_calib=not source_has_metric_depth,
                     meshmap=meshmap,
                     log_prefix="backend/deferred",
+                    apply_correction_target=(fusion_mode != "direct"),
                 )
                 for _ in range(10):
                     worldmap.step_correction()
@@ -779,7 +851,9 @@ def main() -> None:
             calib = _drain_backend_results(backend, worldmap, viz, calib, vo,
                                            (W, H),
                                            apply_calib=not source_has_metric_depth,
-                                           meshmap=meshmap)
+                                           meshmap=meshmap,
+                                           apply_correction_target=(
+                                               fusion_mode != "direct"))
             for _ in range(10):
                 worldmap.step_correction()
             if len(worldmap.points) != before:

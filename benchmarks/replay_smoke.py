@@ -24,7 +24,8 @@ from spacerec.config import Config
 from spacerec.device import configure_torch_runtime, select_torch_device
 from spacerec.directfusion import DirectFusionBackend, DirectFusionKeyframe
 from spacerec.imu import estimate_camera_rotation, should_accept_backend_keyframe
-from spacerec.objects import ObjectRegistry, localize_objects
+from spacerec.loopclosure import LoopClosureEstimator
+from spacerec.objects import ObjectRegistry, Observation, localize_objects
 from spacerec.replay import RecordedOakSource, _nearest
 from spacerec.vo import VisualOdometry
 from spacerec.worldmap import GlobalMap
@@ -182,11 +183,20 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
     valid_fracs = []
     inliers = []
     tracked = []
+    pose_steps = []
+    prev_pose_pos: np.ndarray | None = None
     classes = Counter()
     keyframes: list[BackendKeyframe] = []
     direct_keyframes = 0
     direct_backend = DirectFusionBackend(cfg.fusion, cfg.capture) if direct_fusion else None
     direct_map = GlobalMap(cfg.backend) if direct_fusion else None
+    loop_map = direct_map if direct_map is not None else (
+        GlobalMap(cfg.backend) if full_models else None
+    )
+    loop_closure = (
+        LoopClosureEstimator(cfg.loop_closure)
+        if registry is not None and loop_map is not None else None
+    )
     payload_missing = _payload_missing(src)
     pair_count, pair_median_ms, pair_max_ms = _pairing_stats(src)
 
@@ -198,8 +208,10 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
                 res = direct_backend.results.get_nowait()
             except Exception:
                 return
-            direct_map.fuse(res.points, res.colors,
-                            origins=res.view_origins, view_idx=res.point_view_idx)
+            origins = None if res.view_origins is None else direct_map.to_global_points(
+                res.view_origins)
+            direct_map.fuse(direct_map.to_global_points(res.points), res.colors,
+                            origins=origins, view_idx=res.point_view_idx)
 
     try:
         for frame in src.frames():
@@ -273,6 +285,10 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
                     R_since_keyframe=None if since_prior is None else since_prior.R,
                     omega_norm=omega_norm,
                 )
+            pose_pos = pose.T_wc[:3, 3].copy()
+            if prev_pose_pos is not None:
+                pose_steps.append(float(np.linalg.norm(pose_pos - prev_pose_pos)))
+            prev_pose_pos = pose_pos
             if pose.is_keyframe:
                 imu_since_keyframe = []
                 imu_keyframe_ts = frame.ts
@@ -328,6 +344,8 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
                 drain_direct()
             if pose.is_keyframe and accept_backend_keyframe:
                 last_backend_keyframe_ts = frame.ts
+            if loop_map is not None:
+                loop_map.step_correction()
             stats["lost"] += int(pose.lost)
             stats["keyframes"] += int(pose.is_keyframe)
             if pose.n_tracked:
@@ -335,8 +353,36 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
                 inliers.append(float(pose.inlier_ratio))
             if detections and registry is not None and frame.depth_m is not None:
                 with MetricTimer(timings, "object_localize"):
-                    obs = localize_objects(detections, frame.depth_m, vo.K, pose.T_wc,
-                                           frame.depth_conf)
+                    live_obs = localize_objects(detections, frame.depth_m, vo.K,
+                                                pose.T_wc, frame.depth_conf)
+                if loop_closure is not None and loop_map is not None:
+                    with MetricTimer(timings, "loop_correction"):
+                        loop_result = loop_closure.estimate(
+                            stats["frames"],
+                            frame.ts,
+                            live_obs,
+                            registry,
+                            loop_map.T_global_live,
+                        )
+                    stats["loop_correction_attempts"] += int(loop_result.attempted)
+                    stats["loop_correction_accepted"] += int(loop_result.accepted)
+                    stats["loop_correction_matches"] += int(loop_result.match_count)
+                    stats["loop_correction_last_rms"] = float(loop_result.rms)
+                    stats["loop_correction_last_yaw_delta_deg"] = float(
+                        loop_result.yaw_delta_deg)
+                    if loop_result.accepted and loop_result.T_global_live is not None:
+                        loop_map.set_correction_target(loop_result.T_global_live)
+                    obs = [
+                        Observation(
+                            det=o.det,
+                            position=loop_map.to_global_points(o.position[None])[0],
+                            size=o.size,
+                            emb=o.emb,
+                        )
+                        for o in live_obs
+                    ]
+                else:
+                    obs = live_obs
                 stats["detections"] += len(detections)
                 stats["object_observations"] += len(obs)
                 registry.update(obs, frame.ts)
@@ -365,9 +411,18 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
         "keyframes": stats["keyframes"],
         "avg_tracked": float(np.mean(tracked)) if tracked else 0.0,
         "avg_inlier": float(np.mean(inliers)) if inliers else 0.0,
+        "max_pose_step": float(np.max(pose_steps)) if pose_steps else 0.0,
+        "p95_pose_step": float(np.percentile(pose_steps, 95)) if pose_steps else 0.0,
+        "pose_step_over_1": int(sum(step > 1.0 for step in pose_steps)),
         "detections": stats["detections"],
         "object_observations": stats["object_observations"],
         "objects": 0 if registry is None else len(registry.objects),
+        "loop_correction_attempts": stats["loop_correction_attempts"],
+        "loop_correction_accepted": stats["loop_correction_accepted"],
+        "loop_correction_matches": stats["loop_correction_matches"],
+        "loop_correction_last_rms": float(stats["loop_correction_last_rms"]),
+        "loop_correction_last_yaw_delta_deg": float(
+            stats["loop_correction_last_yaw_delta_deg"]),
         "imu_prior_frames": stats["imu_prior_frames"],
         "imu_lk_priors": stats["imu_lk_priors"],
         "imu_pnp_priors": stats["imu_pnp_priors"],
@@ -446,6 +501,9 @@ def main() -> None:
                 f"lost={result['lost']} keyframes={result['keyframes']} "
                 f"avg_tracked={result['avg_tracked']:.1f} "
                 f"avg_inlier={result['avg_inlier']:.2f} "
+                f"max_pose_step={result['max_pose_step']:.3f} "
+                f"p95_pose_step={result['p95_pose_step']:.3f} "
+                f"pose_step_over_1={result['pose_step_over_1']} "
                 f"imu_prior_frames={result['imu_prior_frames']} "
                 f"imu_lk_priors={result['imu_lk_priors']} "
                 f"imu_pnp_priors={result['imu_pnp_priors']} "
@@ -456,6 +514,12 @@ def main() -> None:
                 f"detections={result['detections']} "
                 f"object_observations={result['object_observations']} "
                 f"objects={result['objects']} "
+                f"loop_correction_attempts={result['loop_correction_attempts']} "
+                f"loop_correction_accepted={result['loop_correction_accepted']} "
+                f"loop_correction_matches={result['loop_correction_matches']} "
+                f"loop_correction_last_rms={result['loop_correction_last_rms']:.3f} "
+                f"loop_correction_last_yaw_delta_deg="
+                f"{result['loop_correction_last_yaw_delta_deg']:.1f} "
                 f"backend_keyframes={result['backend_keyframes']} "
                 f"backend_points={result['backend_points']} "
                 f"backend_runtime_s={result['backend_runtime_s']:.2f} "

@@ -61,6 +61,12 @@ class VoCfg:
     keyframe_interval_s: float = 0.5
     keyframe_min_flow_px: float = 40.0
     min_inlier_ratio: float = 0.5
+    pnp_aided_reproj_tol: float = 1.4
+    pnp_aided_min_inlier_delta: int = -2
+    pnp_max_step_depth_frac: float = 0.5
+    pnp_max_velocity_units_s: float = 3.0
+    pnp_step_floor_units: float = 0.10
+    pnp_divergence_step_factor: float = 3.0
 
 
 @dataclass
@@ -135,6 +141,28 @@ class ObjectsCfg:
 
 
 @dataclass
+class LoopClosureCfg:
+    enabled: bool = True
+    check_every_frames: int = 10
+    min_matches: int = 3
+    min_observations: int = 3
+    min_distinct_classes: int = 2
+    min_spread: float = 0.5
+    max_match_distance: float = 1.0
+    match_size_factor: float = 2.0
+    min_cos: float = 0.45
+    require_appearance: bool = False
+    app_weight: float = 0.5
+    allow_scale: bool = False
+    max_rms: float = 0.25
+    max_rms_frac: float = 0.30
+    max_yaw_delta_deg: float = 15.0
+    max_translation_delta: float = 1.0
+    max_scale_delta: float = 0.12
+    min_accept_interval_s: float = 1.0
+
+
+@dataclass
 class GraphCfg:
     near_dist: float = 1.2
     vertical_ratio: float = 1.5
@@ -170,6 +198,7 @@ class Config:
     fusion: FusionCfg = field(default_factory=FusionCfg)
     mesh: MeshCfg = field(default_factory=MeshCfg)
     objects: ObjectsCfg = field(default_factory=ObjectsCfg)
+    loop_closure: LoopClosureCfg = field(default_factory=LoopClosureCfg)
     graph: GraphCfg = field(default_factory=GraphCfg)
     viz: VizCfg = field(default_factory=VizCfg)
 
@@ -180,7 +209,8 @@ class Config:
             "compute": ComputeCfg, "capture": CaptureCfg, "depth": DepthCfg, "detect": DetectCfg,
             "vo": VoCfg, "imu": ImuCfg, "backend": BackendCfg,
             "fusion": FusionCfg, "mesh": MeshCfg,
-            "objects": ObjectsCfg, "graph": GraphCfg, "viz": VizCfg,
+            "objects": ObjectsCfg, "loop_closure": LoopClosureCfg,
+            "graph": GraphCfg, "viz": VizCfg,
         }
         kwargs = {}
         for key, value in raw.items():
@@ -218,6 +248,15 @@ def apply_runtime_profile(cfg: Config, profile: str | None) -> None:
     cfg.objects.appearance = False
     cfg.objects.appearance_keyframes_only = True
     cfg.objects.appearance_every_n_frames = max(int(cfg.objects.appearance_every_n_frames), 1)
+    cfg.loop_closure.allow_scale = False
+    cfg.loop_closure.max_match_distance = min(float(cfg.loop_closure.max_match_distance), 0.9)
+    cfg.loop_closure.match_size_factor = min(float(cfg.loop_closure.match_size_factor), 2.0)
+    cfg.loop_closure.max_rms = min(float(cfg.loop_closure.max_rms), 0.25)
+    cfg.loop_closure.max_yaw_delta_deg = min(float(cfg.loop_closure.max_yaw_delta_deg), 12.0)
+    cfg.loop_closure.max_translation_delta = min(
+        float(cfg.loop_closure.max_translation_delta), 1.0)
+    cfg.loop_closure.min_accept_interval_s = max(
+        float(cfg.loop_closure.min_accept_interval_s), 1.0)
     cfg.viz.point_subsample = max(int(cfg.viz.point_subsample), 8)
     cfg.viz.frame_every = max(int(cfg.viz.frame_every), 2)
     cfg.viz.depth_every = max(int(cfg.viz.depth_every), 2)
