@@ -121,11 +121,38 @@ def test_recorded_oak_source_yields_metric_frames(tmp_path):
     assert frames[0].depth_m.shape == (2, 4)
     assert frames[0].depth_conf.shape == (2, 4)
     assert frames[0].K.shape == (3, 3)
+    assert frames[0].metadata["depth_matched"] is True
+    assert frames[0].metadata["depth_age_ms"] == pytest.approx(1.0)
+    assert frames[0].metadata["depth_seq"] == 1
     assert frames[0].imu["accel"].tolist() == [1.0, 2.0, 3.0]
     assert [round(sample.t, 2) for sample in frames[0].imu_samples] == [0.0]
     assert [round(sample.t, 2) for sample in frames[1].imu_samples] == [0.05, 0.1]
     assert frames[1].imu_samples[0].gyro.tolist() == [0.4, 0.5, 0.6]
     assert frames[1].ts == pytest.approx(0.1)
+
+
+def test_recorded_oak_source_allows_unmatched_rgb_frames(tmp_path):
+    root = _make_session(tmp_path)
+    rgb2 = np.full((2, 4, 3), 40, dtype=np.uint8)
+    np.save(root / "streams" / "rgb" / "00000003_seq3.npy", rgb2)
+    _write_event(root, {
+        "type": "frame", "stream": "rgb", "seq": 3,
+        "ts_device_ns": 1_250_000_000, "ts_host_ns": 1_250_000_000,
+        "payload_path": "streams/rgb/00000003_seq3.npy",
+        "shape": [2, 4, 3], "dtype": "uint8",
+        "metadata": {"mode": "bgr"},
+    })
+
+    src = RecordedOakSource(root, depth_mode="resize")
+    frames = list(src.frames())
+
+    assert src.has_metric_depth is True
+    assert len(frames) == 3
+    assert frames[2].depth_m is None
+    assert frames[2].depth_conf is None
+    assert frames[2].metadata["depth_matched"] is False
+    assert frames[2].metadata["depth_age_ms"] is None
+    assert frames[2].metadata["depth_pair_tolerance_ms"] == pytest.approx(20.0)
 
 
 def test_recorded_oak_source_rejects_payload_path_escape(tmp_path):

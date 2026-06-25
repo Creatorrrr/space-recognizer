@@ -490,9 +490,9 @@ def main() -> None:
                 detections = []
             t1 = time.perf_counter()
             raw_depth = None
-            has_metric_depth = frame.depth_m is not None
+            has_frame_metric_depth = frame.depth_m is not None
             t = time.perf_counter()
-            if has_metric_depth:
+            if has_frame_metric_depth:
                 fallback = None
                 if cfg.depth.oak_fill_missing:
                     if depth_est is None:
@@ -508,9 +508,8 @@ def main() -> None:
                 calib = oak_calib
                 frame_scale = 1.0
             else:
-                if depth_est is None:
-                    raise RuntimeError("non-metric source requires live depth estimator")
-                raw_depth = depth_est.infer(frame.bgr)
+                if depth_est is not None:
+                    raw_depth = depth_est.infer(frame.bgr)
             add_ms(metrics, "depth_fuse_ms", t)
 
             if K_WARMUP and len(K_samples) < K_WARMUP:
@@ -525,7 +524,11 @@ def main() -> None:
                 else:
                     # K 확정 전에는 VO/지도를 시작하지 않는다 (2D 패널만 갱신)
                     t = time.perf_counter()
-                    viz.log_frame(frame.bgr, calib.apply(raw_depth), detections)
+                    viz.log_frame(
+                        frame.bgr,
+                        None if raw_depth is None else calib.apply(raw_depth),
+                        detections,
+                    )
                     add_ms(metrics, "log_frame_ms", t)
                     frame_count += 1
                     loop_end_perf = time.perf_counter()
@@ -554,7 +557,9 @@ def main() -> None:
                     prev_loop_perf = loop_end_perf
                     continue
             t2 = time.perf_counter()
-            if has_metric_depth:
+            if raw_depth is None:
+                depth = None
+            elif has_frame_metric_depth:
                 depth = raw_depth
             else:
                 depth = calib.apply(raw_depth) * frame_scale
@@ -623,7 +628,8 @@ def main() -> None:
             # 프레임별 depth 스케일 보정: 키프레임에 고정된 3D 특징점의 예측
             # z와 이번 프레임 depth 맵의 측정 z를 비교해, mono depth의 프레임별
             # 스케일 요동을 다음 프레임부터 상쇄한다 (log-EMA, 한 프레임 지연).
-            if (not has_metric_depth
+            if (depth is not None
+                    and not has_frame_metric_depth
                     and pose.feat_uv is not None and len(pose.feat_uv) >= 20):
                 u = pose.feat_uv[:, 0].astype(int).clip(0, W - 1)
                 v = pose.feat_uv[:, 1].astype(int).clip(0, H - 1)
@@ -642,10 +648,11 @@ def main() -> None:
                 blur_omega_rad_s=cfg.imu.keyframe_blur_omega_rad_s,
                 max_delay_s=cfg.imu.keyframe_max_delay_s,
             )
-            if _should_send_reconstruction_keyframe(
-                    pose,
-                    accept_backend_keyframe=accept_backend_keyframe,
-                    fusion_mode=fusion_mode):
+            if (depth is not None and raw_depth is not None
+                    and _should_send_reconstruction_keyframe(
+                        pose,
+                        accept_backend_keyframe=accept_backend_keyframe,
+                        fusion_mode=fusion_mode)):
                 if fusion_mode == "direct":
                     backend.add_keyframe(DirectFusionKeyframe(
                         kf_id=kf_counter,
@@ -667,7 +674,7 @@ def main() -> None:
                         dyn_mask=None if excl is None else
                                  cv2.resize(excl.astype(np.uint8), (bw, bh),
                                             interpolation=cv2.INTER_NEAREST).astype(bool),
-                        calib_ab=((1.0, 0.0) if has_metric_depth
+                        calib_ab=((1.0, 0.0) if has_frame_metric_depth
                                   else (calib.a * frame_scale, calib.b * frame_scale)),
                     ))
                 kf_counter += 1
@@ -678,7 +685,7 @@ def main() -> None:
             if cfg.backend.live_apply:
                 new_calib = _drain_backend_results(backend, worldmap, viz, calib,
                                                    vo, (W, H),
-                                                   apply_calib=not has_metric_depth,
+                                                   apply_calib=not source_has_metric_depth,
                                                    meshmap=meshmap,
                                                    perf_metrics=metrics,
                                                    apply_correction_target=(
@@ -709,7 +716,7 @@ def main() -> None:
             t = time.perf_counter()
             viz.log_calibration(calib.a, calib.b, frame_scale)
             add_ms(metrics, "log_calibration_ms", t)
-            if pose.is_keyframe:
+            if pose.is_keyframe and depth is not None:
                 # 키프레임마다 현재 프레임 포인트클라우드 미리보기를 *전역 좌표*로
                 # 변환해 로깅 (카메라 좌표로 두면 다음 키프레임까지 카메라를 따라
                 # 움직여 지도와 어긋나 보인다)
@@ -781,9 +788,10 @@ def main() -> None:
                 T_lg = sim3_inverse(worldmap.T_global_live)
                 positions_live = {o.obj_id: sim3_apply(T_lg, o.position[None])[0]
                                   for o in registry.objects.values()}
-                registry.decay_absent(visible, observations, positions_live,
-                                      pose.T_wc, vo.K, depth,
-                                      cfg.objects.absence_limit)
+                if depth is not None:
+                    registry.decay_absent(visible, observations, positions_live,
+                                          pose.T_wc, vo.K, depth,
+                                          cfg.objects.absence_limit)
                 add_ms(metrics, "registry_ms", t)
             else:
                 metrics["world_updates_skipped"] = 1.0

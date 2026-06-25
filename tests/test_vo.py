@@ -84,6 +84,40 @@ def test_vo_recovers_lateral_translation():
     assert np.allclose(r1.T_wc[:3, :3], np.eye(3), atol=0.02)
 
 
+def test_vo_defers_initial_keyframe_until_depth_available():
+    W, H, Z = 320, 240, 2.0
+    K = default_intrinsics(W, H)
+    img = _noise_image((H, W), seed=11)
+    depth = np.full((H, W), Z, np.float32)
+    vo = VisualOdometry(K, VoCfg())
+
+    r0 = vo.process(img, None, 0.0, None)
+    r1 = vo.process(img, depth, 0.1, None)
+
+    assert r0.lost
+    assert not r0.is_keyframe
+    assert r1.is_keyframe
+
+
+def test_vo_defers_rekeyframe_when_depth_missing():
+    W, H, Z = 320, 240, 2.0
+    K = default_intrinsics(W, H)
+    img0 = _noise_image((H, W), seed=12)
+    img1 = _noise_image((H, W), seed=12)
+    depth = np.full((H, W), Z, np.float32)
+    cfg = VoCfg(keyframe_interval_s=0.0, keyframe_min_flow_px=1e9,
+                min_inlier_ratio=0.0)
+    vo = VisualOdometry(K, cfg)
+
+    r0 = vo.process(img0, depth, 0.0, None)
+    r1 = vo.process(img1, None, 1.0, None)
+
+    assert r0.is_keyframe
+    assert not r1.is_keyframe
+    assert vo.keyframe is not None
+    assert vo.keyframe.ts == 0.0
+
+
 def test_vo_rotation_prior_tracks_large_pure_rotation():
     W, H, Z = 320, 240, 2.0
     K = default_intrinsics(W, H)

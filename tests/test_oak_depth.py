@@ -48,11 +48,37 @@ class _FakeDuration:
 
 
 class _FakeMsg:
-    def __init__(self, seconds):
+    def __init__(self, seconds, sequence=None, cv_frame=None, frame=None):
         self.seconds = seconds
+        self.sequence = sequence
+        self.cv_frame = cv_frame
+        self.frame = frame
 
     def getTimestampDevice(self):
         return _FakeDuration(self.seconds)
+
+    def getSequenceNum(self):
+        return self.sequence
+
+    def getCvFrame(self):
+        return self.cv_frame
+
+    def getFrame(self):
+        return self.frame
+
+
+class _FakeQueue:
+    def __init__(self, get_items=None, try_items=None):
+        self.get_items = list(get_items or [])
+        self.try_items = list(try_items or [])
+
+    def get(self):
+        return self.get_items.pop(0)
+
+    def tryGet(self):
+        if not self.try_items:
+            return None
+        return self.try_items.pop(0)
 
 
 def _imu_sample(t):
@@ -86,3 +112,45 @@ def test_oak_imu_window_uses_previous_to_current_rgb_interval():
 
     assert [sample.t for sample in window] == pytest.approx([0.11, 0.15])
     assert src._imu_pending_samples == []
+
+
+def test_oak_live_frames_do_not_carry_forward_stale_depth():
+    src = object.__new__(OakSource)
+    src._closed = False
+    src.proc_width = 2
+    src.proc_height = 2
+    src.K = np.eye(3)
+    src.metadata = {}
+    src._imu_t0_s = None
+    src._prev_rgb_imu_ts_s = None
+    src._imu_pending_samples = []
+
+    bgr0 = np.zeros((2, 2, 3), dtype=np.uint8)
+    bgr1 = np.full((2, 2, 3), 10, dtype=np.uint8)
+    depth_mm = np.full((2, 2), 1234, dtype=np.uint16)
+    src._queues = {
+        "rgb": _FakeQueue(get_items=[
+            _FakeMsg(10.0, sequence=1, cv_frame=bgr0),
+            _FakeMsg(10.1, sequence=2, cv_frame=bgr1),
+        ]),
+        "depth": _FakeQueue(try_items=[
+            _FakeMsg(10.005, sequence=7, frame=depth_mm),
+        ]),
+        "left": _FakeQueue(),
+    }
+
+    frames = src.frames()
+    first = next(frames)
+    second = next(frames)
+
+    assert first.depth_m is not None
+    assert first.depth_m[0, 0] == pytest.approx(1.234)
+    assert first.metadata["depth_matched"] is True
+    assert first.metadata["depth_seq"] == 7
+    assert first.metadata["depth_age_ms"] == pytest.approx(5.0)
+    assert first.metadata["depth_pairing_policy"] == "fresh_depth_packet_only"
+
+    assert second.depth_m is None
+    assert second.metadata["depth_matched"] is False
+    assert second.metadata["depth_seq"] is None
+    assert second.metadata["depth_age_ms"] is None

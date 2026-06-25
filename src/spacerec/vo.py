@@ -148,12 +148,15 @@ class VisualOdometry:
     def set_intrinsics(self, K: np.ndarray) -> None:
         self.K = K.copy()
 
-    def process(self, gray: np.ndarray, depth: np.ndarray, ts: float,
+    def process(self, gray: np.ndarray, depth: np.ndarray | None, ts: float,
                 exclude_mask: np.ndarray | None,
                 R_delta_prev: np.ndarray | None = None,
                 R_since_keyframe: np.ndarray | None = None,
                 omega_norm: float | None = None) -> PoseResult:
         if self.keyframe is None:
+            if depth is None:
+                self._prev_gray = gray
+                return PoseResult(self.T_wc.copy(), 0.0, 0, False, lost=True)
             self._make_keyframe(gray, depth, ts, exclude_mask)
             self._prev_ts = ts
             return PoseResult(self.T_wc.copy(), 1.0, 0, True)
@@ -165,7 +168,7 @@ class VisualOdometry:
             or result.inlier_ratio < self.cfg.min_inlier_ratio
             or self._median_flow() > self.cfg.keyframe_min_flow_px
         )
-        if need_kf:
+        if need_kf and depth is not None:
             self._make_keyframe(gray, depth, ts, exclude_mask)
             result.is_keyframe = True
         else:

@@ -50,10 +50,12 @@ def _robust_depth_sample(depth: np.ndarray, ys: np.ndarray, xs: np.ndarray,
     return float(np.median(vals))
 
 
-def localize_objects(detections: list[Detection], depth: np.ndarray,
+def localize_objects(detections: list[Detection], depth: np.ndarray | None,
                      K: np.ndarray, T_wc: np.ndarray,
                      conf: np.ndarray | None = None) -> list[Observation]:
     """Mask-interior robust depth -> camera-frame 3D -> world-frame position."""
+    if depth is None:
+        return []
     results = []
     for det in detections:
         if det.mask is not None and det.mask.any():

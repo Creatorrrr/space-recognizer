@@ -56,6 +56,16 @@ def test_localize_objects_uses_robust_mask_depth():
     assert obs[0].position[2] == 2.0
 
 
+def test_localize_objects_skips_rgb_only_frames_without_depth():
+    det = Detection(track_id=1, cls_name="chair", conf=0.9,
+                    box=np.array([4, 4, 12, 12], dtype=np.float32), mask=None)
+    K = np.array([[100.0, 0.0, 10.0], [0.0, 100.0, 10.0], [0.0, 0.0, 1.0]])
+
+    obs = localize_objects([det], None, K, np.eye(4))
+
+    assert obs == []
+
+
 def test_registry_reidentify_same_class_nearby():
     reg = ObjectRegistry(ObjectsCfg(merge_radius=0.5))
     pos = np.array([0.0, 0.0, 1.0])

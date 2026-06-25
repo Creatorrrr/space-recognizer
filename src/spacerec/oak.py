@@ -288,6 +288,16 @@ class OakSource:
             ("getTimestampDevice", "timestampDevice", "getTimestamp", "timestamp"),
         )
 
+    @staticmethod
+    def _message_sequence(msg: Any) -> int | None:
+        getter = getattr(msg, "getSequenceNum", None)
+        if getter is None:
+            return None
+        try:
+            return int(getter())
+        except (RuntimeError, TypeError, ValueError):
+            return None
+
     def _packet_timestamp_s(self, packet: Any) -> float | None:
         ts = self._timestamp_member_s(
             packet,
@@ -349,7 +359,6 @@ class OakSource:
     def frames(self) -> Iterator[Frame]:
         start = time.monotonic()
         index = -1
-        last_depth_m: np.ndarray | None = None
         last_gray: np.ndarray | None = None
         last_imu: dict[str, Any] | None = None
         while not self._closed:
@@ -366,13 +375,18 @@ class OakSource:
                 bgr = cv2.resize(bgr, (self.proc_width, self.proc_height),
                                  interpolation=cv2.INTER_AREA)
 
+            depth_m: np.ndarray | None = None
+            depth_ts_abs: float | None = None
+            depth_seq: int | None = None
             depth_msg = self._latest("depth")
             if depth_msg is not None:
                 depth = depth_msg.getFrame().astype(np.float32) * 0.001
                 if depth.shape[:2] != bgr.shape[:2]:
                     depth = cv2.resize(depth, (bgr.shape[1], bgr.shape[0]),
                                        interpolation=cv2.INTER_NEAREST)
-                last_depth_m = depth
+                depth_m = depth
+                depth_ts_abs = self._message_timestamp_s(depth_msg)
+                depth_seq = self._message_sequence(depth_msg)
 
             left_msg = self._latest("left")
             if left_msg is not None:
@@ -397,11 +411,21 @@ class OakSource:
             frame_ts = rgb_ts_s if rgb_ts_s is not None else time.monotonic() - start
             metadata = dict(self.metadata)
             metadata["imu_timestamp_aligned"] = rgb_ts_s is not None
+            metadata["depth_matched"] = depth_m is not None
+            metadata["depth_seq"] = depth_seq
+            metadata["depth_ts_device_ns"] = (
+                None if depth_ts_abs is None else int(depth_ts_abs * 1_000_000_000)
+            )
+            metadata["depth_age_ms"] = (
+                None if depth_ts_abs is None or rgb_ts_abs is None
+                else (depth_ts_abs - rgb_ts_abs) * 1_000.0
+            )
+            metadata["depth_pairing_policy"] = "fresh_depth_packet_only"
             yield Frame(
                 ts=frame_ts,
                 bgr=bgr,
                 index=index,
-                depth_m=None if last_depth_m is None else last_depth_m.copy(),
+                depth_m=None if depth_m is None else depth_m.copy(),
                 depth_conf=None,
                 K=None if self.K is None else self.K.copy(),
                 gray_track=None if last_gray is None else last_gray.copy(),

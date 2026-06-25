@@ -362,12 +362,21 @@ class RecordedOakSource:
         h, w = shape
         return crop_scaled_intrinsics(self.metadata, "CAM_B", w, h)
 
-    def _load_depth_for(self, rgb_event: ReplayEvent,
-                        bgr_shape: tuple[int, int]) -> tuple[np.ndarray | None, np.ndarray | None]:
+    def _load_depth_for(
+        self,
+        rgb_event: ReplayEvent,
+        bgr_shape: tuple[int, int],
+    ) -> tuple[np.ndarray | None, np.ndarray | None, dict[str, Any]]:
         depth_event = _nearest(self.depth_events, rgb_event.ts_device_ns,
                                self.max_pair_delta_ns)
         if depth_event is None:
-            return None, None
+            return None, None, {
+                "depth_matched": False,
+                "depth_age_ms": None,
+                "depth_seq": None,
+                "depth_ts_device_ns": None,
+                "depth_pair_tolerance_ms": self.max_pair_delta_ns / 1_000_000,
+            }
         depth_mm = _load_npy(depth_event, expected_dtype="uint16")
         if depth_mm.ndim != 2:
             raise ReplayFormatError(f"depth payload must be HxW, got {depth_mm.shape}")
@@ -387,7 +396,14 @@ class RecordedOakSource:
             aligned = cv2.resize(depth_m, (w_rgb, h_rgb),
                                  interpolation=cv2.INTER_NEAREST)
         valid = np.isfinite(aligned) & (aligned > 0)
-        return aligned.astype(np.float32), valid.astype(np.uint8)
+        depth_meta = {
+            "depth_matched": True,
+            "depth_age_ms": (depth_event.ts_device_ns - rgb_event.ts_device_ns) / 1_000_000,
+            "depth_seq": depth_event.seq,
+            "depth_ts_device_ns": depth_event.ts_device_ns,
+            "depth_pair_tolerance_ms": self.max_pair_delta_ns / 1_000_000,
+        }
+        return aligned.astype(np.float32), valid.astype(np.uint8), depth_meta
 
     def _load_gray_for(self, rgb_event: ReplayEvent,
                        bgr: np.ndarray) -> np.ndarray:
@@ -470,7 +486,8 @@ class RecordedOakSource:
             if bgr.ndim != 3 or bgr.shape[2] != 3:
                 raise ReplayFormatError(f"rgb payload must be HxWx3, got {bgr.shape}")
             bgr = self._resize_bgr(bgr)
-            depth_m, depth_conf = self._load_depth_for(rgb_event, bgr.shape[:2])
+            depth_m, depth_conf, depth_meta = self._load_depth_for(
+                rgb_event, bgr.shape[:2])
             imu_samples = self._load_imu_window(prev_rgb_ts_ns,
                                                 rgb_event.ts_device_ns)
             yield Frame(
@@ -487,6 +504,7 @@ class RecordedOakSource:
                     "recording": str(self.root),
                     "source_metadata": self.metadata,
                     "depth_mode": self.depth_mode,
+                    **depth_meta,
                     "has_depth_to_rgb_calibration": self._depth_to_rgb is not None,
                     "imu_to_camera_rotation": (
                         None if self.R_cam_imu is None else self.R_cam_imu.tolist()),
