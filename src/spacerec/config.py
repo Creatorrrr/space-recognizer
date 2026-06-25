@@ -67,6 +67,10 @@ class VoCfg:
     pnp_max_velocity_units_s: float = 3.0
     pnp_step_floor_units: float = 0.10
     pnp_divergence_step_factor: float = 3.0
+    imu_rot_residual_warn_deg: float = 3.0
+    imu_rot_residual_reject_deg: float = 6.0
+    imu_constrained_reproj_error_px: float = 4.0
+    imu_constrained_min_inliers: int = 12
 
 
 @dataclass

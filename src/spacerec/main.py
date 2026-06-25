@@ -32,7 +32,7 @@ from .mesh import MeshMap
 from .objects import ObjectRegistry, Observation, localize_objects
 from .perf import PerfRecorder, add_ms
 from .viz import NullVisualizer, Visualizer
-from .vo import VisualOdometry, default_intrinsics
+from .vo import PoseResult, VisualOdometry, default_intrinsics
 from .worldmap import GlobalMap
 
 
@@ -231,6 +231,26 @@ def _apply_no_backend_override(cfg: Config) -> None:
         raise ValueError("--no-backend disables reconstruction; use --fusion direct without --no-backend")
     cfg.backend.enabled = False
     cfg.fusion.mode = "none"
+
+
+def _should_send_reconstruction_keyframe(
+    pose: PoseResult,
+    *,
+    accept_backend_keyframe: bool,
+    fusion_mode: str,
+) -> bool:
+    return (
+        pose.is_keyframe
+        and bool(accept_backend_keyframe)
+        and fusion_mode != "none"
+        and not pose.lost
+        and not pose.low_confidence
+        and not pose.fusion_skipped
+    )
+
+
+def _pose_trusted_for_world_updates(pose: PoseResult) -> bool:
+    return not pose.lost and not pose.low_confidence and not pose.fusion_skipped
 
 
 def _check_direct_fusion_alignment(cfg: Config, source) -> None:
@@ -524,6 +544,12 @@ def main() -> None:
                             "vo_lost": 0,
                             "vo_inlier_ratio": 0.0,
                             "vo_tracked": 0,
+                            "vo_rot_residual_deg": 0.0,
+                            "vo_low_confidence": 0,
+                            "vo_fusion_skipped": 0,
+                            "world_updates_skipped": 0,
+                            "vo_rotation_source": "",
+                            "vo_pnp_source": "",
                         }, metrics)
                     prev_loop_perf = loop_end_perf
                     continue
@@ -616,7 +642,10 @@ def main() -> None:
                 blur_omega_rad_s=cfg.imu.keyframe_blur_omega_rad_s,
                 max_delay_s=cfg.imu.keyframe_max_delay_s,
             )
-            if pose.is_keyframe and accept_backend_keyframe and fusion_mode != "none":
+            if _should_send_reconstruction_keyframe(
+                    pose,
+                    accept_backend_keyframe=accept_backend_keyframe,
+                    fusion_mode=fusion_mode):
                 if fusion_mode == "direct":
                     backend.add_keyframe(DirectFusionKeyframe(
                         kf_id=kf_counter,
@@ -696,62 +725,68 @@ def main() -> None:
                 t = time.perf_counter()
                 viz.log_live_points(pts_global, cols.reshape(-1, 3))
                 add_ms(metrics, "log_live_points_ms", t)
-            t = time.perf_counter()
-            live_observations = localize_objects(detections, depth, vo.K, pose.T_wc,
-                                                 frame.depth_conf)
-            add_ms(metrics, "localize_objects_ms", t)
-            do_embed = (
-                embedder is not None and live_observations
-                and (not cfg.objects.appearance_keyframes_only or pose.is_keyframe)
-                and frame_count % max(1, int(cfg.objects.appearance_every_n_frames)) == 0
-            )
-            if do_embed:
+            observations = []
+            visible = []
+            if _pose_trusted_for_world_updates(pose):
                 t = time.perf_counter()
-                embedder.embed(frame.bgr, live_observations)
-                add_ms(metrics, "appearance_embed_ms", t)
-            t = time.perf_counter()
-            loop_result = loop_closure.estimate(
-                frame_count,
-                frame.ts,
-                live_observations,
-                registry,
-                worldmap.T_global_live,
-            )
-            add_ms(metrics, "loop_correction_ms", t)
-            metrics["loop_correction_attempted"] = float(loop_result.attempted)
-            metrics["loop_correction_accepted"] = float(loop_result.accepted)
-            metrics["loop_correction_matches"] = float(loop_result.match_count)
-            metrics["loop_correction_rms"] = float(loop_result.rms)
-            metrics["loop_correction_yaw_delta_deg"] = float(loop_result.yaw_delta_deg)
-            if loop_result.accepted and loop_result.T_global_live is not None:
-                worldmap.set_correction_target(loop_result.T_global_live)
-                print(
-                    "[loop] object correction accepted "
-                    f"matches={loop_result.match_count} rms={loop_result.rms:.3f} "
-                    f"yaw_delta={loop_result.yaw_delta_deg:.1f}deg "
-                    f"trans_delta={loop_result.translation_delta:.2f} "
-                    f"scale_delta={loop_result.scale_delta:.3f}"
+                live_observations = localize_objects(
+                    detections, depth, vo.K, pose.T_wc, frame.depth_conf
                 )
-            observations = [
-                Observation(
-                    det=obs.det,
-                    position=worldmap.to_global_points(obs.position[None])[0],
-                    size=obs.size,
-                    emb=obs.emb,
+                add_ms(metrics, "localize_objects_ms", t)
+                do_embed = (
+                    embedder is not None and live_observations
+                    and (not cfg.objects.appearance_keyframes_only or pose.is_keyframe)
+                    and frame_count % max(1, int(cfg.objects.appearance_every_n_frames)) == 0
                 )
-                for obs in live_observations
-            ]
-            t = time.perf_counter()
-            visible = registry.update(observations, frame.ts)
+                if do_embed:
+                    t = time.perf_counter()
+                    embedder.embed(frame.bgr, live_observations)
+                    add_ms(metrics, "appearance_embed_ms", t)
+                t = time.perf_counter()
+                loop_result = loop_closure.estimate(
+                    frame_count,
+                    frame.ts,
+                    live_observations,
+                    registry,
+                    worldmap.T_global_live,
+                )
+                add_ms(metrics, "loop_correction_ms", t)
+                metrics["loop_correction_attempted"] = float(loop_result.attempted)
+                metrics["loop_correction_accepted"] = float(loop_result.accepted)
+                metrics["loop_correction_matches"] = float(loop_result.match_count)
+                metrics["loop_correction_rms"] = float(loop_result.rms)
+                metrics["loop_correction_yaw_delta_deg"] = float(loop_result.yaw_delta_deg)
+                if loop_result.accepted and loop_result.T_global_live is not None:
+                    worldmap.set_correction_target(loop_result.T_global_live)
+                    print(
+                        "[loop] object correction accepted "
+                        f"matches={loop_result.match_count} rms={loop_result.rms:.3f} "
+                        f"yaw_delta={loop_result.yaw_delta_deg:.1f}deg "
+                        f"trans_delta={loop_result.translation_delta:.2f} "
+                        f"scale_delta={loop_result.scale_delta:.3f}"
+                    )
+                observations = [
+                    Observation(
+                        det=obs.det,
+                        position=worldmap.to_global_points(obs.position[None])[0],
+                        size=obs.size,
+                        emb=obs.emb,
+                    )
+                    for obs in live_observations
+                ]
+                t = time.perf_counter()
+                visible = registry.update(observations, frame.ts)
 
-            # 부재 증거: 보여야 하는 위치인데 안 보이는 노드는 신뢰를 깎는다
-            T_lg = sim3_inverse(worldmap.T_global_live)
-            positions_live = {o.obj_id: sim3_apply(T_lg, o.position[None])[0]
-                              for o in registry.objects.values()}
-            registry.decay_absent(visible, observations, positions_live,
-                                  pose.T_wc, vo.K, depth,
-                                  cfg.objects.absence_limit)
-            add_ms(metrics, "registry_ms", t)
+                # Absence evidence must use only trusted camera poses.
+                T_lg = sim3_inverse(worldmap.T_global_live)
+                positions_live = {o.obj_id: sim3_apply(T_lg, o.position[None])[0]
+                                  for o in registry.objects.values()}
+                registry.decay_absent(visible, observations, positions_live,
+                                      pose.T_wc, vo.K, depth,
+                                      cfg.objects.absence_limit)
+                add_ms(metrics, "registry_ms", t)
+            else:
+                metrics["world_updates_skipped"] = 1.0
 
             # 이전 세션 지도가 있으면 임베딩 매칭으로 재위치추정을 시도
             t = time.perf_counter()
@@ -809,6 +844,17 @@ def main() -> None:
                     "vo_lost": int(pose.lost),
                     "vo_inlier_ratio": pose.inlier_ratio,
                     "vo_tracked": pose.n_tracked,
+                    "vo_rot_residual_deg": (
+                        0.0 if pose.imu_visual_rot_residual_deg is None
+                        else float(pose.imu_visual_rot_residual_deg)
+                    ),
+                    "vo_low_confidence": int(pose.low_confidence),
+                    "vo_fusion_skipped": int(pose.fusion_skipped),
+                    "world_updates_skipped": int(
+                        not _pose_trusted_for_world_updates(pose)
+                    ),
+                    "vo_rotation_source": pose.rotation_source,
+                    "vo_pnp_source": pose.pnp_candidate_source,
                 }, metrics)
             prev_loop_perf = loop_end_perf
             if args.profile and frame_count % 10 == 0:

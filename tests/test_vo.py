@@ -3,7 +3,8 @@ import numpy as np
 import pytest
 
 from spacerec.config import VoCfg
-from spacerec.vo import VisualOdometry, backproject, default_intrinsics
+from spacerec.vo import (Keyframe, PnpCandidate, PoseResult, VisualOdometry, backproject,
+                         default_intrinsics, rotation_residual_deg)
 
 
 def test_default_intrinsics_fov():
@@ -180,3 +181,205 @@ def test_bad_pnp_prior_does_not_teleport_pose():
 
     assert not result.lost
     assert np.linalg.norm(result.T_wc[:3, 3]) < 0.5
+
+
+def _pnp_candidate(name, R, t, n):
+    rvec, _ = cv2.Rodrigues(np.asarray(R, dtype=np.float64))
+    cand = PnpCandidate(
+        name=name,
+        ok=True,
+        rvec=rvec,
+        tvec=np.asarray(t, dtype=np.float64).reshape(3, 1),
+        inliers=np.arange(n, dtype=np.int32).reshape(-1, 1),
+        n_total=n,
+        reproj_median_px=0.2,
+    )
+    return cand
+
+
+def _synthetic_pnp_scene():
+    W, H = 320, 240
+    K = default_intrinsics(W, H)
+    xs = np.linspace(-0.6, 0.6, 5)
+    ys = np.linspace(-0.4, 0.4, 4)
+    pts3d = np.array([[x, y, 3.0 + 0.1 * x] for y in ys for x in xs],
+                     dtype=np.float64)
+    pts2d = (K @ (pts3d / pts3d[:, 2:]).T).T[:, :2]
+    return K, pts3d, pts2d
+
+
+def test_rotation_residual_deg_reports_so3_difference():
+    R_visual, _ = cv2.Rodrigues(np.array([0.0, np.radians(10.0), 0.0]))
+    R_imu, _ = cv2.Rodrigues(np.array([0.0, np.radians(3.0), 0.0]))
+
+    assert rotation_residual_deg(R_visual, R_imu) == pytest.approx(7.0, abs=1e-3)
+
+
+def test_imu_constrained_candidate_replaces_divergent_visual_when_reprojection_passes():
+    K, pts3d, pts2d = _synthetic_pnp_scene()
+    cfg = VoCfg(
+        imu_rot_residual_warn_deg=3.0,
+        imu_rot_residual_reject_deg=6.0,
+        pnp_max_step_depth_frac=1.0,
+    )
+    vo = VisualOdometry(K, cfg)
+    R_bad, _ = cv2.Rodrigues(np.array([0.0, np.radians(10.0), 0.0]))
+    base = _pnp_candidate("base", R_bad, [0.0, 0.0, 0.0], len(pts3d))
+
+    selection = vo._apply_imu_rotation_gate(
+        base,
+        pts3d,
+        pts2d,
+        np.eye(3),
+        dt=0.1,
+    )
+
+    assert selection.candidate is not None
+    assert selection.candidate.name == "imu_constrained"
+    assert selection.low_confidence is False
+    assert selection.fusion_skipped is False
+    assert selection.rot_residual_deg == pytest.approx(10.0, abs=0.2)
+    assert rotation_residual_deg(selection.candidate.rotation_matrix(), np.eye(3)) < 0.5
+
+
+def test_bad_imu_does_not_override_good_visual_candidate():
+    K, pts3d, pts2d = _synthetic_pnp_scene()
+    cfg = VoCfg(
+        imu_rot_residual_warn_deg=3.0,
+        imu_rot_residual_reject_deg=6.0,
+        pnp_max_step_depth_frac=1.0,
+    )
+    vo = VisualOdometry(K, cfg)
+    base = _pnp_candidate("base", np.eye(3), [0.0, 0.0, 0.0], len(pts3d))
+    R_bad_imu, _ = cv2.Rodrigues(np.array([0.0, np.radians(15.0), 0.0]))
+
+    selection = vo._apply_imu_rotation_gate(
+        base,
+        pts3d,
+        pts2d,
+        R_bad_imu,
+        dt=0.1,
+    )
+
+    assert selection.candidate is base
+    assert selection.low_confidence is True
+    assert selection.fusion_skipped is True
+    assert selection.rotation_source == "visual_pnp"
+
+
+def test_imu_rotation_gate_keeps_visual_for_warn_level_disagreement():
+    K, pts3d, pts2d = _synthetic_pnp_scene()
+    cfg = VoCfg(
+        imu_rot_residual_warn_deg=3.0,
+        imu_rot_residual_reject_deg=6.0,
+        pnp_max_step_depth_frac=1.0,
+    )
+    vo = VisualOdometry(K, cfg)
+    R_visual, _ = cv2.Rodrigues(np.array([0.0, np.radians(4.0), 0.0]))
+    base = _pnp_candidate("base", R_visual, [0.0, 0.0, 0.0], len(pts3d))
+
+    selection = vo._apply_imu_rotation_gate(
+        base,
+        pts3d,
+        pts2d,
+        np.eye(3),
+        dt=0.1,
+    )
+
+    assert selection.candidate is base
+    assert selection.rot_residual_deg == pytest.approx(4.0, abs=0.2)
+    assert selection.low_confidence is False
+    assert selection.fusion_skipped is False
+
+
+def test_rejected_imu_visual_divergence_keeps_tracking_recoverable(monkeypatch):
+    K, pts3d, pts2d = _synthetic_pnp_scene()
+    cfg = VoCfg(
+        imu_rot_residual_warn_deg=3.0,
+        imu_rot_residual_reject_deg=6.0,
+        pnp_max_step_depth_frac=1.0,
+    )
+    vo = VisualOdometry(K, cfg)
+    gray = np.zeros((240, 320), dtype=np.uint8)
+    vo.keyframe = Keyframe(
+        ts=0.0,
+        gray=gray,
+        depth=np.ones_like(gray, dtype=np.float32),
+        T_wc=np.eye(4),
+        obj_masks=None,
+    )
+    vo._prev_gray = gray
+    vo._prev_ts = 0.0
+    vo._pts2d = pts2d.astype(np.float32)
+    vo._pts3d = pts3d.copy()
+    vo._pts3d_keyframe = pts3d.copy()
+    vo._kf_pts2d = pts2d.astype(np.float32)
+    previous_pose = np.eye(4)
+    previous_pose[:3, 3] = [1.0, 0.0, 0.0]
+    vo.T_wc = previous_pose.copy()
+
+    monkeypatch.setattr(
+        vo,
+        "_lk_track",
+        lambda *_args, **_kwargs: (
+            pts2d.astype(np.float32).reshape(-1, 1, 2),
+            np.ones((len(pts2d), 1), dtype=np.uint8),
+            np.zeros(len(pts2d), dtype=np.float32),
+        ),
+    )
+    monkeypatch.setattr(
+        vo,
+        "_solve_pnp",
+        lambda *_args, **_kwargs: _pnp_candidate(
+            "base", np.eye(3), [0.0, 0.0, 0.0], len(pts3d)),
+    )
+    R_bad_imu, _ = cv2.Rodrigues(np.array([0.0, np.radians(15.0), 0.0]))
+
+    result = vo._track(gray, ts=0.1, R_since_keyframe=R_bad_imu)
+
+    expected_visual_pose = np.eye(4)
+    assert result.low_confidence
+    assert result.fusion_skipped
+    assert result.rotation_source == "visual_pnp"
+    assert result.pnp_candidate_source == "base"
+    assert np.allclose(result.T_wc, expected_visual_pose)
+    assert np.allclose(vo.T_wc, expected_visual_pose)
+    assert not np.allclose(vo.T_wc, previous_pose)
+
+
+def test_process_refreshes_tracking_keyframe_for_low_confidence_pose(monkeypatch):
+    K = default_intrinsics(320, 240)
+    cfg = VoCfg(keyframe_interval_s=0.1, keyframe_min_flow_px=1e9)
+    vo = VisualOdometry(K, cfg)
+    gray = np.zeros((240, 320), dtype=np.uint8)
+    depth = np.ones_like(gray, dtype=np.float32)
+    vo.keyframe = Keyframe(0.0, gray, depth, np.eye(4), None)
+    vo._prev_ts = 0.0
+
+    monkeypatch.setattr(
+        vo,
+        "_track",
+        lambda *_args, **_kwargs: PoseResult(
+            vo.T_wc.copy(),
+            1.0,
+            20,
+            False,
+            low_confidence=True,
+            fusion_skipped=True,
+        ),
+    )
+    keyframe_calls = []
+
+    def fake_make_keyframe(_gray, _depth, ts, exclude_mask):
+        keyframe_calls.append(ts)
+        vo.keyframe = Keyframe(ts, _gray, _depth, vo.T_wc.copy(), exclude_mask)
+        vo._prev_gray = _gray
+
+    monkeypatch.setattr(vo, "_make_keyframe", fake_make_keyframe)
+
+    result = vo.process(gray, depth, ts=0.2, exclude_mask=None)
+
+    assert keyframe_calls == [0.2]
+    assert result.is_keyframe
+    assert result.low_confidence
+    assert result.fusion_skipped

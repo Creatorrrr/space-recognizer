@@ -51,6 +51,12 @@ META_FIELDS = [
     "vo_lost",
     "vo_inlier_ratio",
     "vo_tracked",
+    "vo_rot_residual_deg",
+    "vo_low_confidence",
+    "vo_fusion_skipped",
+    "world_updates_skipped",
+    "vo_rotation_source",
+    "vo_pnp_source",
 ]
 
 

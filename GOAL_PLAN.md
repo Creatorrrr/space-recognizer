@@ -1,64 +1,62 @@
-# OAK Direct RGB-D Fusion Goal
+# OAK IMU Camera Pose Correction Goal
 
 ## Goal Summary
-- Final outcome: OAK-D-Lite live/replay metric depth can build an accumulated 3D environment point cloud and optional TSDF mesh without loading DA3 live depth, DA3 any-view backend, or DA3 metric anchor models.
-- Scope: `/Users/chasoik/Projects/space-recognizer`, especially `src/spacerec/main.py`, `src/spacerec/config.py`, a new direct fusion module, tests, benchmarks, README, and manual docs.
-- Non-goals: monocular RGB reconstruction without a metric depth source, replacing the existing DA3 backend, loop closure/pose graph/SLAM rewrite, object detection changes, broad VO/IMU changes, destructive cleanup of unrelated work, or self-directed target increases.
+- Final outcome: improve `space-recognizer` camera pose estimation so OAK IMU rotation and visual LK + PnP complement each other, then prove the improvement on the recorded replay `sources/session_20260624_054320_194430108151D05A00`.
+- Scope: `src/spacerec/vo.py`, `src/spacerec/imu.py`, `src/spacerec/main.py`, `src/spacerec/config.py`, perf/replay diagnostics, tests, benchmarks, and targeted docs/config comments if needed.
+- Non-goals: making IMU an unconditional primary pose source, naively combining IMU rotation with an unverified visual translation, broad SLAM/pose-graph rewrites, unrelated direct-fusion/backend refactors, destructive cleanup of unrelated dirty work, or self-directed target increases.
 
 ## Baseline And Assumptions
-- Current baseline:
-  - `worldmap.fuse()` is called only through backend result application, so `--no-backend` leaves the accumulated environment point cloud empty.
-  - OAK live/replay frames already expose metric `depth_m`, camera `K`, RGB, optional depth confidence, and IMU metadata through the common `Frame` contract.
-  - The live loop already has dynamic object masks and VO poses before backend keyframes are emitted.
-  - Current `config.yaml` may contain unrelated user edits and must not be reverted.
-- Unknowns to verify:
-  - Which OAK replay session is available locally for final smoke verification.
-  - Whether direct TSDF integration must run synchronously or needs a worker to avoid visible live-loop spikes.
-- Assumptions:
-  - Direct fusion is valid only when the source has metric depth aligned to the RGB frame.
-  - Direct fusion should reuse the existing `BackendResult` consumption path where practical so `GlobalMap`, `MeshMap`, visualization, persistence, and export behavior stay shared.
-  - DA3 backend and direct OAK fusion are mutually exclusive reconstruction sources for a single run.
+- Baseline must be measured from the current code before behavior changes.
+- The main problem window is the user-observed camera rotation around 45 seconds. Use `44.5s-46.5s` as the focused window unless current logs show a more precise interval.
+- Current likely failure mode: high-inlier visual PnP can converge to a wrong keyframe-relative rotation during a rotation/low-parallax segment, while IMU is only used as LK/PnP initialization and does not veto or constrain the final visual solution.
+- Existing OAK session health is assumed usable, but the run must verify the file exists and replay commands actually complete.
+- Numeric targets must be derived from measured baseline. Do not invent unsupported thresholds as final success evidence before measuring.
 
 ## Checkpoint Plan
 | Step | Work | Stage Target | Verification | Done When |
 |---|---|---|---|---|
-| 1 | Review the stale plan/current source and patch this plan to the active OAK direct fusion goal. | Plan is concrete, bounded, verifiable, and preserves unrelated dirty work. | Inspect `GOAL_PLAN.md`, `git status`, OAK/depth/backend/main/mesh/config sources. | Stale plan is replaced and progress log begins. |
-| 2 | Add tests first for fusion config/mode resolution and direct RGB-D fusion behavior. | Tests cover direct-only metric source gating, default config loading, no DA3-needed policy, point backprojection, validity/mask filtering, RGB color order, BackendResult-compatible view arrays, and mesh-window output. | Run focused pytest and confirm new tests fail for missing implementation. | Red tests fail for the expected missing symbols/behavior. |
-| 3 | Implement fusion config and direct fusion module. | Add `FusionCfg`, mode resolution, direct keyframe/result production, depth validity filters, dynamic mask dilation, optional edge filtering, point subsampling, RGB conversion, view buffering, and `BackendResult` output with `meters_per_unit=1.0`. | Focused direct fusion/config tests. | Red tests pass without loading DA3. |
-| 4 | Wire main loop and CLI. | Add `--fusion`, `--direct-fusion`; instantiate DA3 backend only for backend mode; instantiate direct backend only for metric sources; keep `--fusion none` as reconstruction off; reject conflicting or invalid modes clearly. | Main/config policy tests and source review. | Direct OAK path reaches existing backend-result drain or equivalent shared application path. |
-| 5 | Update docs and benchmarks. | README/MANUAL/config/benchmark help explain `backend`, `direct`, `none`, `auto`, `--no-backend`, OAK alignment requirements, DA3-free behavior, and drift/mesh limitations. | Docs grep/source review and benchmark help smoke where practical. | User-facing instructions match implementation. |
-| 6 | Final verification and repair. | Related and full tests pass; strongest available OAK replay smoke proves non-empty accumulated map and, when mesh enabled, readable mesh output. | `git diff --check`, focused tests, full pytest, direct fusion smoke/benchmark on available OAK recording or documented substitute if unavailable. | Every final completion criterion is proven from current-state evidence. |
+| 1 | Review and patch this plan, inspect worktree and relevant source. | Plan is current, bounded, verifiable, and unrelated dirty work is preserved. | Read `GOAL_PLAN.md`, `git status`, VO/IMU/main/config/perf/replay tests. | Stale plan is replaced and source map is recorded in the progress log. |
+| 2 | Establish baseline on the real session. | Produce baseline artifacts with 45s focused metrics: visual-vs-IMU rotation residual, chosen pose source, inliers, tracked points, lost state, loop correction status if available. | Run the required focused replay and any additional diagnostic script needed to compute residuals. | Baseline CSV/artifact path and 45s before numbers are recorded. |
+| 3 | Add RED tests for the intended behavior. | Tests cover rotation residual computation, bad-IMU protection, wrong-visual/right-IMU divergence handling, and no unsafe fusion of rejected poses. | Run focused pytest and confirm tests fail for the expected missing behavior. | Red tests fail for expected reasons, not syntax/import errors. |
+| 4 | Implement IMU reliability checks, residual diagnostics, and candidate selection gate. | Visual pose remains accepted when it agrees with trusted IMU; visual pose is marked low-confidence/rejected or replaced by a constrained candidate when it diverges beyond threshold; bad IMU does not override good visual. | Focused tests pass; perf logs include residual/source/confidence fields. | Tests prove both correction and bad-IMU fallback behavior. |
+| 5 | Add or wire a constrained fallback for divergent rotations. | When visual and trusted IMU disagree, attempt an IMU-rotation-constrained translation estimate and accept it only if reprojection/motion gates pass; otherwise hold/reject without polluting map/backend fusion. | Synthetic tests and focused replay diagnostics. | Divergent high-inlier wrong visual no longer silently updates global reconstruction. |
+| 6 | Final real-session verification and regression checks. | Full and focused replays prove improvement at the 45s window and no major regressions. | Run required replay commands, focused tests, broader tests, `git diff --check`, and independent verification if available. | Every final completion criterion is proven from current-state evidence. |
 
 ## Final Completion Criteria
-- OAK live/replay metric depth can run with `--fusion direct` or `--direct-fusion` and produce accumulated `worldmap.points`.
-- Direct mode does not instantiate or load `DepthEstimator`, `ReconstructionBackend` DA3 any-view, or DA3 metric anchor when `oak_fill_missing` is false.
-- Direct mode rejects non-metric sources with a clear error.
-- Existing `--fusion backend` or equivalent backend path preserves DA3 backend behavior.
-- `--fusion none` or an explicit reconstruction-off path remains available for performance upper-bound runs.
-- Depth validity includes range checks, optional confidence, dynamic object mask exclusion, mask dilation, and optional edge/flying-pixel filtering.
-- RGB/BGR color conversion is tested and correct for point cloud and mesh data.
-- Direct fusion can provide `view_depths`, `view_valid`, `view_colors`, `view_poses`, and `view_intrinsics` so existing `MeshMap` can build/export TSDF mesh when enabled.
-- Existing DA3 backend, OAK depth policy, mesh, persistence, config, VO, replay, and object tests do not regress.
-- README/MANUAL/config comments explain direct mode, DA3-free behavior, OAK depth alignment requirements, `--no-backend`/`--fusion none`, drift limitations, and mesh limitations.
-- Existing unrelated dirty worktree changes and artifacts are preserved.
+- Current baseline is measured and saved before implementation.
+- The implementation exposes diagnostics equivalent to `imu_visual_rot_residual_deg`, `rotation_source` or `pnp_candidate_source`, low-confidence/rejected state, and fusion-skipped state where applicable.
+- Visual LK + PnP remains the main source when it agrees with a trusted IMU signal.
+- Trusted IMU can prevent or correct a high-inlier visual rotation solution that diverges from keyframe-since IMU by the configured threshold.
+- A bad or unreliable IMU cannot forcibly override a good visual solution.
+- Rejected or low-confidence poses do not get fused into the world map/backend/mesh path as if they were trustworthy.
+- The focused real-session replay is run:
+  ```powershell
+  .\.venv\Scripts\python.exe -m spacerec.main --source "sources\session_20260624_054320_194430108151D05A00" --max-seconds 47 --no-viz --perf-log artifacts\imu_pose_after_45s.csv
+  ```
+- The full real-session replay is run:
+  ```powershell
+  .\.venv\Scripts\python.exe -m spacerec.main --source "sources\session_20260624_054320_194430108151D05A00" --no-viz --perf-log artifacts\imu_pose_after_full.csv
+  ```
+- If the measured baseline 45s keyframe-since IMU/visual rotation residual is at least 6 degrees, the after result must show at least 50% reduction or an absolute residual of at most 3 degrees for the problematic accepted/fused pose. If this is not possible because the IMU is rejected by reliability gates, report the goal as infeasible rather than passing.
+- Related unit tests, replay/perf tests, and `python -m compileall src tests` pass.
+- Final report includes exact commands, results/exit codes, artifact paths, before/after 45s metrics, completion-criteria pass/fail, and remaining risks.
 
 ## Independent Verification Policy
-- Independent final verification is required before marking the goal complete.
-- Preferred verification: separate subagent or clean worktree/fresh checkout reruns final criteria and reviews the diff.
-- If unavailable, record why and run the strongest substitute: `git status`, `git diff --check`, focused tests, full tests, direct OAK replay smoke, direct mesh smoke, artifact read-back, and focused diff review.
-- Final report must include exact commands, pass/fail results, generated artifact paths if any, DA3-free/direct behavior evidence, and unresolved risks.
+- Preferred final verification: a separate subagent or clean worktree/fresh checkout reruns final criteria and reviews the diff.
+- If unavailable, record why and run the strongest substitute: `git status`, `git diff --check`, focused tests, broader tests, full and focused replay artifact regeneration, artifact read-back, and focused diff review.
+- Do not mark the goal complete unless the verification evidence is surfaced in the final response.
 
 ## Self-Directed Target Increase Policy
 - User opt-in: no.
 - After mandatory targets pass, stop without raising performance or quality targets.
-- Do not expand scope into full SLAM, loop closure, pose graph, full spatial-block TSDF, broad refactors, or unrequested performance targets.
+- Do not expand scope into full SLAM, loop closure, pose graph optimization, broad depth/backend redesign, or unrelated performance goals.
 
 ## Stop And Ask Conditions
-- Correctness requires deleting unrelated user work or reverting dirty changes not made for this goal.
-- Required validation needs physical OAK hardware and no recorded OAK session is available for a substitute smoke.
+- Correctness requires deleting or reverting unrelated user work.
+- The recorded session is missing or unreadable and no equivalent user-approved replay is available.
+- Required validation needs live OAK hardware rather than the recorded session.
 - Destructive commands, credentials, external services, or large new dependencies are required.
-- Evidence shows metric-depth direct fusion cannot satisfy the goal without adding a broader SLAM/loop-closure system.
-- Existing public behavior would need an incompatible CLI/config break instead of additive options.
+- Evidence shows the IMU signal is not timestamp/extrinsic reliable enough to satisfy the goal under the stated constraints.
 
 ## Progress Log Rules
 - After each checkpoint, log current step, changed files, verification command/result, remaining work, and blockers.
@@ -67,9 +65,9 @@
 ## Progress Log
 | Step | Status | Changed Files | Verification Result | Remaining / Blockers |
 |---|---|---|---|---|
-| 1 | Done | `GOAL_PLAN.md` | Current `GOAL_PLAN.md` was a stale canonical mesh plan. Current source and `git status` reviewed; branch `codex/oak-direct-fusion` created to avoid implementing on `main`. | Continue with TDD red tests for direct fusion. |
-| 2 | Done | `tests/test_config.py`, `tests/test_main_depth_policy.py`, `tests/test_directfusion.py` | Red check before implementation: `.venv/bin/python -m pytest tests/test_config.py tests/test_main_depth_policy.py tests/test_directfusion.py -q` failed for the expected missing `FusionCfg`, `resolve_fusion_mode`, and `directfusion` module. | None. |
-| 3 | Done | `src/spacerec/config.py`, `src/spacerec/directfusion.py` | Added `FusionCfg` and direct RGB-D fusion. Focused check after implementation: `.venv/bin/python -m pytest tests/test_config.py tests/test_main_depth_policy.py tests/test_directfusion.py -q` -> 22 passed. | None. |
-| 4 | Done | `src/spacerec/main.py`, `benchmarks/replay_smoke.py` | Added `--fusion`, `--direct-fusion`, direct/none/backend mode resolution, metric-source gating, RGB-depth alignment checks, explicit `--no-backend` direct conflict handling, DA3-free direct fill policy, and direct keyframe wiring into the shared result application path. Focused replay policy check: `.venv/bin/python -m pytest tests/test_config.py tests/test_main_depth_policy.py tests/test_directfusion.py tests/test_replay.py -q` -> 35 passed. Direct replay smoke: `.venv/bin/python benchmarks/replay_smoke.py sources/session_20260624_054320_194430108151D05A00 --frames 60 --direct-fusion` -> `direct_keyframes=11 direct_points=104863`. | None. |
-| 5 | Done | `README.md`, `docs/MANUAL.md`, `docs/benchmarks.md`, `config.yaml`, `benchmarks/mesh_smoke.py`, `benchmarks/perf_matrix.py` | Docs/config/benchmarks now describe `backend`, `direct`, `none`, `auto`, OAK alignment requirements, `--no-backend` semantics, DA3-free direct mode, and drift/mesh limits. Main direct smoke: `.venv/bin/python -m spacerec.main --source sources/session_20260624_054320_194430108151D05A00 --fusion direct --no-realtime --max-frames 20 --no-viz --runtime-profile realtime --profile` -> direct fusion enabled, no backend wait, `map=40383pts`, `scale=1.000`, `done: 20 frames`. Direct mesh smoke: `.venv/bin/python benchmarks/mesh_smoke.py sources/session_20260624_054320_194430108151D05A00 --frames 60 --fusion direct --out-dir artifacts/mesh_direct_verify` -> readable PLY with `vertices=56302 faces=83309 read_vertices=56302 read_faces=83309`. | None. |
-| 6 | Done | All changed files | Final local verification: `git diff --check` -> pass; `.venv/bin/python -m pytest tests/ -q` -> 92 passed; main direct smoke -> `map=40383pts`; direct replay smoke -> `direct_keyframes=11 direct_points=104863`; direct mesh smoke -> readable PLY at `artifacts/mesh_direct_verify/session_20260624_054320_194430108151D05A00.ply` with `56302` vertices and `83309` faces. Independent verifier `Russell` reran `git diff --check` -> pass and full tests -> `92 passed`, then reviewed that helper refactor preserved DA3-free direct mode, metric-depth gating, and RGB alignment checks. | No blocker. `config.yaml` had pre-existing `mesh.enabled: false`; preserved as unrelated dirty work while direct mesh is verified through `mesh_smoke.py`. |
+| 1 | Done | `GOAL_PLAN.md` | Existing plan was stale direct-fusion work and was replaced with the active IMU pose-correction goal. Worktree is on `codex/orbslam3-oak-pose-provider`; unrelated untracked benchmark/docs files were left untouched. | None. |
+| 2 | Done | `artifacts/imu_pose_baseline_45s.csv`, `artifacts/imu_pose_baseline_nogate_config.yaml`, `artifacts/imu_pose_baseline_nogate_45s.csv`, `artifacts/imu_pose_45s_compare.json` | Current-code focused baseline command completed. A no-gate diagnostic baseline preserved pre-gate behavior while exposing residuals: in 44.5-46.5s, 6/6 keyframes were fused; 5 had residual >6 deg; max residual was 9.03 deg. | None. |
+| 3 | Done | `tests/test_vo.py`, `tests/test_main_pose_safety.py` | RED checks failed for expected missing `rotation_residual_deg`, `_should_send_reconstruction_keyframe`, and then policy mismatches before implementation changes. | None. |
+| 4 | Done | `src/spacerec/vo.py`, `src/spacerec/main.py`, `src/spacerec/perf.py`, `src/spacerec/config.py`, `config.yaml` | Added residual diagnostics, IMU-constrained translation candidate, bad-IMU reprojection guard, low-confidence/fusion-skip flags, perf CSV fields, reconstruction keyframe safety gate, and world-update safety gate. Focused tests: `.\.venv\Scripts\python.exe -m pytest tests\test_vo.py tests\test_main_pose_safety.py -q` -> 18 passed. | None. |
+| 5 | Done | `artifacts/imu_pose_after_45s.csv`, `artifacts/imu_pose_45s_compare.json` | Focused after replay completed. In 44.5-46.5s, baseline fused 6/6 keyframes including 5 keyframes with residual >6 deg; after fused 1/6 keyframes and marked/skipped all 5 keyframes >6 deg for reconstruction and world updates. | None. |
+| 6 | Done | `artifacts/imu_pose_after_full.csv`, `artifacts/imu_pose_after_full_summary.json` | Full replay completed: 750 frames, 0 lost rows, 168 low-confidence/fusion-skipped/world-update-skipped rows, final map_points 461618. Local checks completed: `git diff --check` pass, `.\.venv\Scripts\python.exe -m compileall src tests` pass, `.\.venv\Scripts\python.exe -m pytest tests -q` -> 124 passed. | Independent verification requested; final response must include its result or residual risk if unavailable. |

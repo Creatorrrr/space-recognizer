@@ -68,6 +68,10 @@ vo:
   pnp_max_velocity_units_s: 3.0
   pnp_step_floor_units: 0.10
   pnp_divergence_step_factor: 3.0
+  imu_rot_residual_warn_deg: 3.0
+  imu_rot_residual_reject_deg: 6.0
+  imu_constrained_reproj_error_px: 4.0
+  imu_constrained_min_inliers: 12
 
 imu:
   enabled: true          # true면 gyro-derived LK/PnP rotation prior 사용

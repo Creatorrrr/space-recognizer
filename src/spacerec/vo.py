@@ -35,6 +35,16 @@ def backproject(pts2d: np.ndarray, depth: np.ndarray, K: np.ndarray) -> np.ndarr
     return np.stack([x, y, z], axis=1)
 
 
+def rotation_residual_deg(R_a: np.ndarray, R_b: np.ndarray) -> float:
+    """Return the SO(3) angle between two rotation matrices in degrees."""
+
+    Ra = np.asarray(R_a, dtype=np.float64).reshape(3, 3)
+    Rb = np.asarray(R_b, dtype=np.float64).reshape(3, 3)
+    R = Ra @ Rb.T
+    value = float((np.trace(R) - 1.0) * 0.5)
+    return float(np.degrees(np.arccos(np.clip(value, -1.0, 1.0))))
+
+
 @dataclass
 class Keyframe:
     ts: float
@@ -56,6 +66,11 @@ class PoseResult:
     # 카메라 z-depth. depth 맵의 프레임별 스케일 검증/보정에 사용한다.
     feat_uv: np.ndarray | None = None
     feat_z: np.ndarray | None = None
+    imu_visual_rot_residual_deg: float | None = None
+    pnp_candidate_source: str = ""
+    rotation_source: str = ""
+    low_confidence: bool = False
+    fusion_skipped: bool = False
 
 
 _LK_PARAMS = dict(winSize=(21, 21), maxLevel=3,
@@ -72,6 +87,12 @@ class PnpCandidate:
     n_total: int
     reproj_median_px: float = np.inf
 
+    def rotation_matrix(self) -> np.ndarray:
+        if self.rvec is None:
+            raise ValueError("candidate has no rotation vector")
+        R, _ = cv2.Rodrigues(self.rvec)
+        return R
+
     @property
     def n_inliers(self) -> int:
         return 0 if self.inliers is None else int(len(self.inliers))
@@ -79,6 +100,15 @@ class PnpCandidate:
     @property
     def inlier_ratio(self) -> float:
         return 0.0 if self.n_total <= 0 else self.n_inliers / self.n_total
+
+
+@dataclass
+class PnpSelection:
+    candidate: PnpCandidate | None
+    rot_residual_deg: float | None = None
+    low_confidence: bool = False
+    fusion_skipped: bool = False
+    rotation_source: str = "visual_pnp"
 
 
 def reprojection_median_px(
@@ -244,6 +274,151 @@ class VisualOdometry:
         median_z = self._candidate_median_z(cand, pts3d)
         return self._candidate_pose_step(cand) <= self._pose_step_limit(dt, median_z)
 
+    def _translation_for_fixed_rotation(
+        self,
+        pts3d: np.ndarray,
+        pts2d: np.ndarray,
+        R_ck: np.ndarray,
+        idx: np.ndarray,
+    ) -> np.ndarray | None:
+        if len(idx) < 3:
+            return None
+        pts = pts3d[idx].astype(np.float64)
+        uv = pts2d[idx].astype(np.float64)
+        xn = (uv[:, 0] - self.K[0, 2]) / self.K[0, 0]
+        yn = (uv[:, 1] - self.K[1, 2]) / self.K[1, 1]
+        rotated = pts @ np.asarray(R_ck, dtype=np.float64).reshape(3, 3).T
+        A = np.zeros((len(idx) * 2, 3), dtype=np.float64)
+        b = np.zeros((len(idx) * 2,), dtype=np.float64)
+        A[0::2, 0] = 1.0
+        A[0::2, 2] = -xn
+        b[0::2] = xn * rotated[:, 2] - rotated[:, 0]
+        A[1::2, 1] = 1.0
+        A[1::2, 2] = -yn
+        b[1::2] = yn * rotated[:, 2] - rotated[:, 1]
+        try:
+            tvec, *_ = np.linalg.lstsq(A, b, rcond=None)
+        except np.linalg.LinAlgError:
+            return None
+        if not np.all(np.isfinite(tvec)):
+            return None
+        return tvec.reshape(3, 1)
+
+    def _fixed_rotation_candidate(
+        self,
+        pts3d: np.ndarray,
+        pts2d: np.ndarray,
+        R_ck: np.ndarray,
+        seed_inliers: np.ndarray | None = None,
+    ) -> PnpCandidate:
+        n_total = len(pts2d)
+        if n_total < 6:
+            return PnpCandidate("imu_constrained", False, None, None, None, n_total)
+        if seed_inliers is None or len(seed_inliers) < 6:
+            idx = np.arange(n_total, dtype=np.int32)
+        else:
+            idx = np.asarray(seed_inliers, dtype=np.int32).ravel()
+        rvec, _ = cv2.Rodrigues(np.asarray(R_ck, dtype=np.float64).reshape(3, 3))
+        threshold = float(self.cfg.imu_constrained_reproj_error_px)
+        min_inliers = max(6, int(self.cfg.imu_constrained_min_inliers))
+        best: PnpCandidate | None = None
+        for _ in range(4):
+            tvec = self._translation_for_fixed_rotation(pts3d, pts2d, R_ck, idx)
+            if tvec is None:
+                break
+            proj, _ = cv2.projectPoints(
+                pts3d.astype(np.float64),
+                rvec.astype(np.float64),
+                tvec.astype(np.float64),
+                self.K.astype(np.float64),
+                None,
+            )
+            err = np.linalg.norm(proj.reshape(-1, 2) - pts2d, axis=1)
+            inlier_idx = np.flatnonzero(np.isfinite(err) & (err <= threshold)).astype(np.int32)
+            cand = PnpCandidate(
+                "imu_constrained",
+                len(inlier_idx) >= min_inliers,
+                rvec.copy(),
+                tvec.copy(),
+                inlier_idx.reshape(-1, 1),
+                n_total,
+                reproj_median_px=(
+                    float(np.median(err[inlier_idx])) if len(inlier_idx) else np.inf
+                ),
+            )
+            if best is None or cand.n_inliers > best.n_inliers:
+                best = cand
+            if len(inlier_idx) == len(idx):
+                break
+            if len(inlier_idx) < 3:
+                break
+            idx = inlier_idx
+        if best is None:
+            return PnpCandidate("imu_constrained", False, rvec, None, None, n_total)
+        return best
+
+    def _rotation_source_for_candidate(self, cand: PnpCandidate) -> str:
+        if cand.name == "imu_constrained":
+            return "imu_constrained"
+        if cand.name == "imu":
+            return "imu_pnp_seed"
+        return "visual_pnp"
+
+    def _apply_imu_rotation_gate(
+        self,
+        cand: PnpCandidate,
+        pts3d: np.ndarray,
+        pts2d: np.ndarray,
+        R_since_keyframe: np.ndarray | None,
+        dt: float,
+    ) -> PnpSelection:
+        source = self._rotation_source_for_candidate(cand)
+        if (R_since_keyframe is None or not cand.ok or cand.rvec is None
+                or cand.tvec is None or cand.inliers is None):
+            return PnpSelection(cand, rotation_source=source)
+
+        R_imu = np.asarray(R_since_keyframe, dtype=np.float64).reshape(3, 3)
+        residual = rotation_residual_deg(cand.rotation_matrix(), R_imu)
+        warn = float(self.cfg.imu_rot_residual_warn_deg)
+        reject = float(self.cfg.imu_rot_residual_reject_deg)
+        if reject <= 0.0 or residual <= warn:
+            return PnpSelection(cand, residual, rotation_source=source)
+        if residual <= reject:
+            return PnpSelection(cand, residual, rotation_source=source)
+
+        constrained = self._fixed_rotation_candidate(
+            pts3d,
+            pts2d,
+            R_imu,
+            seed_inliers=cand.inliers,
+        )
+        reproj_ok = (
+            constrained.reproj_median_px
+            <= cand.reproj_median_px * float(self.cfg.pnp_aided_reproj_tol)
+        )
+        inlier_ok = (
+            constrained.n_inliers
+            >= cand.n_inliers + int(self.cfg.pnp_aided_min_inlier_delta)
+        )
+        if (constrained.ok and constrained.inliers is not None
+                and reproj_ok and inlier_ok
+                and self._passes_motion_gate(constrained, pts3d, dt)):
+            return PnpSelection(
+                constrained,
+                residual,
+                low_confidence=False,
+                fusion_skipped=False,
+                rotation_source="imu_constrained",
+            )
+
+        return PnpSelection(
+            cand,
+            residual,
+            low_confidence=True,
+            fusion_skipped=True,
+            rotation_source=source,
+        )
+
     def _choose_pnp_result(
         self,
         base: PnpCandidate,
@@ -336,13 +511,37 @@ class VisualOdometry:
         cand = self._choose_pnp_result(base, aided, pts3d_for_pnp, dt)
         if cand is None or cand.rvec is None or cand.tvec is None or cand.inliers is None:
             return PoseResult(self.T_wc.copy(), 0.0, n, False, lost=True)
-
+        selection = self._apply_imu_rotation_gate(
+            cand,
+            pts3d_for_pnp,
+            self._pts2d,
+            R_since_keyframe,
+            dt,
+        )
+        cand = selection.candidate
+        if cand is None or cand.rvec is None or cand.tvec is None or cand.inliers is None:
+            return PoseResult(
+                self.T_wc.copy(),
+                0.0,
+                n,
+                False,
+                lost=True,
+                imu_visual_rot_residual_deg=selection.rot_residual_deg,
+                rotation_source=selection.rotation_source,
+                low_confidence=True,
+                fusion_skipped=True,
+            )
         self.T_wc = self._candidate_to_world_pose(cand.rvec, cand.tvec)
         idx = cand.inliers.ravel()
         R, _ = cv2.Rodrigues(cand.rvec)
         z_pred = (pts3d_for_pnp[idx] @ R.T + cand.tvec.ravel())[:, 2]
         return PoseResult(self.T_wc.copy(), cand.inlier_ratio, n, False,
-                          feat_uv=self._pts2d[idx].copy(), feat_z=z_pred)
+                          feat_uv=self._pts2d[idx].copy(), feat_z=z_pred,
+                          imu_visual_rot_residual_deg=selection.rot_residual_deg,
+                          pnp_candidate_source=cand.name,
+                          rotation_source=selection.rotation_source,
+                          low_confidence=selection.low_confidence,
+                          fusion_skipped=selection.fusion_skipped)
 
     def _make_keyframe(self, gray: np.ndarray, depth: np.ndarray, ts: float,
                        exclude_mask: np.ndarray | None) -> None:
