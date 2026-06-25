@@ -1,6 +1,6 @@
-from spacerec.config import Config
 import torch
 
+from spacerec.config import Config, apply_runtime_profile
 from spacerec.device import autocast_context, configure_torch_runtime, select_torch_device
 
 
@@ -42,6 +42,11 @@ capture:
   replay_pair_tolerance_ms: 12
 depth:
   oak_fill_missing: false
+detect:
+  every_n_frames: 2
+backend:
+  enabled: false
+  live_apply: false
 mesh:
   enabled: true
   voxel_size: 0.04
@@ -64,6 +69,46 @@ imu:
   max_rotation_deg: 25.0
   keyframe_blur_omega_rad_s: 1.8
   keyframe_max_delay_s: 0.7
+objects:
+  appearance: true
+  appearance_keyframes_only: true
+  appearance_every_n_frames: 3
+loop_closure:
+  enabled: true
+  check_every_frames: 8
+  min_matches: 4
+  min_observations: 5
+  min_distinct_classes: 3
+  min_spread: 0.7
+  max_match_distance: 1.8
+  match_size_factor: 2.5
+  min_cos: 0.55
+  require_appearance: false
+  app_weight: 0.4
+  allow_scale: false
+  max_rms: 0.25
+  max_rms_frac: 0.2
+  max_yaw_delta_deg: 12.0
+  max_translation_delta: 1.4
+  max_scale_delta: 0.08
+  min_accept_interval_s: 2.0
+viz:
+  point_subsample: 6
+  frame_every: 2
+  depth_every: 3
+  objects_every: 4
+  trajectory_every: 5
+  trajectory_max_points: 200
+  global_map_every: 2
+  global_map_max_points: 10000
+  jpeg_quality: 55
+vo:
+  pnp_aided_reproj_tol: 1.4
+  pnp_aided_min_inlier_delta: -2
+  pnp_max_step_depth_frac: 0.5
+  pnp_max_velocity_units_s: 3.0
+  pnp_step_floor_units: 0.10
+  pnp_divergence_step_factor: 3.0
 """,
         encoding="utf-8",
     )
@@ -78,6 +123,9 @@ imu:
     assert cfg.capture.replay_depth_mode == "resize"
     assert cfg.capture.replay_pair_tolerance_ms == 12
     assert cfg.depth.oak_fill_missing is False
+    assert cfg.detect.every_n_frames == 2
+    assert cfg.backend.enabled is False
+    assert cfg.backend.live_apply is False
     assert cfg.mesh.enabled is True
     assert cfg.mesh.voxel_size == 0.04
     assert cfg.mesh.trunc_margin == 0.16
@@ -98,6 +146,121 @@ imu:
     assert cfg.imu.max_rotation_deg == 25.0
     assert cfg.imu.keyframe_blur_omega_rad_s == 1.8
     assert cfg.imu.keyframe_max_delay_s == 0.7
+    assert cfg.objects.appearance is True
+    assert cfg.objects.appearance_keyframes_only is True
+    assert cfg.objects.appearance_every_n_frames == 3
+    assert cfg.loop_closure.enabled is True
+    assert cfg.loop_closure.check_every_frames == 8
+    assert cfg.loop_closure.min_matches == 4
+    assert cfg.loop_closure.min_observations == 5
+    assert cfg.loop_closure.min_distinct_classes == 3
+    assert cfg.loop_closure.min_spread == 0.7
+    assert cfg.loop_closure.max_match_distance == 1.8
+    assert cfg.loop_closure.match_size_factor == 2.5
+    assert cfg.loop_closure.min_cos == 0.55
+    assert cfg.loop_closure.require_appearance is False
+    assert cfg.loop_closure.app_weight == 0.4
+    assert cfg.loop_closure.allow_scale is False
+    assert cfg.loop_closure.max_rms == 0.25
+    assert cfg.loop_closure.max_rms_frac == 0.2
+    assert cfg.loop_closure.max_yaw_delta_deg == 12.0
+    assert cfg.loop_closure.max_translation_delta == 1.4
+    assert cfg.loop_closure.max_scale_delta == 0.08
+    assert cfg.loop_closure.min_accept_interval_s == 2.0
+    assert cfg.viz.point_subsample == 6
+    assert cfg.viz.frame_every == 2
+    assert cfg.viz.depth_every == 3
+    assert cfg.viz.objects_every == 4
+    assert cfg.viz.trajectory_every == 5
+    assert cfg.viz.trajectory_max_points == 200
+    assert cfg.viz.global_map_every == 2
+    assert cfg.viz.global_map_max_points == 10000
+    assert cfg.viz.jpeg_quality == 55
+    assert cfg.vo.pnp_aided_reproj_tol == 1.4
+    assert cfg.vo.pnp_aided_min_inlier_delta == -2
+    assert cfg.vo.pnp_max_step_depth_frac == 0.5
+    assert cfg.vo.pnp_max_velocity_units_s == 3.0
+    assert cfg.vo.pnp_step_floor_units == 0.10
+    assert cfg.vo.pnp_divergence_step_factor == 3.0
+
+
+def test_load_reads_fusion_config(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+fusion:
+  mode: direct
+  direct_point_subsample: 3
+  direct_mesh_window_size: 5
+  direct_mesh_overlap: 2
+  direct_mesh_downsample: 2
+  direct_edge_filter: false
+  direct_edge_rel_thresh: 0.08
+  direct_mask_dilate_px: 1
+  require_aligned_depth: false
+""",
+        encoding="utf-8",
+    )
+
+    cfg = Config.load(path)
+
+    assert cfg.fusion.mode == "direct"
+    assert cfg.fusion.direct_point_subsample == 3
+    assert cfg.fusion.direct_mesh_window_size == 5
+    assert cfg.fusion.direct_mesh_overlap == 2
+    assert cfg.fusion.direct_mesh_downsample == 2
+    assert cfg.fusion.direct_edge_filter is False
+    assert cfg.fusion.direct_edge_rel_thresh == 0.08
+    assert cfg.fusion.direct_mask_dilate_px == 1
+    assert cfg.fusion.require_aligned_depth is False
+
+
+def test_fusion_config_defaults_preserve_backend_mode():
+    cfg = Config()
+
+    assert cfg.fusion.mode == "backend"
+    assert cfg.fusion.direct_point_subsample >= 1
+    assert cfg.fusion.direct_mesh_window_size >= 2
+    assert cfg.fusion.direct_mesh_overlap < cfg.fusion.direct_mesh_window_size
+    assert cfg.fusion.require_aligned_depth is True
+
+
+def test_loop_closure_defaults_do_not_estimate_scale():
+    cfg = Config()
+
+    assert cfg.loop_closure.enabled is True
+    assert cfg.loop_closure.allow_scale is False
+
+
+def test_realtime_runtime_profile_applies_tail_latency_overrides():
+    cfg = Config()
+    cfg.depth.oak_fill_missing = True
+    cfg.backend.metric_anchor = True
+    cfg.mesh.enabled = True
+    cfg.objects.appearance = True
+    cfg.loop_closure.max_match_distance = 2.0
+    cfg.loop_closure.max_yaw_delta_deg = 20.0
+
+    apply_runtime_profile(cfg, "realtime")
+
+    assert cfg.depth.oak_fill_missing is False
+    assert cfg.backend.enabled is False
+    assert cfg.backend.metric_anchor is False
+    assert cfg.backend.live_apply is False
+    assert cfg.detect.every_n_frames >= 5
+    assert cfg.backend.period_s >= 10.0
+    assert cfg.backend.window_size <= 8
+    assert cfg.backend.overlap <= cfg.backend.window_size // 2
+    assert cfg.mesh.enabled is False
+    assert cfg.objects.appearance is False
+    assert cfg.loop_closure.allow_scale is False
+    assert cfg.loop_closure.max_match_distance <= 0.9
+    assert cfg.loop_closure.max_yaw_delta_deg <= 12.0
+    assert cfg.loop_closure.max_translation_delta <= 1.0
+    assert cfg.viz.point_subsample >= 8
+    assert cfg.viz.frame_every >= 2
+    assert cfg.viz.depth_every >= 2
+    assert cfg.viz.global_map_max_points <= 150000
 
 
 def test_select_torch_device_prefers_cuda(monkeypatch):

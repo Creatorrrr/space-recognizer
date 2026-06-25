@@ -126,3 +126,27 @@
   덮지 않도록 하는 것이 의도다.
 - 이 단계는 render/export-time 정리 계층이다. full spatial-block TSDF, dirty-block
   rebuild, free-space 기반 mesh reintegration은 별도 장기 과제로 남아 있다.
+
+## OAK direct RGB-D fusion smoke
+
+DA3를 거치지 않고 OAK live/replay metric depth만으로 누적 지도를 만들려면
+`--fusion direct`를 사용한다. 이 모드는 RGB-aligned stereo depth, VO pose, dynamic
+mask를 직접 역투영해 `GlobalMap`에 넣고, mesh가 켜져 있으면 같은 RGB-D keyframe
+window를 `MeshMap` TSDF 경로에 넘긴다. `depth.oak_fill_missing`은 direct mode에서
+꺼지므로 DA3-Small/DA3 any-view/DA3METRIC 모델을 로드하지 않는다.
+
+재실행 예:
+
+```bash
+.venv/bin/python benchmarks/replay_smoke.py \
+  sources/session_20260624_054320_194430108151D05A00 \
+  --frames 60 --direct-fusion
+
+.venv/bin/python -m spacerec.main \
+  --source sources/session_20260624_054320_194430108151D05A00 \
+  --fusion direct --no-realtime --max-frames 120 --no-viz
+```
+
+주의: direct mode는 OAK metric depth 덕분에 scale은 안정적이지만 loop closure가
+없어 장시간 재방문 drift를 제거하지 못한다. `capture.replay_depth_mode=calibrated`
+또는 live `oak_align_depth_to_rgb=true`가 전제다.

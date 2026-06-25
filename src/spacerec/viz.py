@@ -29,8 +29,22 @@ def _color_for(name: str) -> list[int]:
 
 
 class Visualizer:
-    def __init__(self, app_id: str = "spacerec", memory_limit: str = "4GB"):
+    def __init__(self, app_id: str = "spacerec", memory_limit: str = "4GB",
+                 frame_every: int = 1, depth_every: int = 1,
+                 objects_every: int = 1, trajectory_every: int = 1,
+                 trajectory_max_points: int = 0, global_map_every: int = 1,
+                 global_map_max_points: int = 0, jpeg_quality: int = 75):
         self._trajectory: list[np.ndarray] = []
+        self._frame_idx = -1
+        self._global_map_logs = 0
+        self.frame_every = max(1, int(frame_every))
+        self.depth_every = max(1, int(depth_every))
+        self.objects_every = max(1, int(objects_every))
+        self.trajectory_every = max(1, int(trajectory_every))
+        self.trajectory_max_points = max(0, int(trajectory_max_points))
+        self.global_map_every = max(1, int(global_map_every))
+        self.global_map_max_points = max(0, int(global_map_max_points))
+        self.jpeg_quality = int(np.clip(jpeg_quality, 1, 100))
         self.meters_per_unit: float | None = None  # metric 앵커가 있으면 거리 라벨에 사용
         rr.init(app_id)
         # venv를 활성화하지 않고 실행해도 뷰어 바이너리를 찾도록 명시 경로 사용
@@ -57,6 +71,7 @@ class Visualizer:
         )
 
     def set_time(self, ts: float) -> None:
+        self._frame_idx += 1
         rr.set_time("video", duration=ts)
 
     def log_camera(self, T_wc: np.ndarray, K: np.ndarray,
@@ -70,9 +85,12 @@ class Visualizer:
             image_plane_distance=0.3,
         ))
         self._trajectory.append(T_wc[:3, 3].copy())
-        if len(self._trajectory) >= 2:
+        if len(self._trajectory) >= 2 and self._frame_idx % self.trajectory_every == 0:
+            trajectory = self._trajectory
+            if self.trajectory_max_points > 0:
+                trajectory = trajectory[-self.trajectory_max_points:]
             rr.log("world/trajectory", rr.LineStrips3D(
-                [np.array(self._trajectory, dtype=np.float32)],
+                [np.array(trajectory, dtype=np.float32)],
                 colors=[[120, 180, 255, 255]], radii=0.004))
 
     def log_live_points(self, points_world: np.ndarray, colors: np.ndarray) -> None:
@@ -92,6 +110,13 @@ class Visualizer:
         rr.log("calib/frame_scale", rr.Scalars([frame_scale]))
 
     def log_global_map(self, points: np.ndarray, colors: np.ndarray) -> None:
+        self._global_map_logs += 1
+        if (self._global_map_logs - 1) % self.global_map_every:
+            return
+        if self.global_map_max_points > 0 and len(points) > self.global_map_max_points:
+            stride = int(np.ceil(len(points) / self.global_map_max_points))
+            points = points[::stride]
+            colors = colors[::stride]
         rr.log("world/points", rr.Points3D(points, colors=colors, radii=0.006))
 
     def clear_mesh_submaps(self, submap_ids: list[int]) -> None:
@@ -133,6 +158,8 @@ class Visualizer:
         현재 보이는 노드는 불투명, 화면 밖/가려진 노드는 반투명으로 그려
         '기억된 위치'임을 시각적으로 구분한다.
         """
+        if self._frame_idx % self.objects_every:
+            return
         if not objects:
             rr.log("world/objects", rr.Clear(recursive=True))
             return
@@ -170,9 +197,11 @@ class Visualizer:
 
     def log_frame(self, bgr: np.ndarray, depth: np.ndarray | None,
                   detections: list[Detection], K: np.ndarray | None = None) -> None:
-        rr.log("world/camera/image/rgb",
-               rr.Image(bgr, color_model=rr.ColorModel.BGR).compress(jpeg_quality=75))
-        if depth is not None:
+        if self._frame_idx % self.frame_every == 0:
+            rr.log("world/camera/image/rgb",
+                   rr.Image(bgr, color_model=rr.ColorModel.BGR).compress(
+                       jpeg_quality=self.jpeg_quality))
+        if depth is not None and self._frame_idx % self.depth_every == 0:
             # 절반 해상도로 로깅하되, 반드시 그에 맞는 절반 스케일 Pinhole을 함께
             # 단다. (전체 해상도 Pinhole 밑에 절반 해상도 depth를 넣으면 3D 뷰의
             # depth 역투영이 2배 어긋난다 — 실제로 겪었던 버그)
@@ -199,3 +228,42 @@ class Visualizer:
             ))
         else:
             rr.log("world/camera/image/detections", rr.Clear(recursive=False))
+
+
+class NullVisualizer:
+    """Visualizer-compatible no-op for headless performance upper bounds."""
+
+    def __init__(self):
+        self.meters_per_unit: float | None = None
+
+    def set_time(self, ts: float) -> None:
+        pass
+
+    def log_camera(self, T_wc: np.ndarray, K: np.ndarray,
+                   width: int, height: int) -> None:
+        pass
+
+    def log_live_points(self, points_world: np.ndarray, colors: np.ndarray) -> None:
+        pass
+
+    def log_calibration(self, a: float, b: float, frame_scale: float) -> None:
+        pass
+
+    def log_global_map(self, points: np.ndarray, colors: np.ndarray) -> None:
+        pass
+
+    def clear_mesh_submaps(self, submap_ids: list[int]) -> None:
+        pass
+
+    def log_canonical_mesh(self, mesh) -> None:
+        pass
+
+    def log_mesh_submaps(self, submaps: list) -> None:
+        pass
+
+    def log_objects(self, objects: list, edges: list, visible: set[int]) -> None:
+        pass
+
+    def log_frame(self, bgr: np.ndarray, depth: np.ndarray | None,
+                  detections: list[Detection], K: np.ndarray | None = None) -> None:
+        pass

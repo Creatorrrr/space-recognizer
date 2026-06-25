@@ -22,10 +22,13 @@ import spacerec  # noqa: F401
 from spacerec.backend import BackendKeyframe, _Worker
 from spacerec.config import Config
 from spacerec.device import configure_torch_runtime, select_torch_device
+from spacerec.directfusion import DirectFusionBackend, DirectFusionKeyframe
 from spacerec.imu import estimate_camera_rotation, should_accept_backend_keyframe
-from spacerec.objects import ObjectRegistry, localize_objects
+from spacerec.loopclosure import LoopClosureEstimator
+from spacerec.objects import ObjectRegistry, Observation, localize_objects
 from spacerec.replay import RecordedOakSource, _nearest
 from spacerec.vo import VisualOdometry
+from spacerec.worldmap import GlobalMap
 
 
 class MetricTimer:
@@ -149,7 +152,8 @@ def _run_backend_window(
 
 def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
                 backend: bool, imu_enabled: bool | None = None,
-                backend_metric_anchor: bool = False) -> dict:
+                backend_metric_anchor: bool = False,
+                direct_fusion: bool = False) -> dict:
     src = RecordedOakSource(
         path,
         proc_width=cfg.proc_width,
@@ -179,10 +183,36 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
     valid_fracs = []
     inliers = []
     tracked = []
+    pose_steps = []
+    prev_pose_pos: np.ndarray | None = None
     classes = Counter()
     keyframes: list[BackendKeyframe] = []
+    direct_keyframes = 0
+    direct_backend = DirectFusionBackend(cfg.fusion, cfg.capture) if direct_fusion else None
+    direct_map = GlobalMap(cfg.backend) if direct_fusion else None
+    loop_map = direct_map if direct_map is not None else (
+        GlobalMap(cfg.backend) if full_models else None
+    )
+    loop_closure = (
+        LoopClosureEstimator(cfg.loop_closure)
+        if registry is not None and loop_map is not None else None
+    )
     payload_missing = _payload_missing(src)
     pair_count, pair_median_ms, pair_max_ms = _pairing_stats(src)
+
+    def drain_direct() -> None:
+        if direct_backend is None or direct_map is None:
+            return
+        while True:
+            try:
+                res = direct_backend.results.get_nowait()
+            except Exception:
+                return
+            origins = None if res.view_origins is None else direct_map.to_global_points(
+                res.view_origins)
+            direct_map.fuse(direct_map.to_global_points(res.points), res.colors,
+                            origins=origins, view_idx=res.point_view_idx)
+
     try:
         for frame in src.frames():
             if stats["frames"] >= frames:
@@ -255,6 +285,10 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
                     R_since_keyframe=None if since_prior is None else since_prior.R,
                     omega_norm=omega_norm,
                 )
+            pose_pos = pose.T_wc[:3, 3].copy()
+            if prev_pose_pos is not None:
+                pose_steps.append(float(np.linalg.norm(pose_pos - prev_pose_pos)))
+            prev_pose_pos = pose_pos
             if pose.is_keyframe:
                 imu_since_keyframe = []
                 imu_keyframe_ts = frame.ts
@@ -293,8 +327,25 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
                         interpolation=cv2.INTER_NEAREST).astype(bool),
                     calib_ab=(1.0, 0.0),
                 ))
+            if (direct_backend is not None and pose.is_keyframe
+                    and accept_backend_keyframe and frame.depth_m is not None):
+                dyn = _dynamic_mask(detections, gray.shape, set(cfg.detect.dynamic_classes))
+                direct_backend.add_keyframe(DirectFusionKeyframe(
+                    kf_id=direct_keyframes,
+                    ts=frame.ts,
+                    bgr=frame.bgr.copy(),
+                    depth_m=frame.depth_m.copy(),
+                    K=vo.K.copy(),
+                    T_wc=pose.T_wc.copy(),
+                    dyn_mask=None if dyn is None else dyn.copy(),
+                    depth_conf=None if frame.depth_conf is None else frame.depth_conf.copy(),
+                ))
+                direct_keyframes += 1
+                drain_direct()
             if pose.is_keyframe and accept_backend_keyframe:
                 last_backend_keyframe_ts = frame.ts
+            if loop_map is not None:
+                loop_map.step_correction()
             stats["lost"] += int(pose.lost)
             stats["keyframes"] += int(pose.is_keyframe)
             if pose.n_tracked:
@@ -302,12 +353,41 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
                 inliers.append(float(pose.inlier_ratio))
             if detections and registry is not None and frame.depth_m is not None:
                 with MetricTimer(timings, "object_localize"):
-                    obs = localize_objects(detections, frame.depth_m, vo.K, pose.T_wc,
-                                           frame.depth_conf)
+                    live_obs = localize_objects(detections, frame.depth_m, vo.K,
+                                                pose.T_wc, frame.depth_conf)
+                if loop_closure is not None and loop_map is not None:
+                    with MetricTimer(timings, "loop_correction"):
+                        loop_result = loop_closure.estimate(
+                            stats["frames"],
+                            frame.ts,
+                            live_obs,
+                            registry,
+                            loop_map.T_global_live,
+                        )
+                    stats["loop_correction_attempts"] += int(loop_result.attempted)
+                    stats["loop_correction_accepted"] += int(loop_result.accepted)
+                    stats["loop_correction_matches"] += int(loop_result.match_count)
+                    stats["loop_correction_last_rms"] = float(loop_result.rms)
+                    stats["loop_correction_last_yaw_delta_deg"] = float(
+                        loop_result.yaw_delta_deg)
+                    if loop_result.accepted and loop_result.T_global_live is not None:
+                        loop_map.set_correction_target(loop_result.T_global_live)
+                    obs = [
+                        Observation(
+                            det=o.det,
+                            position=loop_map.to_global_points(o.position[None])[0],
+                            size=o.size,
+                            emb=o.emb,
+                        )
+                        for o in live_obs
+                    ]
+                else:
+                    obs = live_obs
                 stats["detections"] += len(detections)
                 stats["object_observations"] += len(obs)
                 registry.update(obs, frame.ts)
     finally:
+        drain_direct()
         src.release()
     backend_metrics = (_run_backend_window(
         cfg, keyframes, metric_anchor=backend_metric_anchor) if backend else {
@@ -331,9 +411,18 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
         "keyframes": stats["keyframes"],
         "avg_tracked": float(np.mean(tracked)) if tracked else 0.0,
         "avg_inlier": float(np.mean(inliers)) if inliers else 0.0,
+        "max_pose_step": float(np.max(pose_steps)) if pose_steps else 0.0,
+        "p95_pose_step": float(np.percentile(pose_steps, 95)) if pose_steps else 0.0,
+        "pose_step_over_1": int(sum(step > 1.0 for step in pose_steps)),
         "detections": stats["detections"],
         "object_observations": stats["object_observations"],
         "objects": 0 if registry is None else len(registry.objects),
+        "loop_correction_attempts": stats["loop_correction_attempts"],
+        "loop_correction_accepted": stats["loop_correction_accepted"],
+        "loop_correction_matches": stats["loop_correction_matches"],
+        "loop_correction_last_rms": float(stats["loop_correction_last_rms"]),
+        "loop_correction_last_yaw_delta_deg": float(
+            stats["loop_correction_last_yaw_delta_deg"]),
         "imu_prior_frames": stats["imu_prior_frames"],
         "imu_lk_priors": stats["imu_lk_priors"],
         "imu_pnp_priors": stats["imu_pnp_priors"],
@@ -348,6 +437,8 @@ def run_session(path: Path, cfg: Config, frames: int, full_models: bool,
         "backend_cuda_memory": backend_metrics["backend_cuda_memory"],
         "timings": _summarize_timings(timings),
         "cuda_memory": _cuda_memory_snapshot(),
+        "direct_keyframes": direct_keyframes,
+        "direct_points": 0 if direct_map is None else len(direct_map.points),
         "top_classes": classes.most_common(6),
     }
 
@@ -363,6 +454,8 @@ def main() -> None:
                     help="run one direct DA3 backend window and report point count")
     ap.add_argument("--backend-metric-anchor", action="store_true",
                     help="include the optional DA3METRIC anchor in the direct backend window")
+    ap.add_argument("--direct-fusion", action="store_true",
+                    help="run OAK metric-depth direct fusion and report map point count")
     ap.add_argument("--imu", action="store_true",
                     help="enable gyro-derived VO rotation priors for this run")
     ap.add_argument("--compare-imu", action="store_true",
@@ -394,7 +487,8 @@ def main() -> None:
         for imu_enabled in modes:
             result = run_session(Path(session), cfg, args.frames, args.full_models,
                                  args.backend, imu_enabled=imu_enabled,
-                                 backend_metric_anchor=args.backend_metric_anchor)
+                                 backend_metric_anchor=args.backend_metric_anchor,
+                                 direct_fusion=args.direct_fusion)
             results.append(result)
             print(
                 "REPLAY_SMOKE "
@@ -407,6 +501,9 @@ def main() -> None:
                 f"lost={result['lost']} keyframes={result['keyframes']} "
                 f"avg_tracked={result['avg_tracked']:.1f} "
                 f"avg_inlier={result['avg_inlier']:.2f} "
+                f"max_pose_step={result['max_pose_step']:.3f} "
+                f"p95_pose_step={result['p95_pose_step']:.3f} "
+                f"pose_step_over_1={result['pose_step_over_1']} "
                 f"imu_prior_frames={result['imu_prior_frames']} "
                 f"imu_lk_priors={result['imu_lk_priors']} "
                 f"imu_pnp_priors={result['imu_pnp_priors']} "
@@ -417,9 +514,17 @@ def main() -> None:
                 f"detections={result['detections']} "
                 f"object_observations={result['object_observations']} "
                 f"objects={result['objects']} "
+                f"loop_correction_attempts={result['loop_correction_attempts']} "
+                f"loop_correction_accepted={result['loop_correction_accepted']} "
+                f"loop_correction_matches={result['loop_correction_matches']} "
+                f"loop_correction_last_rms={result['loop_correction_last_rms']:.3f} "
+                f"loop_correction_last_yaw_delta_deg="
+                f"{result['loop_correction_last_yaw_delta_deg']:.1f} "
                 f"backend_keyframes={result['backend_keyframes']} "
                 f"backend_points={result['backend_points']} "
                 f"backend_runtime_s={result['backend_runtime_s']:.2f} "
+                f"direct_keyframes={result['direct_keyframes']} "
+                f"direct_points={result['direct_points']} "
                 f"top_classes={result['top_classes']}"
             )
     if args.metrics_out:
